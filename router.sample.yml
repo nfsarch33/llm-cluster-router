@@ -3,6 +3,9 @@ metrics_addr: ":9091"
 debug_addr: ":6060"
 log_level: info
 
+# Optional bearer auth for /v1/* endpoints. Leave empty to disable.
+# auth_token: ${ROUTER_AUTH_TOKEN}
+
 defaults:
   max_queue_depth: 8
   max_concurrency: 2

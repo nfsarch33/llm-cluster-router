@@ -496,3 +496,84 @@ func writeTestFile(t *testing.T, path, content string) error {
 	t.Helper()
 	return os.WriteFile(path, []byte(content), 0o644)
 }
+
+func TestBearerAuthNoTokenConfigured(t *testing.T) {
+	t.Parallel()
+	handler := bearerAuth("")(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when no auth configured, got %d", rec.Code)
+	}
+}
+
+func TestBearerAuthValidToken(t *testing.T) {
+	t.Parallel()
+	handler := bearerAuth("secret-token")(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid token, got %d", rec.Code)
+	}
+}
+
+func TestBearerAuthInvalidToken(t *testing.T) {
+	t.Parallel()
+	handler := bearerAuth("secret-token")(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with invalid token, got %d", rec.Code)
+	}
+}
+
+func TestBearerAuthMissingHeader(t *testing.T) {
+	t.Parallel()
+	handler := bearerAuth("secret-token")(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with missing auth header, got %d", rec.Code)
+	}
+}
+
+func TestLoadConfigExpandsAuthToken(t *testing.T) {
+	t.Setenv("TEST_ROUTER_AUTH", "my-secret-auth")
+
+	yamlContent := `
+listen: ":9998"
+auth_token: ${TEST_ROUTER_AUTH}
+nodes:
+  - name: test-node
+    url: http://localhost:8001
+    tier: fast
+    weight: 1
+    models: ["model-a"]
+`
+	dir := t.TempDir()
+	path := dir + "/test-auth-router.yml"
+	if err := writeTestFile(t, path, yamlContent); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.AuthToken != "my-secret-auth" {
+		t.Fatalf("auth_token = %q, want my-secret-auth", cfg.AuthToken)
+	}
+}

@@ -65,6 +65,7 @@ type config struct {
 	MetricsAddr string       `yaml:"metrics_addr"`
 	DebugAddr   string       `yaml:"debug_addr"`
 	LogLevel    string       `yaml:"log_level"`
+	AuthToken   string       `yaml:"auth_token"`
 	Defaults    defaults     `yaml:"defaults"`
 	HealthCheck healthConfig `yaml:"health_check"`
 	Nodes       []nodeConfig `yaml:"nodes"`
@@ -233,12 +234,14 @@ func runServe(args []string) error {
 		}()
 	}
 
+	authWrap := bearerAuth(cfg.AuthToken)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", r.handleHealth)
-	mux.HandleFunc("/v1/models", r.handleModels)
-	mux.HandleFunc("/v1/chat/completions", r.handleProxy)
-	mux.HandleFunc("/v1/completions", r.handleProxy)
-	mux.HandleFunc("/v1/embeddings", r.handleProxy)
+	mux.HandleFunc("/v1/models", authWrap(r.handleModels))
+	mux.HandleFunc("/v1/chat/completions", authWrap(r.handleProxy))
+	mux.HandleFunc("/v1/completions", authWrap(r.handleProxy))
+	mux.HandleFunc("/v1/embeddings", authWrap(r.handleProxy))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	server := &http.Server{
@@ -296,6 +299,7 @@ func loadConfig(path string) (config, error) {
 	if len(cfg.Nodes) == 0 {
 		return cfg, errors.New("config must define at least one node")
 	}
+	cfg.AuthToken = expandEnvValue(cfg.AuthToken)
 	for i := range cfg.Nodes {
 		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
 	}
@@ -311,6 +315,22 @@ func expandEnvValue(s string) string {
 		return v
 	}
 	return ""
+}
+
+func bearerAuth(token string) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		if token == "" {
+			return next
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+token {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
 }
 
 func newRouter(cfg config) (*router, error) {
