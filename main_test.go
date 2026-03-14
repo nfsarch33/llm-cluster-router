@@ -355,3 +355,78 @@ func TestRunCancelProbeSetsMaxTokens(t *testing.T) {
 		t.Fatalf("runCancelProbe returned error: %#v", result)
 	}
 }
+
+func TestSelectNodePrefersLowerPriority(t *testing.T) {
+	t.Parallel()
+
+	localURL, _ := url.Parse("http://local:8001")
+	cloudURL, _ := url.Parse("http://cloud:443")
+
+	localNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "local-27b", Tier: "agent", Weight: 1, Priority: 0, Models: []string{"qwen3.5-27b"}},
+		baseURL: localURL,
+	}
+	localNode.healthy.Store(true)
+
+	cloudNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "cloud-deepseek", Tier: "reasoning", Weight: 1, Priority: 10, Models: []string{"qwen3.5-27b"}, APIKey: "sk-test"},
+		baseURL: cloudURL,
+	}
+	cloudNode.healthy.Store(true)
+
+	r := &router{nodes: []*upstreamNode{cloudNode, localNode}}
+
+	for i := 0; i < 10; i++ {
+		selected := r.selectNode("qwen3.5-27b")
+		if selected == nil {
+			t.Fatal("selectNode returned nil")
+		}
+		if selected.cfg.Name != "local-27b" {
+			t.Fatalf("iteration %d: selected %q, want local-27b (lower priority)", i, selected.cfg.Name)
+		}
+	}
+}
+
+func TestSelectNodeFallsBackToCloudWhenLocalUnhealthy(t *testing.T) {
+	t.Parallel()
+
+	localURL, _ := url.Parse("http://local:8001")
+	cloudURL, _ := url.Parse("http://cloud:443")
+
+	localNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "local-27b", Tier: "agent", Weight: 1, Priority: 0, Models: []string{"qwen3.5-27b"}},
+		baseURL: localURL,
+	}
+	localNode.healthy.Store(false)
+
+	cloudNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "cloud-deepseek", Tier: "reasoning", Weight: 1, Priority: 10, Models: []string{"qwen3.5-27b"}, APIKey: "sk-test"},
+		baseURL: cloudURL,
+	}
+	cloudNode.healthy.Store(true)
+
+	r := &router{nodes: []*upstreamNode{localNode, cloudNode}}
+
+	selected := r.selectNode("qwen3.5-27b")
+	if selected == nil {
+		t.Fatal("selectNode returned nil")
+	}
+	if selected.cfg.Name != "cloud-deepseek" {
+		t.Fatalf("selected %q, want cloud-deepseek (local unhealthy)", selected.cfg.Name)
+	}
+}
+
+func TestSelectNodeAPIKeySetOnNode(t *testing.T) {
+	t.Parallel()
+
+	cloudURL, _ := url.Parse("http://cloud:443")
+	node := &upstreamNode{
+		cfg:     nodeConfig{Name: "cloud-node", APIKey: "sk-secret", Weight: 1, Priority: 10, Models: []string{"model-x"}},
+		baseURL: cloudURL,
+	}
+	node.healthy.Store(true)
+
+	if node.cfg.APIKey != "sk-secret" {
+		t.Fatalf("api_key = %q, want sk-secret", node.cfg.APIKey)
+	}
+}

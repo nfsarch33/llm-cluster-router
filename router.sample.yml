@@ -20,10 +20,20 @@ nodes:
   - name: workstation-3090-agent
     url: http://127.0.0.1:8001
     tier: agent
+    priority: 0
     weight: 4
     models: ["qwen3.5-27b"]
   - name: workstation-4070-fast
     url: http://127.0.0.1:8002
     tier: fast
+    priority: 0
     weight: 2
     models: ["qwen3.5-9b"]
+  # Cloud fallback example:
+  # - name: deepseek-v3-reasoning
+  #   url: https://api.deepseek.com/v1
+  #   tier: reasoning
+  #   priority: 10
+  #   weight: 1
+  #   api_key: sk-your-key
+  #   models: ["deepseek-chat"]

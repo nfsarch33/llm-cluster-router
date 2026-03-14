@@ -103,11 +103,13 @@ func (d *durationValue) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type nodeConfig struct {
-	Name   string   `yaml:"name"`
-	URL    string   `yaml:"url"`
-	Tier   string   `yaml:"tier"`
-	Weight int      `yaml:"weight"`
-	Models []string `yaml:"models"`
+	Name     string   `yaml:"name"`
+	URL      string   `yaml:"url"`
+	Tier     string   `yaml:"tier"`
+	Weight   int      `yaml:"weight"`
+	Models   []string `yaml:"models"`
+	APIKey   string   `yaml:"api_key"`
+	Priority int      `yaml:"priority"`
 }
 
 type router struct {
@@ -462,6 +464,9 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	copyHeaders(upstreamReq.Header, req.Header)
+	if node.cfg.APIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
+	}
 
 	resp, err := r.client.Do(upstreamReq)
 	if err != nil && isRetryableConnError(err) {
@@ -469,6 +474,9 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		retryReq, retryErr := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
 		if retryErr == nil {
 			copyHeaders(retryReq.Header, req.Header)
+			if node.cfg.APIKey != "" {
+				retryReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
+			}
 			resp, err = r.client.Do(retryReq)
 		}
 	}
@@ -492,20 +500,39 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *router) selectNode(model string) *upstreamNode {
-	candidates := make([]*upstreamNode, 0)
+	type bucket struct {
+		priority   int
+		candidates []*upstreamNode
+	}
+
+	buckets := make(map[int]*bucket)
 	for _, node := range r.nodes {
 		if !node.healthy.Load() {
 			continue
 		}
 		if model == "" || supportsModel(node.cfg.Models, model) {
+			p := node.cfg.Priority
+			b, ok := buckets[p]
+			if !ok {
+				b = &bucket{priority: p}
+				buckets[p] = b
+			}
 			for i := 0; i < node.cfg.Weight; i++ {
-				candidates = append(candidates, node)
+				b.candidates = append(b.candidates, node)
 			}
 		}
 	}
-	if len(candidates) == 0 {
+	if len(buckets) == 0 {
 		return nil
 	}
+
+	priorities := make([]int, 0, len(buckets))
+	for p := range buckets {
+		priorities = append(priorities, p)
+	}
+	sort.Ints(priorities)
+
+	candidates := buckets[priorities[0]].candidates
 	idx := int(r.rr.Add(1)-1) % len(candidates)
 	return candidates[idx]
 }
