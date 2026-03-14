@@ -296,7 +296,21 @@ func loadConfig(path string) (config, error) {
 	if len(cfg.Nodes) == 0 {
 		return cfg, errors.New("config must define at least one node")
 	}
+	for i := range cfg.Nodes {
+		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
+	}
 	return cfg, nil
+}
+
+func expandEnvValue(s string) string {
+	if !strings.HasPrefix(s, "${") || !strings.HasSuffix(s, "}") {
+		return s
+	}
+	key := s[2 : len(s)-1]
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return ""
 }
 
 func newRouter(cfg config) (*router, error) {

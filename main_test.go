@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -429,4 +430,69 @@ func TestSelectNodeAPIKeySetOnNode(t *testing.T) {
 	if node.cfg.APIKey != "sk-secret" {
 		t.Fatalf("api_key = %q, want sk-secret", node.cfg.APIKey)
 	}
+}
+
+func TestExpandEnvValue(t *testing.T) {
+	t.Setenv("TEST_EXPAND_KEY", "sk-from-env")
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"literal key", "sk-hardcoded", "sk-hardcoded"},
+		{"empty string", "", ""},
+		{"env var present", "${TEST_EXPAND_KEY}", "sk-from-env"},
+		{"env var missing", "${MISSING_VAR_XYZ}", ""},
+		{"partial syntax", "${INCOMPLETE", "${INCOMPLETE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := expandEnvValue(tt.input)
+			if got != tt.want {
+				t.Fatalf("expandEnvValue(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigExpandsAPIKeyEnvVar(t *testing.T) {
+	t.Setenv("TEST_CLOUD_KEY", "sk-expanded-123")
+
+	yamlContent := `
+listen: ":9999"
+nodes:
+  - name: test-local
+    url: http://localhost:8001
+    tier: fast
+    weight: 1
+    models: ["model-a"]
+  - name: test-cloud
+    url: https://api.example.com
+    tier: reasoning
+    priority: 10
+    weight: 1
+    api_key: ${TEST_CLOUD_KEY}
+    models: ["model-b"]
+`
+	dir := t.TempDir()
+	path := dir + "/test-router.yml"
+	if err := writeTestFile(t, path, yamlContent); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if len(cfg.Nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(cfg.Nodes))
+	}
+	if cfg.Nodes[1].APIKey != "sk-expanded-123" {
+		t.Fatalf("api_key = %q, want sk-expanded-123", cfg.Nodes[1].APIKey)
+	}
+}
+
+func writeTestFile(t *testing.T, path, content string) error {
+	t.Helper()
+	return os.WriteFile(path, []byte(content), 0o644)
 }

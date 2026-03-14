@@ -29,11 +29,11 @@ nodes:
     priority: 0
     weight: 2
     models: ["qwen3.5-9b"]
-  # Cloud fallback example:
+  # Cloud fallback example (env var expansion supported for api_key):
   # - name: deepseek-v3-reasoning
-  #   url: https://api.deepseek.com/v1
+  #   url: https://api.deepseek.com
   #   tier: reasoning
   #   priority: 10
   #   weight: 1
-  #   api_key: sk-your-key
+  #   api_key: ${DEEPSEEK_API_KEY}
   #   models: ["deepseek-chat"]
