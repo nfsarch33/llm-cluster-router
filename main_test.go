@@ -551,6 +551,59 @@ func TestBearerAuthMissingHeader(t *testing.T) {
 	}
 }
 
+func TestHandleProxyRetriesAlternateUpstreamOnDialFailure(t *testing.T) {
+	t.Parallel()
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(healthy.Close)
+
+	r := &router{
+		cfg: config{Defaults: defaults{
+			MaxQueueDepth:  8,
+			MaxConcurrency: 1,
+			RequestTimeout: durationValue{Duration: time.Second},
+			MaxBodySize:    1 << 20,
+		}},
+		client:    &http.Client{Timeout: time.Second},
+		semaphore: make(chan struct{}, 1),
+	}
+	badURL, _ := url.Parse("http://127.0.0.1:1")
+	goodURL, _ := url.Parse(healthy.URL)
+	bad := &upstreamNode{
+		cfg:     nodeConfig{Name: "dead-primary", Tier: "agent", Priority: 1, Weight: 1, Models: []string{"fault-model"}},
+		baseURL: badURL,
+	}
+	good := &upstreamNode{
+		cfg:     nodeConfig{Name: "healthy-fallback", Tier: "agent", Priority: 2, Weight: 1, Models: []string{"fault-model"}},
+		baseURL: goodURL,
+	}
+	bad.healthy.Store(true)
+	good.healthy.Store(true)
+	r.nodes = []*upstreamNode{bad, good}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"fault-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	r.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if bad.healthy.Load() {
+		t.Fatal("expected failed primary to be marked unhealthy")
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
 func TestNewRouterSkipsDisabledNodes(t *testing.T) {
 	t.Parallel()
 

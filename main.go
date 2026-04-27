@@ -521,6 +521,28 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	if err != nil {
+		node.healthy.Store(false)
+		nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
+		if fallback := r.selectNodeExcluding(model, tier, node.cfg.Name); fallback != nil {
+			fallbackURL := *fallback.baseURL
+			fallbackURL.Path = strings.TrimRight(fallback.baseURL.Path, "/") + req.URL.Path
+			fallbackURL.RawQuery = req.URL.RawQuery
+			fallbackReq, fallbackErr := http.NewRequestWithContext(ctx, req.Method, fallbackURL.String(), bytes.NewReader(body))
+			if fallbackErr == nil {
+				copyHeaders(fallbackReq.Header, req.Header)
+				if fallback.cfg.APIKey != "" {
+					fallbackReq.Header.Set("Authorization", "Bearer "+fallback.cfg.APIKey)
+				}
+				resp, err = r.client.Do(fallbackReq)
+				if err == nil {
+					node = fallback
+				} else {
+					requestRetries.WithLabelValues(model, fallback.cfg.Name).Inc()
+				}
+			}
+		}
+	}
+	if err != nil {
 		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "bad_gateway").Inc()
 		return
@@ -540,6 +562,10 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *router) selectNode(model, targetTier string) *upstreamNode {
+	return r.selectNodeExcluding(model, targetTier, "")
+}
+
+func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -549,6 +575,9 @@ func (r *router) selectNode(model, targetTier string) *upstreamNode {
 	buckets := make(map[int]*bucket)
 	for _, node := range r.nodes {
 		if !node.healthy.Load() {
+			continue
+		}
+		if excludeName != "" && node.cfg.Name == excludeName {
 			continue
 		}
 		if targetTier != "" && node.cfg.Tier != targetTier {
