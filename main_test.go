@@ -378,7 +378,7 @@ func TestSelectNodePrefersLowerPriority(t *testing.T) {
 	r := &router{nodes: []*upstreamNode{cloudNode, localNode}}
 
 	for i := 0; i < 10; i++ {
-		selected := r.selectNode("qwen3.5-27b")
+		selected := r.selectNode("qwen3.5-27b", "")
 		if selected == nil {
 			t.Fatal("selectNode returned nil")
 		}
@@ -408,7 +408,7 @@ func TestSelectNodeFallsBackToCloudWhenLocalUnhealthy(t *testing.T) {
 
 	r := &router{nodes: []*upstreamNode{localNode, cloudNode}}
 
-	selected := r.selectNode("qwen3.5-27b")
+	selected := r.selectNode("qwen3.5-27b", "")
 	if selected == nil {
 		t.Fatal("selectNode returned nil")
 	}
@@ -548,6 +548,53 @@ func TestBearerAuthMissingHeader(t *testing.T) {
 	handler(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with missing auth header, got %d", rec.Code)
+	}
+}
+
+func TestNewRouterSkipsDisabledNodes(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{
+		Defaults: defaults{MaxConcurrency: 1, RequestTimeout: durationValue{Duration: time.Second}},
+		Nodes: []nodeConfig{
+			{Name: "primary", URL: "http://primary.example", Tier: "primary", Models: []string{"qwen35-27b-main"}},
+			{Name: "coding-36", URL: "http://qwen36.example", Tier: "agent-ab", Enabled: "false", Models: []string{"qwen36-27b-int4"}},
+		},
+	}
+	r, err := newRouter(cfg)
+	if err != nil {
+		t.Fatalf("newRouter: %v", err)
+	}
+	if len(r.nodes) != 1 {
+		t.Fatalf("expected disabled coding-36 node to be skipped, got %d nodes", len(r.nodes))
+	}
+	if r.nodes[0].cfg.Name != "primary" {
+		t.Fatalf("expected only primary node, got %q", r.nodes[0].cfg.Name)
+	}
+}
+
+func TestSelectNodeHonorsXTierForOptInLane(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{
+		Defaults: defaults{MaxConcurrency: 1, RequestTimeout: durationValue{Duration: time.Second}},
+		Nodes: []nodeConfig{
+			{Name: "primary", URL: "http://primary.example", Tier: "primary", Priority: 1, Models: []string{"qwen35-27b-main"}},
+			{Name: "coding-36", URL: "http://qwen36.example", Tier: "agent-ab", Priority: 9, Models: []string{"qwen36-27b-int4"}},
+		},
+	}
+	r, err := newRouter(cfg)
+	if err != nil {
+		t.Fatalf("newRouter: %v", err)
+	}
+	if got := r.selectNode("", ""); got == nil || got.cfg.Name != "primary" {
+		t.Fatalf("default selection = %#v, want primary", got)
+	}
+	if got := r.selectNode("", "agent-ab"); got == nil || got.cfg.Name != "coding-36" {
+		t.Fatalf("X-Tier agent-ab selection = %#v, want coding-36", got)
+	}
+	if got := r.selectNode("qwen36-27b-int4", ""); got == nil || got.cfg.Name != "coding-36" {
+		t.Fatalf("model opt-in selection = %#v, want coding-36", got)
 	}
 }
 

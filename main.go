@@ -107,6 +107,7 @@ type nodeConfig struct {
 	Name     string   `yaml:"name"`
 	URL      string   `yaml:"url"`
 	Tier     string   `yaml:"tier"`
+	Enabled  string   `yaml:"enabled"`
 	Weight   int      `yaml:"weight"`
 	Models   []string `yaml:"models"`
 	APIKey   string   `yaml:"api_key"`
@@ -302,6 +303,7 @@ func loadConfig(path string) (config, error) {
 	cfg.AuthToken = expandEnvValue(cfg.AuthToken)
 	for i := range cfg.Nodes {
 		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
+		cfg.Nodes[i].Enabled = expandEnvValue(cfg.Nodes[i].Enabled)
 	}
 	return cfg, nil
 }
@@ -336,6 +338,9 @@ func bearerAuth(token string) func(http.HandlerFunc) http.HandlerFunc {
 func newRouter(cfg config) (*router, error) {
 	nodes := make([]*upstreamNode, 0, len(cfg.Nodes))
 	for _, nc := range cfg.Nodes {
+		if !nodeEnabled(nc.Enabled) {
+			continue
+		}
 		if nc.Name == "" || nc.URL == "" {
 			return nil, fmt.Errorf("node requires name and url")
 		}
@@ -445,7 +450,8 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	model := extractModel(body)
-	node := r.selectNode(model)
+	tier := req.Header.Get("X-Tier")
+	node := r.selectNode(model, tier)
 	if node == nil {
 		http.Error(w, "no healthy upstream available for requested model", http.StatusServiceUnavailable)
 		requestsTotal.WithLabelValues(model, "none", "unavailable").Inc()
@@ -533,15 +539,19 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	requestDuration.WithLabelValues(model, node.cfg.Name).Observe(time.Since(start).Seconds())
 }
 
-func (r *router) selectNode(model string) *upstreamNode {
+func (r *router) selectNode(model, targetTier string) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
 	}
 
+	targetTier = strings.TrimSpace(targetTier)
 	buckets := make(map[int]*bucket)
 	for _, node := range r.nodes {
 		if !node.healthy.Load() {
+			continue
+		}
+		if targetTier != "" && node.cfg.Tier != targetTier {
 			continue
 		}
 		if model == "" || supportsModel(node.cfg.Models, model) {
@@ -569,6 +579,11 @@ func (r *router) selectNode(model string) *upstreamNode {
 	candidates := buckets[priorities[0]].candidates
 	idx := int(r.rr.Add(1)-1) % len(candidates)
 	return candidates[idx]
+}
+
+func nodeEnabled(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return value == "" || value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func (r *router) healthLoop(ctx context.Context) {
