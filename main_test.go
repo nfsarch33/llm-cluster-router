@@ -325,6 +325,89 @@ func TestHandleProxyRetriesOnIdleConnectionClose(t *testing.T) {
 	}
 }
 
+func TestHandleProxyFallsBackToSecondUpstreamWhenPrimaryConnectionFails(t *testing.T) {
+	t.Parallel()
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"from-fallback"}}]}`))
+	}))
+	t.Cleanup(fallback.Close)
+
+	fallbackParsed, err := url.Parse(fallback.URL)
+	if err != nil {
+		t.Fatalf("parse fallback url: %v", err)
+	}
+
+	deadParsed, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse dead url: %v", err)
+	}
+
+	const model = "shared-model"
+	const tier = "fault"
+
+	deadNode := &upstreamNode{
+		cfg: nodeConfig{
+			Name:     "primary-dead",
+			Tier:     tier,
+			Priority: 0,
+			Weight:   1,
+			Models:   []string{model},
+		},
+		baseURL: deadParsed,
+	}
+	deadNode.healthy.Store(true)
+
+	fallbackNode := &upstreamNode{
+		cfg: nodeConfig{
+			Name:     "fallback-live",
+			Tier:     tier,
+			Priority: 1,
+			Weight:   1,
+			Models:   []string{model},
+		},
+		baseURL: fallbackParsed,
+	}
+	fallbackNode.healthy.Store(true)
+
+	r := &router{
+		cfg: config{
+			Defaults: defaults{
+				MaxQueueDepth:  8,
+				MaxConcurrency: 4,
+				RequestTimeout: durationValue{Duration: 5 * time.Second},
+				MaxBodySize:    1 << 20,
+			},
+		},
+		client:    &http.Client{Timeout: 2 * time.Second},
+		semaphore: make(chan struct{}, 4),
+		nodes:     []*upstreamNode{deadNode, fallbackNode},
+	}
+
+	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tier", tier)
+	w := httptest.NewRecorder()
+
+	r.handleProxy(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from fallback upstream, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "from-fallback") {
+		t.Fatalf("expected fallback body in response, got %q", w.Body.String())
+	}
+	if deadNode.healthy.Load() {
+		t.Fatal("expected dead primary node to be marked unhealthy after failure")
+	}
+}
+
 func TestRunCancelProbeSetsMaxTokens(t *testing.T) {
 	t.Parallel()
 
