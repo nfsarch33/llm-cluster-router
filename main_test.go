@@ -11,6 +11,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -405,6 +406,91 @@ func TestHandleProxyFallsBackToSecondUpstreamWhenPrimaryConnectionFails(t *testi
 	}
 	if deadNode.healthy.Load() {
 		t.Fatal("expected dead primary node to be marked unhealthy after failure")
+	}
+}
+
+func TestHandleProxyConcurrentRequestsUseFallbackWhenPrimaryDead(t *testing.T) {
+	t.Parallel()
+
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"from-fallback"}}]}`))
+	}))
+	t.Cleanup(fallback.Close)
+
+	fallbackParsed, err := url.Parse(fallback.URL)
+	if err != nil {
+		t.Fatalf("parse fallback url: %v", err)
+	}
+	deadParsed, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse dead url: %v", err)
+	}
+
+	const model = "shared-model"
+	const tier = "fault-concurrent"
+
+	deadNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "primary-dead-conc", Tier: tier, Priority: 0, Weight: 1, Models: []string{model}},
+		baseURL: deadParsed,
+	}
+	deadNode.healthy.Store(true)
+
+	fallbackNode := &upstreamNode{
+		cfg:     nodeConfig{Name: "fallback-live-conc", Tier: tier, Priority: 1, Weight: 1, Models: []string{model}},
+		baseURL: fallbackParsed,
+	}
+	fallbackNode.healthy.Store(true)
+
+	const maxConc = 6
+	r := &router{
+		cfg: config{
+			Defaults: defaults{
+				MaxQueueDepth:  32,
+				MaxConcurrency: maxConc,
+				RequestTimeout: durationValue{Duration: 5 * time.Second},
+				MaxBodySize:    1 << 20,
+			},
+		},
+		client:    &http.Client{Timeout: 2 * time.Second},
+		semaphore: make(chan struct{}, maxConc),
+		nodes:     []*upstreamNode{deadNode, fallbackNode},
+	}
+
+	const nReq = 12
+	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
+	errs := make(chan string, nReq)
+	var wg sync.WaitGroup
+	wg.Add(nReq)
+	for i := 0; i < nReq; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Tier", tier)
+			w := httptest.NewRecorder()
+			r.handleProxy(w, req)
+			if w.Code != http.StatusOK {
+				errs <- fmt.Sprintf("status=%d body=%s", w.Code, w.Body.String())
+				return
+			}
+			if !strings.Contains(w.Body.String(), "from-fallback") {
+				errs <- fmt.Sprintf("missing fallback marker: %q", w.Body.String())
+				return
+			}
+			errs <- ""
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		if msg != "" {
+			t.Fatal(msg)
+		}
 	}
 }
 
