@@ -1,4 +1,4 @@
-module github.com/nfsarch33/ironclaw/scripts/llm-cluster-router
+module github.com/nfsarch33/llm-cluster-router
 
 go 1.24.0
 

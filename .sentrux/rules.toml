@@ -1,0 +1,9 @@
+[project]
+name = "llm-cluster-router"
+language = "go"
+
+[constraints]
+max_cyclomatic_complexity = 20
+max_coupling = 10
+no_god_files = true
+god_file_threshold = 2000

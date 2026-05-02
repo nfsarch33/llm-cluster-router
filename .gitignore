@@ -1,0 +1,26 @@
+# Binaries
+llm-cluster-router
+*.exe
+
+# Config with secrets
+router.yml
+!router.sample.yml
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Test/coverage
+coverage.out
+*.test
+
+# Benchmark output
+*-benchmark.json
+*-gpu-probe.json

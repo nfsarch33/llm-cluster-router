@@ -1,3 +1,8 @@
+# llm-cluster-router sample configuration
+#
+# SECURITY: Do NOT point this router at corporate or managed AI gateways
+# (e.g. ai-gateway.zende.sk). This tool is for self-hosted GPU clusters only.
+
 listen: ":8080"
 metrics_addr: ":9091"
 debug_addr: ":6060"
@@ -20,13 +25,13 @@ health_check:
   healthy_threshold: 1
 
 nodes:
-  - name: workstation-3090-agent
+  - name: gpu-0-agent
     url: http://127.0.0.1:8001
     tier: agent
     priority: 0
     weight: 4
     models: ["qwen3.5-27b"]
-  - name: workstation-4070-fast
+  - name: gpu-1-fast
     url: http://127.0.0.1:8002
     tier: fast
     priority: 0

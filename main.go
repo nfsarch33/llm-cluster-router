@@ -763,7 +763,7 @@ func runBench(args []string) error {
 	maxTokens := fs.Int("max-tokens", 64, "maximum completion tokens per request")
 	timeout := fs.Duration("timeout", 3*time.Minute, "request timeout")
 	cancelAfter := fs.Duration("cancel-after", 1500*time.Millisecond, "cancel one probe request after this duration")
-	output := fs.String("output", filepath.Join(os.TempDir(), "ironclaw-mission-control-benchmark.json"), "benchmark report path")
+	output := fs.String("output", filepath.Join(os.TempDir(), "llm-cluster-router-benchmark.json"), "benchmark report path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
