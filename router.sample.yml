@@ -1,7 +1,14 @@
 # llm-cluster-router sample configuration
 #
-# SECURITY: Do NOT point this router at corporate or managed AI gateways
-# (e.g. ai-gateway.zende.sk). This tool is for self-hosted GPU clusters only.
+# SECURITY: This router refuses to start when any node URL hostname
+# matches a corporate or managed AI gateway suffix. The forbidden list
+# is enforced by validateUpstreamURL() in main.go and currently blocks
+# *.zende.sk and *.zendesk.com (case-insensitive, apex + subdomain).
+# This tool is for self-hosted GPU clusters only — point it at a
+# corporate gateway and the prompts (with any embedded secrets, PII,
+# or proprietary data) will silently cross a trust boundary you did
+# not opt into. To extend the list, edit forbiddenUpstreamHostSuffixes
+# in main.go and add a regression test.
 
 listen: ":8080"
 metrics_addr: ":9091"

@@ -304,8 +304,57 @@ func loadConfig(path string) (config, error) {
 	for i := range cfg.Nodes {
 		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
 		cfg.Nodes[i].Enabled = expandEnvValue(cfg.Nodes[i].Enabled)
+		if err := validateUpstreamURL(cfg.Nodes[i].Name, cfg.Nodes[i].URL); err != nil {
+			return cfg, err
+		}
 	}
 	return cfg, nil
+}
+
+// forbiddenUpstreamHostSuffixes is the locked list of hostnames the
+// router refuses to route to. The list is intentionally narrow: it
+// targets corporate or managed gateways whose use would silently push
+// every prompt — and any embedded secrets, PII, or proprietary data —
+// across a trust boundary the operator did not opt into.
+//
+// Suffix matching is case-insensitive and applied after the URL host
+// is lowercased. Both bare apex (zende.sk) and any subdomain
+// (ai-gateway.zende.sk) are blocked. Adding a new entry is a one-line
+// review in this file plus a regression test in main_test.go; do not
+// add behind feature flags.
+var forbiddenUpstreamHostSuffixes = []string{
+	"zende.sk",
+	"zendesk.com",
+}
+
+// validateUpstreamURL parses node.url and rejects it when the host
+// matches a forbiddenUpstreamHostSuffixes entry. The check is
+// case-insensitive and matches the apex domain plus any subdomain.
+//
+// Empty or malformed URLs are passed through; downstream node setup
+// will surface those with a clearer error than this function can.
+func validateUpstreamURL(nodeName, rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return nil
+	}
+	for _, suffix := range forbiddenUpstreamHostSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return fmt.Errorf(
+				"node %q: forbidden upstream host %q (matches %q); "+
+					"see router.sample.yml — this router is for self-hosted clusters only",
+				nodeName, host, suffix,
+			)
+		}
+	}
+	return nil
 }
 
 func expandEnvValue(s string) string {
