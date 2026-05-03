@@ -1,0 +1,41 @@
+# gitleaks configuration for llm-cluster-router.
+#
+# Rules: extends the gitleaks default ruleset (https://github.com/gitleaks/gitleaks).
+# Allowlists below are the SHORT list of intentional, audited exceptions —
+# every entry must point at a real test fixture or generated artifact.
+# DO NOT add an allowlist entry without a one-line "why this is safe" comment.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "audited synthetic fixtures and generated artefacts"
+
+# Per-file regex allowlists. Restrict by path so a real key in a different
+# file still trips the scan.
+paths = [
+    # No path-level allowlists today. Add only when an entire generated
+    # file is unavoidable (e.g. coverage.out, test-output dumps).
+]
+
+# Per-secret regexes. Use sparingly; prefer inline `# gitleaks:allow`
+# annotations in source so reviewers see the suppression alongside the
+# fixture.
+regexes = [
+    # 'sk-expanded-123' is a synthetic API key used in main_test.go to
+    # verify env-var expansion in node.api_key. The fixture is also
+    # annotated inline; this regex is belt-and-suspenders so the scan
+    # cannot drift if someone refactors the test and forgets the
+    # inline annotation.
+    "sk-expanded-123",
+]
+
+# Stop signals (entries that MUST NOT be allowlisted, even by accident).
+# stopwords are matched case-insensitively against any allowlisted hit
+# and re-promote it to a finding. This protects us from a future
+# allowlist that accidentally swallows a real production key.
+stopwords = [
+    "production",
+    "prod-",
+    "live-",
+]

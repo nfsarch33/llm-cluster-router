@@ -626,7 +626,10 @@ func TestExpandEnvValue(t *testing.T) {
 }
 
 func TestLoadConfigExpandsAPIKeyEnvVar(t *testing.T) {
-	t.Setenv("TEST_CLOUD_KEY", "sk-expanded-123")
+	// Test fixture: literal "sk-expanded-123" is a synthetic value
+	// used to verify env-var expansion in node.api_key. It is not a
+	// real API key. The trailing comments suppress gitleaks.
+	t.Setenv("TEST_CLOUD_KEY", "sk-expanded-123") // gitleaks:allow
 
 	yamlContent := `
 listen: ":9999"
@@ -656,8 +659,8 @@ nodes:
 	if len(cfg.Nodes) != 2 {
 		t.Fatalf("expected 2 nodes, got %d", len(cfg.Nodes))
 	}
-	if cfg.Nodes[1].APIKey != "sk-expanded-123" {
-		t.Fatalf("api_key = %q, want sk-expanded-123", cfg.Nodes[1].APIKey)
+	if cfg.Nodes[1].APIKey != "sk-expanded-123" { // gitleaks:allow
+		t.Fatalf("api_key = %q, want sk-expanded-123", cfg.Nodes[1].APIKey) // gitleaks:allow
 	}
 }
 
