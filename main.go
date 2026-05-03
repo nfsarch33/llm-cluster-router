@@ -310,6 +310,17 @@ type gpuProbeReport struct {
 
 type commandRunner func(context.Context, string, ...string) ([]byte, error)
 
+// llmRouterBuckets is the canonical histogram bucket set for
+// LLM-streaming workloads: 50ms..120s. The Prometheus defaults
+// (5ms..10s) cap before any non-trivial generation finishes,
+// flattening every long request into the +Inf bucket and losing
+// p95/p99 resolution. These buckets are wide enough to keep label
+// cardinality low while giving operators meaningful percentiles
+// across the full vLLM/Ollama latency range.
+var llmRouterBuckets = []float64{
+	0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120,
+}
+
 var (
 	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "llm_router_requests_total",
@@ -321,8 +332,13 @@ var (
 	}, []string{"model", "node"})
 	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "llm_router_request_duration_seconds",
-		Help:    "Request duration by model and node.",
-		Buckets: prometheus.DefBuckets,
+		Help:    "End-to-end request duration by model and node (LLM-tuned buckets, 50ms..120s).",
+		Buckets: llmRouterBuckets,
+	}, []string{"model", "node"})
+	requestTTFT = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "llm_router_request_ttft_seconds",
+		Help:    "Time-to-first-byte from upstream by model and node (LLM-tuned buckets, 50ms..120s). Captures router perceived TTFT, not in-token TTFT.",
+		Buckets: llmRouterBuckets,
 	}, []string{"model", "node"})
 	queueDepthGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "llm_router_queue_depth",
@@ -769,6 +785,14 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// TTFT here is "router-perceived time-to-first-byte" -- from
+	// request-arrival to upstream returning headers. It is NOT
+	// in-token TTFT (we don't parse SSE chunks here); for that the
+	// client must measure from the first `data:` line on the
+	// streamed body. Still, this is a useful upstream-side latency
+	// signal because vLLM batching delays appear here.
+	requestTTFT.WithLabelValues(model, node.cfg.Name).Observe(time.Since(start).Seconds())
 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
