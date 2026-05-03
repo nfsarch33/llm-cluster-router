@@ -669,6 +669,96 @@ func writeTestFile(t *testing.T, path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
+// TestLoadConfigRejectsForbiddenUpstreamHosts asserts that loadConfig
+// refuses to start the router when any node URL points at a corporate
+// or managed AI gateway. Personal forks of llm-cluster-router are
+// self-hosted-cluster-only by design (see router.sample.yml). Allowing
+// a forbidden upstream would silently route every prompt — including
+// any that contain personal data, secrets, or PII — into the wrong
+// trust boundary.
+func TestLoadConfigRejectsForbiddenUpstreamHosts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"zende_sk_subdomain", "https://ai-gateway.zende.sk/v1"},
+		{"zende_sk_apex", "https://zende.sk"},
+		{"zendesk_corp_subdomain", "https://corp.zendesk.com/llm"},
+		{"zendesk_internal_subdomain", "https://ai-gateway.internal.zendesk.com"},
+		{"zendesk_uppercase", "https://AI-GATEWAY.ZENDE.SK/v1"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			yamlContent := `
+listen: ":9999"
+nodes:
+  - name: forbidden
+    url: ` + tc.url + `
+    tier: reasoning
+    weight: 1
+    models: ["forbidden-model"]
+`
+			dir := t.TempDir()
+			path := dir + "/forbidden-router.yml"
+			if err := writeTestFile(t, path, yamlContent); err != nil {
+				t.Fatal(err)
+			}
+			_, err := loadConfig(path)
+			if err == nil {
+				t.Fatalf("loadConfig(%q): expected error, got nil", tc.url)
+			}
+			if !strings.Contains(err.Error(), "forbidden upstream host") {
+				t.Fatalf("loadConfig(%q): error %q does not mention 'forbidden upstream host'", tc.url, err)
+			}
+		})
+	}
+}
+
+// TestLoadConfigAllowsLegitimateUpstreamHosts confirms the forbidden-host
+// guard does NOT misfire on the documented happy paths: localhost
+// clusters, a custom OpenAI-compatible cloud (deepseek), and an
+// arbitrary self-hosted IP.
+func TestLoadConfigAllowsLegitimateUpstreamHosts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"loopback", "http://127.0.0.1:8001"},
+		{"private_lan", "http://10.0.0.7:8001"},
+		{"deepseek_cloud", "https://api.deepseek.com"},
+		{"openrouter", "https://openrouter.ai"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			yamlContent := `
+listen: ":9999"
+nodes:
+  - name: ok
+    url: ` + tc.url + `
+    tier: fast
+    weight: 1
+    models: ["ok-model"]
+`
+			dir := t.TempDir()
+			path := dir + "/ok-router.yml"
+			if err := writeTestFile(t, path, yamlContent); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfig(path); err != nil {
+				t.Fatalf("loadConfig(%q): unexpected error: %v", tc.url, err)
+			}
+		})
+	}
+}
+
 func TestBearerAuthNoTokenConfigured(t *testing.T) {
 	t.Parallel()
 	handler := bearerAuth("")(func(w http.ResponseWriter, r *http.Request) {
