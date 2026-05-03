@@ -15,6 +15,7 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 - **GPU probing** — `probe-gpu` subcommand for NVIDIA GPU inventory, VRAM usage, and compute process bindings
 - **Bearer auth** — optional bearer token authentication for `/v1/*` endpoints
 - **Env var expansion** — `${ENV_VAR}` syntax in config YAML for secrets
+- **SIGHUP reload** — atomic config reload (nodes, auth token, timeouts, health-check tuning) without dropping inflight requests; `listen`, `metrics_addr`, `debug_addr`, and `max_body_size` still require restart
 
 ## Quickstart
 
@@ -78,6 +79,34 @@ nodes:
 | `/healthz` | Router health plus per-node status |
 | `/metrics` | Prometheus metrics |
 | `/debug/pprof/*` | Optional pprof (when `debug_addr` is set) |
+
+## Reload
+
+Send `SIGHUP` to the router process to atomically swap config without
+dropping inflight requests:
+
+```bash
+kill -HUP $(pgrep -f 'llm-cluster-router serve')
+```
+
+What reloads:
+
+- `nodes` (add, remove, change models, weights, priority, API keys)
+- `auth_token` (rotate bearer token)
+- `defaults.request_timeout`, `defaults.max_queue_depth`,
+  `defaults.max_concurrency`
+- `health_check.*` (interval, timeout, path, thresholds)
+
+What still requires a process restart:
+
+- `listen`, `metrics_addr`, `debug_addr` (listener sockets)
+- `defaults.max_body_size` (bound at server boot)
+
+A failed reload (file not found, YAML parse error, missing required
+node fields) is rejected and the previous config stays in effect.
+Inflight requests continue using the previous concurrency budget;
+new requests use the new one. Both budgets coexist briefly during
+the swap and resolve naturally as the old requests drain.
 
 ## Benchmark
 
