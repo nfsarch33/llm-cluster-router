@@ -25,7 +25,7 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
+      - name: Test (unit)
         run: go test -race -coverprofile=coverage.out ./...
 
       - name: Upload coverage
@@ -33,6 +33,24 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+
+  integration:
+    name: Integration tests (httptest mock upstreams)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install pkg-config
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+      - name: Test (integration, build tag)
+        # Tagged tests live in *_test.go files with `//go:build integration`.
+        # They start the router in-process and hit it through real HTTP.
+        run: go test -tags=integration -timeout=2m -count=1 -race -v -run TestIT_ ./...
 
   lint:
     runs-on: ubuntu-latest

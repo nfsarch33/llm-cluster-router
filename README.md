@@ -92,6 +92,39 @@ nodes:
 
 Reports include TTFT p50/p95, latency p50/p95, prompt and generation tokens/sec, queue depth, and cancellation probe results.
 
+## Tests
+
+Two suites:
+
+```bash
+# Unit tests (run on every push, fast, default lane)
+go test -race ./...
+
+# Integration tests (build-tagged so the default lane stays fast)
+go test -tags=integration -timeout=2m -count=1 -race -v -run TestIT_ ./...
+```
+
+The integration suite (`it_test.go`, `//go:build integration`) starts the
+router in-process with mock OpenAI-compatible upstream servers
+(`net/http/httptest.NewServer`) and exercises:
+
+- `TestIT_NoStarvationUnderConcurrentLoad` — burst load from multiple
+  X-User producers; asserts every producer completes within ±20% of
+  equal share (no header-based bias).
+- `TestIT_StreamingSSEPassthrough` — Server-Sent Events from upstream
+  reach the client unchanged with a `[DONE]` terminator.
+- `TestIT_FailoverWhenUpstreamReturns502` — when the primary upstream
+  starts returning HTTP 502, traffic continues to flow via the fallback
+  upstream advertising the same model.
+- `TestIT_ModelsAggregation` — `/v1/models` aggregates inventory from
+  every healthy upstream.
+- `TestIT_PrometheusExpositionFormat` — `/metrics` exposes
+  `llm_router_requests_total`, `_request_duration_seconds`,
+  `_queue_depth`, `_inflight_requests`, and `_node_healthy` with the
+  expected types and labels.
+
+CI runs both suites on every push and PR — see `.github/workflows/ci.yml`.
+
 ## Security
 
 > **Do not** point this router at corporate or managed AI gateways.
