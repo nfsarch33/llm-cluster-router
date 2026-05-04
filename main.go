@@ -17,12 +17,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -114,14 +116,165 @@ type nodeConfig struct {
 	Priority int      `yaml:"priority"`
 }
 
+// router serves OpenAI-compatible traffic across a fleet of upstream
+// LLM nodes. The mutable subset of its state -- cfg, nodes, client,
+// and semaphore -- can be replaced atomically via Reload() so the
+// daemon can absorb config changes (new nodes, removed nodes, new
+// auth token, retuned timeouts) without dropping inflight traffic.
+//
+// Reload semantics:
+//   - The mu lock guards cfg/nodes/client/semaphore. Hot paths take
+//     a single snapshot via snap() at the start of a request; that
+//     snapshot is used for the lifetime of the request so the request
+//     sees a consistent config even if Reload swaps state mid-flight.
+//   - listen, metrics_addr, debug_addr, and max_body_size are
+//     captured at server boot and require a process restart to
+//     change; Reload of those keys is a no-op (logged at warn level
+//     by callers in a future PR; see Band H roadmap).
+//   - Inflight requests continue using the OLD semaphore. New
+//     requests pick up the NEW semaphore. Briefly, both
+//     concurrency budgets coexist; this is intentional and bounded
+//     by the in-progress request count.
 type router struct {
-	cfg        config
-	client     *http.Client
-	semaphore  chan struct{}
-	nodes      []*upstreamNode
+	cfg       config
+	client    *http.Client
+	semaphore chan struct{}
+	nodes     []*upstreamNode
+
+	mu sync.RWMutex // protects cfg, client, semaphore, nodes during Reload
+
 	rr         atomic.Uint64
 	queueDepth atomic.Int64
 	inflight   atomic.Int64
+}
+
+// routerSnap is the consistent view of the reloadable router state
+// taken by hot paths at the start of a request. Once captured, the
+// snapshot is immutable for the rest of that request even if Reload
+// fires in parallel.
+type routerSnap struct {
+	cfg       config
+	nodes     []*upstreamNode
+	client    *http.Client
+	semaphore chan struct{}
+}
+
+// snap takes an RLock and copies the reloadable router state into a
+// caller-owned routerSnap. The nodes slice is duplicated so callers
+// can iterate it without coordinating with Reload; the *upstreamNode
+// pointers themselves are shared (their internal atomic.Bools handle
+// concurrent health-state updates).
+func (r *router) snap() routerSnap {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	nodes := make([]*upstreamNode, len(r.nodes))
+	copy(nodes, r.nodes)
+	return routerSnap{
+		cfg:       r.cfg,
+		nodes:     nodes,
+		client:    r.client,
+		semaphore: r.semaphore,
+	}
+}
+
+// AuthToken returns the bearer token currently expected by the
+// router. It always reflects the most recent successful Reload.
+// Callers who hold the value for longer than a single request
+// should re-read it; an operator can rotate the token via SIGHUP.
+func (r *router) AuthToken() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg.AuthToken
+}
+
+// Reload re-reads the on-disk config at path, builds a new node set
+// + http.Client + semaphore from it, and atomically swaps them in.
+// On any error -- file read, YAML parse, validation, node URL parse
+// -- the previous state is preserved verbatim. The caller can wire
+// this to SIGHUP via watchReloadSignal so an operator can rotate
+// auth tokens, add nodes, or retune timeouts without restarting
+// the daemon.
+//
+// Reload does NOT recreate the http.Server, the listener, the
+// metrics or debug servers, or the body-size limit; those are bound
+// at server boot. See the router doc comment for the restart-only
+// keys.
+func (r *router) Reload(path string) error {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return fmt.Errorf("router reload: load %s: %w", path, err)
+	}
+	nodes, client, sem, err := buildReloadable(cfg)
+	if err != nil {
+		return fmt.Errorf("router reload: build state: %w", err)
+	}
+	r.mu.Lock()
+	r.cfg = cfg
+	r.nodes = nodes
+	r.client = client
+	r.semaphore = sem
+	r.mu.Unlock()
+	log.Printf("router reload succeeded for %s (nodes=%d, max_concurrency=%d, request_timeout=%s)",
+		path, len(nodes), cfg.Defaults.MaxConcurrency, cfg.Defaults.RequestTimeout.Duration)
+	return nil
+}
+
+// watchReloadSignal blocks reading from sigCh and, on each SIGHUP,
+// invokes r.Reload(path). The optional after hook fires after each
+// attempted reload (regardless of outcome) and is provided so tests
+// can synchronise on completion without waiting on a flaky timer.
+//
+// Other signals on the channel are ignored; the goroutine exits
+// when sigCh is closed.
+func watchReloadSignal(sigCh <-chan os.Signal, path string, r *router, after func()) {
+	for sig := range sigCh {
+		if sig != syscall.SIGHUP {
+			continue
+		}
+		if err := r.Reload(path); err != nil {
+			log.Printf("router reload failed: %v", err)
+		}
+		if after != nil {
+			after()
+		}
+	}
+}
+
+// buildReloadable turns a parsed config into the four reloadable
+// pieces of router state. It is shared by newRouter (initial boot)
+// and Reload (atomic swap) so both paths apply identical validation
+// and defaulting.
+func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, error) {
+	nodes := make([]*upstreamNode, 0, len(cfg.Nodes))
+	for _, nc := range cfg.Nodes {
+		if !nodeEnabled(nc.Enabled) {
+			continue
+		}
+		if nc.Name == "" || nc.URL == "" {
+			return nil, nil, nil, fmt.Errorf("node requires name and url")
+		}
+		if nc.Weight <= 0 {
+			nc.Weight = 1
+		}
+		parsed, err := url.Parse(nc.URL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("parse node %s url: %w", nc.Name, err)
+		}
+		node := &upstreamNode{cfg: nc, baseURL: parsed}
+		node.healthy.Store(true)
+		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
+		nodes = append(nodes, node)
+	}
+	client := &http.Client{
+		Timeout: cfg.Defaults.RequestTimeout.Duration,
+		Transport: &http.Transport{
+			MaxIdleConns:        20,
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+	sem := make(chan struct{}, cfg.Defaults.MaxConcurrency)
+	return nodes, client, sem, nil
 }
 
 type upstreamNode struct {
@@ -235,7 +388,10 @@ func runServe(args []string) error {
 		}()
 	}
 
-	authWrap := bearerAuth(cfg.AuthToken)
+	// Use a closure-form wrapper so the bearer token can be rotated
+	// via SIGHUP without restarting the listener. Each request
+	// consults r.AuthToken() afresh.
+	authWrap := bearerAuthFunc(r.AuthToken)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", r.handleHealth)
@@ -250,6 +406,14 @@ func runServe(args []string) error {
 		Handler:           limitBody(cfg.Defaults.MaxBodySize, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	// Wire SIGHUP -> Reload so an operator can rotate auth tokens,
+	// add or remove nodes, and retune health-check / concurrency
+	// settings without dropping inflight requests. Listener address
+	// and max_body_size are captured at boot and require restart.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go watchReloadSignal(sigCh, *configPath, r, nil)
 
 	log.Printf("router listening on %s", cfg.Listen)
 	return server.ListenAndServe()
@@ -384,38 +548,37 @@ func bearerAuth(token string) func(http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// bearerAuthFunc is the dynamic-token form of bearerAuth. It calls
+// getToken() on each request so SIGHUP-driven token rotation is
+// picked up immediately without rebuilding the http.ServeMux. An
+// empty token disables auth entirely (matching bearerAuth).
+func bearerAuthFunc(getToken func() string) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			token := getToken()
+			if token == "" {
+				next(w, r)
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+token {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+}
+
 func newRouter(cfg config) (*router, error) {
-	nodes := make([]*upstreamNode, 0, len(cfg.Nodes))
-	for _, nc := range cfg.Nodes {
-		if !nodeEnabled(nc.Enabled) {
-			continue
-		}
-		if nc.Name == "" || nc.URL == "" {
-			return nil, fmt.Errorf("node requires name and url")
-		}
-		if nc.Weight <= 0 {
-			nc.Weight = 1
-		}
-		parsed, err := url.Parse(nc.URL)
-		if err != nil {
-			return nil, fmt.Errorf("parse node %s url: %w", nc.Name, err)
-		}
-		node := &upstreamNode{cfg: nc, baseURL: parsed}
-		node.healthy.Store(true)
-		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
-		nodes = append(nodes, node)
+	nodes, client, sem, err := buildReloadable(cfg)
+	if err != nil {
+		return nil, err
 	}
 	return &router{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: cfg.Defaults.RequestTimeout.Duration,
-			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				MaxIdleConnsPerHost: 4,
-				IdleConnTimeout:     30 * time.Second,
-			},
-		},
-		semaphore: make(chan struct{}, cfg.Defaults.MaxConcurrency),
+		cfg:       cfg,
+		client:    client,
+		semaphore: sem,
 		nodes:     nodes,
 	}, nil
 }
@@ -435,9 +598,10 @@ func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Models  []string `json:"models"`
 		Healthy bool     `json:"healthy"`
 	}
-	nodes := make([]nodeStatus, 0, len(r.nodes))
+	snap := r.snap()
+	nodes := make([]nodeStatus, 0, len(snap.nodes))
 	healthy := 0
-	for _, node := range r.nodes {
+	for _, node := range snap.nodes {
 		ok := node.healthy.Load()
 		if ok {
 			healthy++
@@ -454,19 +618,20 @@ func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                healthy > 0,
 		"healthy_nodes":     healthy,
-		"total_nodes":       len(r.nodes),
+		"total_nodes":       len(snap.nodes),
 		"queue_depth":       r.queueDepth.Load(),
 		"inflight_requests": r.inflight.Load(),
-		"max_queue_depth":   r.cfg.Defaults.MaxQueueDepth,
-		"max_concurrency":   r.cfg.Defaults.MaxConcurrency,
+		"max_queue_depth":   snap.cfg.Defaults.MaxQueueDepth,
+		"max_concurrency":   snap.cfg.Defaults.MaxConcurrency,
 		"nodes":             nodes,
 	})
 }
 
 func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
+	snap := r.snap()
 	seen := make(map[string]struct{})
 	models := make([]map[string]string, 0)
-	for _, node := range r.nodes {
+	for _, node := range snap.nodes {
 		if !node.healthy.Load() {
 			continue
 		}
@@ -498,9 +663,16 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Snapshot the reloadable state once at the top so the entire
+	// request runs against a consistent config even if SIGHUP fires
+	// mid-flight. The snapshot is cheap (one RLock + a slice copy)
+	// and avoids the inconsistency of a request that picks a node
+	// from one config and a timeout from a newer one.
+	snap := r.snap()
+
 	model := extractModel(body)
 	tier := req.Header.Get("X-Tier")
-	node := r.selectNode(model, tier)
+	node := r.selectNodeFromSnap(snap, model, tier, "")
 	if node == nil {
 		http.Error(w, "no healthy upstream available for requested model", http.StatusServiceUnavailable)
 		requestsTotal.WithLabelValues(model, "none", "unavailable").Inc()
@@ -509,7 +681,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	queueDepth := r.queueDepth.Add(1)
 	queueDepthGauge.Set(float64(queueDepth))
-	if int(queueDepth) > r.cfg.Defaults.MaxQueueDepth {
+	if int(queueDepth) > snap.cfg.Defaults.MaxQueueDepth {
 		r.queueDepth.Add(-1)
 		queueDepthGauge.Set(float64(r.queueDepth.Load()))
 		http.Error(w, "router queue is full", http.StatusTooManyRequests)
@@ -518,11 +690,11 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	select {
-	case r.semaphore <- struct{}{}:
+	case snap.semaphore <- struct{}{}:
 		r.queueDepth.Add(-1)
 		queueDepthGauge.Set(float64(r.queueDepth.Load()))
 		defer func() {
-			<-r.semaphore
+			<-snap.semaphore
 		}()
 	case <-req.Context().Done():
 		r.queueDepth.Add(-1)
@@ -543,7 +715,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	upstreamURL.Path = strings.TrimRight(node.baseURL.Path, "/") + req.URL.Path
 	upstreamURL.RawQuery = req.URL.RawQuery
 
-	ctx, cancel := context.WithTimeout(req.Context(), r.cfg.Defaults.RequestTimeout.Duration)
+	ctx, cancel := context.WithTimeout(req.Context(), snap.cfg.Defaults.RequestTimeout.Duration)
 	defer cancel()
 
 	upstreamReq, err := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
@@ -557,7 +729,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		upstreamReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
 	}
 
-	resp, err := r.client.Do(upstreamReq)
+	resp, err := snap.client.Do(upstreamReq)
 	if err != nil && isRetryableConnError(err) {
 		requestRetries.WithLabelValues(model, node.cfg.Name).Inc()
 		retryReq, retryErr := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
@@ -566,13 +738,13 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			if node.cfg.APIKey != "" {
 				retryReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
 			}
-			resp, err = r.client.Do(retryReq)
+			resp, err = snap.client.Do(retryReq)
 		}
 	}
 	if err != nil {
 		node.healthy.Store(false)
 		nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
-		if fallback := r.selectNodeExcluding(model, tier, node.cfg.Name); fallback != nil {
+		if fallback := r.selectNodeFromSnap(snap, model, tier, node.cfg.Name); fallback != nil {
 			fallbackURL := *fallback.baseURL
 			fallbackURL.Path = strings.TrimRight(fallback.baseURL.Path, "/") + req.URL.Path
 			fallbackURL.RawQuery = req.URL.RawQuery
@@ -582,7 +754,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 				if fallback.cfg.APIKey != "" {
 					fallbackReq.Header.Set("Authorization", "Bearer "+fallback.cfg.APIKey)
 				}
-				resp, err = r.client.Do(fallbackReq)
+				resp, err = snap.client.Do(fallbackReq)
 				if err == nil {
 					node = fallback
 				} else {
@@ -610,11 +782,21 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	requestDuration.WithLabelValues(model, node.cfg.Name).Observe(time.Since(start).Seconds())
 }
 
+// selectNode is the legacy entrypoint kept for direct test usage.
+// Production callers should prefer selectNodeFromSnap so the entire
+// request shares a single config snapshot.
 func (r *router) selectNode(model, targetTier string) *upstreamNode {
 	return r.selectNodeExcluding(model, targetTier, "")
 }
 
+// selectNodeExcluding is the legacy form of selectNodeFromSnap that
+// still takes an RLock for tests that don't have a snapshot in
+// hand. New production code paths take a snap up front.
 func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *upstreamNode {
+	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName)
+}
+
+func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -622,7 +804,7 @@ func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *ups
 
 	targetTier = strings.TrimSpace(targetTier)
 	buckets := make(map[int]*bucket)
-	for _, node := range r.nodes {
+	for _, node := range snap.nodes {
 		if !node.healthy.Load() {
 			continue
 		}
@@ -666,38 +848,46 @@ func nodeEnabled(value string) bool {
 
 func (r *router) healthLoop(ctx context.Context) {
 	r.runHealthPass(ctx)
-	ticker := time.NewTicker(r.cfg.HealthCheck.Interval.Duration)
-	defer ticker.Stop()
+	// Re-read the interval before every tick so a SIGHUP reload
+	// that retunes health_check.interval takes effect on the next
+	// pass instead of being pinned to the boot-time value.
 	for {
+		snap := r.snap()
+		interval := snap.cfg.HealthCheck.Interval.Duration
+		if interval <= 0 {
+			interval = 15 * time.Second
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(interval):
 			r.runHealthPass(ctx)
 		}
 	}
 }
 
 func (r *router) runHealthPass(ctx context.Context) {
+	snap := r.snap()
+	hc := snap.cfg.HealthCheck
 	var wg sync.WaitGroup
-	for _, node := range r.nodes {
+	for _, node := range snap.nodes {
 		wg.Add(1)
 		go func(node *upstreamNode) {
 			defer wg.Done()
 			start := time.Now()
-			pass := probeNode(ctx, r.cfg.HealthCheck, node)
+			pass := probeNode(ctx, hc, node)
 			healthLatency.WithLabelValues(node.cfg.Name).Observe(time.Since(start).Seconds())
 			if pass {
 				node.consecutiveFail.Store(0)
 				passes := node.consecutivePass.Add(1)
-				if passes >= int64(r.cfg.HealthCheck.HealthyThreshold) {
+				if passes >= int64(hc.HealthyThreshold) {
 					node.healthy.Store(true)
 					nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(1)
 				}
 			} else {
 				node.consecutivePass.Store(0)
 				fails := node.consecutiveFail.Add(1)
-				if fails >= int64(r.cfg.HealthCheck.UnhealthyThreshold) {
+				if fails >= int64(hc.UnhealthyThreshold) {
 					node.healthy.Store(false)
 					nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
 				}
