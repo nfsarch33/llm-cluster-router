@@ -80,6 +80,28 @@ nodes:
 | `/metrics` | Prometheus metrics |
 | `/debug/pprof/*` | Optional pprof (when `debug_addr` is set) |
 
+## Grafana dashboard
+
+Import `dashboards/llm-cluster-router.json` into Grafana 11+. The
+dashboard exposes a `$datasource` template variable so it works in
+any Grafana org without per-panel edits, plus `$model` and `$node`
+filters wired to the metrics the router exports.
+
+Panels:
+
+- Healthy upstreams, inflight, queue depth, RPS (top-row stat panels)
+- End-to-end latency p50 / p95 / p99 by model
+- Time-to-first-byte (TTFT) p50 / p95 / p99 by model
+- Requests/sec by node + status (stacked bars)
+- Queue depth and inflight (timeseries)
+- Per-node health (1 = healthy, 0 = unhealthy)
+- Upstream health-probe p95 latency
+
+A test in `dashboards/dashboard_test.go` enforces the dashboard
+references every metric the router exports, so any future metric
+additions must update both the router and the dashboard JSON in
+the same commit.
+
 ## Reload
 
 Send `SIGHUP` to the router process to atomically swap config without
