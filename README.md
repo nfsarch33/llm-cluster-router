@@ -10,6 +10,7 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 - **SSE streaming** — full Server-Sent Events pass-through for streaming completions
 - **Tier-based routing** — assign nodes to tiers (agent, fast, reasoning) with priority and weight
 - **Health checking** — automatic health probing with configurable thresholds; supports both vLLM (`/health`) and Ollama (`/v1/models`) backends
+- **Per-upstream circuit breaker** — flapping nodes are dropped from rotation faster than the health-check loop notices; 5-failure threshold, 30s cooldown, exposed via `llm_router_circuit_state` gauge
 - **Prometheus `/metrics`** — request latency + TTFT histograms (LLM-tuned 50ms..120s buckets), queue depth gauges, per-node health status, upstream error counters
 - **Benchmark harness** — built-in `bench` subcommand with TTFT p50/p95, generation tokens/sec, and cancellation probes
 - **GPU probing** — `probe-gpu` subcommand for NVIDIA GPU inventory, VRAM usage, and compute process bindings

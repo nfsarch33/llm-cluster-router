@@ -262,6 +262,7 @@ func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, 
 		}
 		node := &upstreamNode{cfg: nc, baseURL: parsed}
 		node.healthy.Store(true)
+		node.breaker = newCircuitBreaker(5, 30*time.Second).withName(nc.Name)
 		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
 		nodes = append(nodes, node)
 	}
@@ -283,6 +284,14 @@ type upstreamNode struct {
 	healthy         atomic.Bool
 	consecutivePass atomic.Int64
 	consecutiveFail atomic.Int64
+
+	// breaker is the per-upstream circuit breaker. It is
+	// consulted by selectNodeFromSnap so an upstream that is
+	// returning errors faster than the slower health-check loop
+	// notices is removed from rotation immediately. Defaults to a
+	// 5-failure threshold + 30s cooldown; future PRs can expose
+	// these as per-node config.
+	breaker *circuitBreaker
 }
 
 type gpuProcess struct {
@@ -760,6 +769,9 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		node.healthy.Store(false)
 		nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
+		if node.breaker != nil {
+			node.breaker.recordFailure()
+		}
 		if fallback := r.selectNodeFromSnap(snap, model, tier, node.cfg.Name); fallback != nil {
 			fallbackURL := *fallback.baseURL
 			fallbackURL.Path = strings.TrimRight(fallback.baseURL.Path, "/") + req.URL.Path
@@ -804,6 +816,17 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	statusLabel := strconv.Itoa(resp.StatusCode)
 	requestsTotal.WithLabelValues(model, node.cfg.Name, statusLabel).Inc()
 	requestDuration.WithLabelValues(model, node.cfg.Name).Observe(time.Since(start).Seconds())
+	// 5xx upstream responses count as breaker failures even when
+	// the transport delivered the bytes. 4xx is treated as
+	// upstream-rejected-the-input (caller's fault), not a node
+	// problem, so we only record a success for <500.
+	if node.breaker != nil {
+		if resp.StatusCode >= 500 {
+			node.breaker.recordFailure()
+		} else {
+			node.breaker.recordSuccess()
+		}
+	}
 }
 
 // selectNode is the legacy entrypoint kept for direct test usage.
@@ -836,6 +859,12 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 			continue
 		}
 		if targetTier != "" && node.cfg.Tier != targetTier {
+			continue
+		}
+		// Skip nodes whose circuit breaker is open. allow() is
+		// the routing-time check; nodes constructed via test
+		// helpers without a breaker fall through (nil-safe).
+		if node.breaker != nil && !node.breaker.allow() {
 			continue
 		}
 		if model == "" || supportsModel(node.cfg.Models, model) {

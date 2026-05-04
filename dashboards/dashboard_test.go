@@ -20,6 +20,7 @@ var requiredMetrics = []string{
 	"llm_router_inflight_requests",
 	"llm_router_node_healthy",
 	"llm_router_requests_total",
+	"llm_router_circuit_state",
 }
 
 // TestDashboardJSONIsValid asserts dashboards/llm-cluster-router.json
