@@ -83,6 +83,67 @@ func TestHandleProxy_RecordsTTFT(t *testing.T) {
 	}
 }
 
+func TestQueueDepthByTierGaugeExposed(t *testing.T) {
+	queueDepthByTierGauge.WithLabelValues("fast").Set(2)
+
+	value := gaugeValueForLabels(t, "llm_router_queue_depth_by_tier", map[string]string{
+		"tier": "fast",
+	})
+	if value != 2 {
+		t.Fatalf("queue depth by tier = %v, want 2", value)
+	}
+}
+
+func TestTokenRateHistogramsExposed(t *testing.T) {
+	generationTokensPerSecond.WithLabelValues("__bucket_probe__", "__bucket_probe__").Observe(12.5)
+	promptTokensPerSecond.WithLabelValues("__bucket_probe__", "__bucket_probe__").Observe(80)
+
+	for _, name := range []string{
+		"llm_router_generation_tokens_per_second",
+		"llm_router_prompt_tokens_per_second",
+	} {
+		got := capturedBuckets(t, name)
+		want := tokenRateBuckets()
+		if len(got) != len(want) {
+			t.Fatalf("%s bucket count: got %d (%v), want %d (%v)", name, len(got), got, len(want), want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s bucket %d: got %v, want %v", name, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+func TestHandleProxy_RecordsTokenRatesFromStreamingUsage(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":10}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	r := newTestRouter(t, upstream.URL, "beta")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"beta","messages":[{"role":"user","content":"ping"}]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	r.handleProxy(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	count := histogramCountForLabels(t, "llm_router_generation_tokens_per_second", map[string]string{
+		"model": "beta",
+	})
+	if count < 1 {
+		t.Fatalf("expected generation tokens/s observation for model=beta, got %d", count)
+	}
+}
+
 // helpers
 //
 
@@ -95,6 +156,10 @@ func llmHistogramBuckets() []float64 {
 	return []float64{
 		0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120,
 	}
+}
+
+func tokenRateBuckets() []float64 {
+	return []float64{1, 2, 5, 10, 20, 40, 80, 120, 200}
 }
 
 // capturedBuckets gathers the upper bounds of a registered
@@ -169,6 +234,38 @@ func histogramCountForLabels(t *testing.T, name string, want map[string]string) 
 			return h.GetSampleCount()
 		}
 	}
+	return 0
+}
+
+func gaugeValueForLabels(t *testing.T, name string, want map[string]string) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			matches := true
+			for k, v := range want {
+				if labels[k] != v {
+					matches = false
+					break
+				}
+			}
+			if !matches || m.GetGauge() == nil {
+				continue
+			}
+			return m.GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("gauge %q with labels %+v not found", name, want)
 	return 0
 }
 
