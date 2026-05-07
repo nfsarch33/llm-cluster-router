@@ -146,6 +146,9 @@ type router struct {
 	rr         atomic.Uint64
 	queueDepth atomic.Int64
 	inflight   atomic.Int64
+
+	queueTierMu      sync.Mutex
+	queueDepthByTier map[string]int64
 }
 
 // routerSnap is the consistent view of the reloadable router state
@@ -330,6 +333,8 @@ var llmRouterBuckets = []float64{
 	0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120,
 }
 
+var routerTokenRateBuckets = []float64{1, 2, 5, 10, 20, 40, 80, 120, 200}
+
 var (
 	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "llm_router_requests_total",
@@ -353,10 +358,24 @@ var (
 		Name: "llm_router_queue_depth",
 		Help: "Current router queue depth.",
 	})
+	queueDepthByTierGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "llm_router_queue_depth_by_tier",
+		Help: "Current router queue depth partitioned by selected tier.",
+	}, []string{"tier"})
 	inflightGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "llm_router_inflight_requests",
 		Help: "Current number of inflight requests.",
 	})
+	generationTokensPerSecond = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "llm_router_generation_tokens_per_second",
+		Help:    "Completion token throughput inferred from OpenAI-compatible usage payloads.",
+		Buckets: routerTokenRateBuckets,
+	}, []string{"model", "node"})
+	promptTokensPerSecond = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "llm_router_prompt_tokens_per_second",
+		Help:    "Prompt token throughput inferred from OpenAI-compatible usage payloads.",
+		Buckets: routerTokenRateBuckets,
+	}, []string{"model", "node"})
 	nodeHealthyGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "llm_router_node_healthy",
 		Help: "Whether an upstream node is healthy.",
@@ -704,11 +723,16 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	tierLabel := metricLabel(node.cfg.Tier, "unknown")
 	queueDepth := r.queueDepth.Add(1)
 	queueDepthGauge.Set(float64(queueDepth))
+	r.addQueueDepthByTier(tierLabel, 1)
+	dequeue := func() {
+		queueDepthGauge.Set(float64(r.queueDepth.Add(-1)))
+		r.addQueueDepthByTier(tierLabel, -1)
+	}
 	if int(queueDepth) > snap.cfg.Defaults.MaxQueueDepth {
-		r.queueDepth.Add(-1)
-		queueDepthGauge.Set(float64(r.queueDepth.Load()))
+		dequeue()
 		http.Error(w, "router queue is full", http.StatusTooManyRequests)
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "queue_full").Inc()
 		return
@@ -716,14 +740,12 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	select {
 	case snap.semaphore <- struct{}{}:
-		r.queueDepth.Add(-1)
-		queueDepthGauge.Set(float64(r.queueDepth.Load()))
+		dequeue()
 		defer func() {
 			<-snap.semaphore
 		}()
 	case <-req.Context().Done():
-		r.queueDepth.Add(-1)
-		queueDepthGauge.Set(float64(r.queueDepth.Load()))
+		dequeue()
 		http.Error(w, "request cancelled while queued", http.StatusRequestTimeout)
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "cancelled").Inc()
 		return
@@ -808,10 +830,13 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(flushWriter{ResponseWriter: w}, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
+	capturedBody := &limitedBuffer{limit: 2 << 20}
+	bodyReader := io.TeeReader(resp.Body, capturedBody)
+	if _, err := io.Copy(flushWriter{ResponseWriter: w}, bodyReader); err != nil && !errors.Is(err, context.Canceled) {
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "stream_error").Inc()
 		return
 	}
+	observeTokenRates(model, node.cfg.Name, time.Since(start), capturedBody.Bytes())
 
 	statusLabel := strconv.Itoa(resp.StatusCode)
 	requestsTotal.WithLabelValues(model, node.cfg.Name, statusLabel).Inc()
@@ -827,6 +852,97 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			node.breaker.recordSuccess()
 		}
 	}
+}
+
+func (r *router) addQueueDepthByTier(tier string, delta int64) {
+	r.queueTierMu.Lock()
+	defer r.queueTierMu.Unlock()
+	if r.queueDepthByTier == nil {
+		r.queueDepthByTier = make(map[string]int64)
+	}
+	next := r.queueDepthByTier[tier] + delta
+	if next < 0 {
+		next = 0
+	}
+	r.queueDepthByTier[tier] = next
+	queueDepthByTierGauge.WithLabelValues(tier).Set(float64(next))
+}
+
+func metricLabel(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+type limitedBuffer struct {
+	limit int
+	buf   bytes.Buffer
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 || b.buf.Len() < b.limit {
+		remaining := b.limit - b.buf.Len()
+		if b.limit <= 0 || remaining > len(p) {
+			remaining = len(p)
+		}
+		if remaining > 0 {
+			_, _ = b.buf.Write(p[:remaining])
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) Bytes() []byte {
+	return b.buf.Bytes()
+}
+
+func observeTokenRates(model, node string, elapsed time.Duration, body []byte) {
+	if elapsed <= 0 {
+		return
+	}
+	promptTokens, completionTokens, ok := extractUsageTokens(body)
+	if !ok {
+		return
+	}
+	seconds := elapsed.Seconds()
+	if completionTokens > 0 {
+		generationTokensPerSecond.WithLabelValues(model, node).Observe(float64(completionTokens) / seconds)
+	}
+	if promptTokens > 0 {
+		promptTokensPerSecond.WithLabelValues(model, node).Observe(float64(promptTokens) / seconds)
+	}
+}
+
+func extractUsageTokens(body []byte) (int, int, bool) {
+	for _, rawLine := range strings.Split(string(body), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if prompt, completion, ok := usageTokensFromJSON([]byte(payload)); ok {
+			return prompt, completion, true
+		}
+	}
+	return usageTokensFromJSON(body)
+}
+
+func usageTokensFromJSON(body []byte) (int, int, bool) {
+	var payload struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Usage == nil {
+		return 0, 0, false
+	}
+	return payload.Usage.PromptTokens, payload.Usage.CompletionTokens, true
 }
 
 // selectNode is the legacy entrypoint kept for direct test usage.

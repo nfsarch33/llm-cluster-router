@@ -17,9 +17,12 @@ var requiredMetrics = []string{
 	"llm_router_request_duration_seconds",
 	"llm_router_request_ttft_seconds",
 	"llm_router_queue_depth",
+	"llm_router_queue_depth_by_tier",
 	"llm_router_inflight_requests",
 	"llm_router_node_healthy",
 	"llm_router_requests_total",
+	"llm_router_generation_tokens_per_second",
+	"llm_router_prompt_tokens_per_second",
 	"llm_router_circuit_state",
 }
 
