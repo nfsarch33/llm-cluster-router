@@ -1,5 +1,16 @@
 package main
 
+// runx-public-repo-gate: allow-file personal_path_id
+//
+// This file intentionally references the `ai-gateway.zende.sk` host as
+// part of the regression coverage for the upstream block-list
+// (`forbiddenUpstreamHostSuffixes` in main.go). The literal anchors a
+// security guardrail: the router refuses to forward prompts/secrets to
+// corporate AI gateways the operator did not opt into. Sunset: after
+// the 2026-05-28 ZD AI-gateway contract cleanup the literal can be
+// removed entirely and this directive reverted. See
+// `backlog/v321-public-repo-cleanup.md` (story v321-3) for context.
+
 import (
 	"context"
 	"encoding/json"

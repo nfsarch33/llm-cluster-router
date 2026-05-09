@@ -1,5 +1,18 @@
 package main
 
+// runx-public-repo-gate: allow-file personal_path_id
+//
+// This file intentionally references the `ai-gateway.zende.sk` host as
+// part of the upstream block-list security declaration
+// (`forbiddenUpstreamHostSuffixes`). The literal anchors a security
+// guardrail: the router refuses to forward prompts/secrets to corporate
+// AI gateways the operator did not opt into. Adding a new entry is a
+// one-line review here plus a regression test in main_test.go; do not
+// add behind feature flags. Sunset: after the 2026-05-28 ZD AI-gateway
+// contract cleanup the literal can be removed entirely and this
+// directive reverted. See `backlog/v321-public-repo-cleanup.md`
+// (story v321-3) for context.
+
 import (
 	"bufio"
 	"bytes"
