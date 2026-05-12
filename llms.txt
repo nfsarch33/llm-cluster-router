@@ -1,0 +1,69 @@
+# llm-cluster-router
+
+> OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters
+> with fair-share per-user queuing. Drop-in proxy for `/v1/chat/completions`
+> and `/v1/models` with streaming, tier-based routing, health checking, and
+> Prometheus metrics.
+
+## Overview
+
+- Name: llm-cluster-router
+- Purpose: OpenAI-compatible HTTP reverse-proxy for multi-node LLM clusters; provides fair-share per-user queuing, SSE streaming pass-through, tier-based routing (agent/fast/reasoning), health-checked upstreams with circuit breakers, Prometheus metrics, and SIGHUP config reload.
+- Language(s): Go
+- License: MIT
+- Authoritative README: <https://github.com/nfsarch33/llm-cluster-router#readme>
+- Source of truth branch: `main`
+
+## Quick Start
+
+- Install:
+  ```
+  go install github.com/nfsarch33/llm-cluster-router@latest
+  ```
+- Build from source:
+  ```
+  git clone https://github.com/nfsarch33/llm-cluster-router.git
+  cd llm-cluster-router
+  go build -o llm-cluster-router .
+  ```
+- Run with sample config:
+  ```
+  ./llm-cluster-router serve -config router.sample.yml
+  ```
+- Minimum runtime prerequisites: Go 1.22+
+
+## Key Concepts
+
+- Configuration via YAML (`router.sample.yml`): nodes, tiers, weights, auth, health check settings
+- Endpoints: `/v1/chat/completions`, `/v1/models`, `/healthz`, `/metrics`
+- Fair-share queuing: per-user sliding-window rate limiting prevents consumer starvation
+- Tier-based routing: agent, fast, reasoning tiers with priority and weight
+- Health checking: automatic probing with configurable thresholds for vLLM and Ollama backends
+- Circuit breaker: 5-failure threshold, 30s cooldown per upstream
+- SIGHUP reload: atomic config swap without dropping inflight requests
+- Grafana dashboard: `dashboards/llm-cluster-router.json`
+- Benchmark harness: `./llm-cluster-router bench` with TTFT p50/p95, throughput, cancellation probes
+- GPU probing: `./llm-cluster-router probe-gpu` for NVIDIA inventory and VRAM usage
+
+## Runnable Examples
+
+- Run unit tests: `go test -race ./...`
+- Run integration tests: `go test -tags=integration -timeout=2m -count=1 -race -v -run TestIT_ ./...`
+- Benchmark: `./llm-cluster-router bench -url http://127.0.0.1:8080 -model <model-name> -requests 8 -concurrency 2`
+- Reload config: `kill -HUP $(pgrep -f 'llm-cluster-router serve')`
+
+## Related Repos
+
+- [fleet-bench](https://github.com/nfsarch33/fleet-bench) — benchmark harness for LLM lane validation
+- [ironclaw-ops](https://github.com/nfsarch33/ironclaw-ops) — operator control-plane (colocated router source)
+
+## Operational Notes
+
+- Issue tracker: <https://github.com/nfsarch33/llm-cluster-router/issues>
+- Security: designed for self-hosted local GPU clusters only; do not point at corporate/managed AI gateways
+- API keys support `${ENV_VAR}` expansion in config YAML
+
+---
+
+*This file follows the emerging `llms.txt` convention adopted by cloudwego/eino,
+Anthropic tooling, and others.*
