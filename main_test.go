@@ -612,6 +612,80 @@ func TestSelectNodeAPIKeySetOnNode(t *testing.T) {
 	}
 }
 
+func TestNextAPIKey_RoundRobin(t *testing.T) {
+	t.Parallel()
+	node := &upstreamNode{
+		cfg: nodeConfig{
+			Name:    "multi-key-node",
+			APIKeys: []string{"key-a", "key-b", "key-c"},
+		},
+	}
+	got := make([]string, 6)
+	for i := range got {
+		got[i] = node.nextAPIKey()
+	}
+	want := []string{"key-a", "key-b", "key-c", "key-a", "key-b", "key-c"}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("call %d: got %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestNextAPIKey_FallbackToSingle(t *testing.T) {
+	t.Parallel()
+	node := &upstreamNode{
+		cfg: nodeConfig{Name: "single-key", APIKey: "sk-solo"},
+	}
+	if got := node.nextAPIKey(); got != "sk-solo" {
+		t.Fatalf("nextAPIKey() = %q, want sk-solo", got)
+	}
+}
+
+func TestNextAPIKey_Empty(t *testing.T) {
+	t.Parallel()
+	node := &upstreamNode{cfg: nodeConfig{Name: "no-key"}}
+	if got := node.nextAPIKey(); got != "" {
+		t.Fatalf("nextAPIKey() = %q, want empty", got)
+	}
+}
+
+func TestLoadConfigExpandsAPIKeysEnvVars(t *testing.T) {
+	t.Setenv("TEST_MK1", "sk-one")   // gitleaks:allow
+	t.Setenv("TEST_MK2", "sk-two")   // gitleaks:allow
+
+	yamlContent := `
+listen: ":9999"
+nodes:
+  - name: multi-key
+    url: http://localhost:8001
+    tier: fast
+    weight: 1
+    api_keys:
+      - ${TEST_MK1}
+      - ${TEST_MK2}
+    models: ["model-x"]
+`
+	dir := t.TempDir()
+	path := dir + "/test-router.yml"
+	if err := writeTestFile(t, path, yamlContent); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if len(cfg.Nodes[0].APIKeys) != 2 {
+		t.Fatalf("api_keys len = %d, want 2", len(cfg.Nodes[0].APIKeys))
+	}
+	if cfg.Nodes[0].APIKeys[0] != "sk-one" { // gitleaks:allow
+		t.Fatalf("api_keys[0] = %q, want sk-one", cfg.Nodes[0].APIKeys[0]) // gitleaks:allow
+	}
+	if cfg.Nodes[0].APIKeys[1] != "sk-two" { // gitleaks:allow
+		t.Fatalf("api_keys[1] = %q, want sk-two", cfg.Nodes[0].APIKeys[1]) // gitleaks:allow
+	}
+}
+
 func TestExpandEnvValue(t *testing.T) {
 	t.Setenv("TEST_EXPAND_KEY", "sk-from-env")
 

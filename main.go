@@ -126,6 +126,7 @@ type nodeConfig struct {
 	Weight   int      `yaml:"weight"`
 	Models   []string `yaml:"models"`
 	APIKey   string   `yaml:"api_key"`
+	APIKeys  []string `yaml:"api_keys"`
 	Priority int      `yaml:"priority"`
 }
 
@@ -300,6 +301,7 @@ type upstreamNode struct {
 	healthy         atomic.Bool
 	consecutivePass atomic.Int64
 	consecutiveFail atomic.Int64
+	keyIdx          atomic.Uint64
 
 	// breaker is the per-upstream circuit breaker. It is
 	// consulted by selectNodeFromSnap so an upstream that is
@@ -308,6 +310,17 @@ type upstreamNode struct {
 	// 5-failure threshold + 30s cooldown; future PRs can expose
 	// these as per-node config.
 	breaker *circuitBreaker
+}
+
+// nextAPIKey returns the next API key via round-robin when multiple
+// keys are configured (api_keys), falls back to the single api_key,
+// or returns "" when no key is set.
+func (n *upstreamNode) nextAPIKey() string {
+	if len(n.cfg.APIKeys) > 0 {
+		idx := n.keyIdx.Add(1) - 1
+		return n.cfg.APIKeys[idx%uint64(len(n.cfg.APIKeys))]
+	}
+	return n.cfg.APIKey
 }
 
 type gpuProcess struct {
@@ -524,6 +537,9 @@ func loadConfig(path string) (config, error) {
 	cfg.AuthToken = expandEnvValue(cfg.AuthToken)
 	for i := range cfg.Nodes {
 		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
+		for j := range cfg.Nodes[i].APIKeys {
+			cfg.Nodes[i].APIKeys[j] = expandEnvValue(cfg.Nodes[i].APIKeys[j])
+		}
 		cfg.Nodes[i].Enabled = expandEnvValue(cfg.Nodes[i].Enabled)
 		if err := validateUpstreamURL(cfg.Nodes[i].Name, cfg.Nodes[i].URL); err != nil {
 			return cfg, err
@@ -785,8 +801,8 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	copyHeaders(upstreamReq.Header, req.Header)
-	if node.cfg.APIKey != "" {
-		upstreamReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
+	if key := node.nextAPIKey(); key != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+key)
 	}
 
 	resp, err := snap.client.Do(upstreamReq)
@@ -795,8 +811,8 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		retryReq, retryErr := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
 		if retryErr == nil {
 			copyHeaders(retryReq.Header, req.Header)
-			if node.cfg.APIKey != "" {
-				retryReq.Header.Set("Authorization", "Bearer "+node.cfg.APIKey)
+			if key := node.nextAPIKey(); key != "" {
+				retryReq.Header.Set("Authorization", "Bearer "+key)
 			}
 			resp, err = snap.client.Do(retryReq)
 		}
@@ -814,8 +830,8 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			fallbackReq, fallbackErr := http.NewRequestWithContext(ctx, req.Method, fallbackURL.String(), bytes.NewReader(body))
 			if fallbackErr == nil {
 				copyHeaders(fallbackReq.Header, req.Header)
-				if fallback.cfg.APIKey != "" {
-					fallbackReq.Header.Set("Authorization", "Bearer "+fallback.cfg.APIKey)
+				if key := fallback.nextAPIKey(); key != "" {
+					fallbackReq.Header.Set("Authorization", "Bearer "+key)
 				}
 				resp, err = snap.client.Do(fallbackReq)
 				if err == nil {

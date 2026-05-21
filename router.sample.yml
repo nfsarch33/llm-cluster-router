@@ -52,3 +52,14 @@ nodes:
   #   weight: 1
   #   api_key: ${DEEPSEEK_API_KEY}
   #   models: ["deepseek-chat"]
+  #
+  # Multi-key round-robin (quota spreading for providers like MiniMax):
+  # - name: minimax-overflow
+  #   url: https://api.minimax.chat
+  #   tier: fast
+  #   priority: 5
+  #   weight: 1
+  #   api_keys:
+  #     - ${MINIMAX_API_KEY_1}
+  #     - ${MINIMAX_API_KEY_2}
+  #   models: ["minimax-text"]
