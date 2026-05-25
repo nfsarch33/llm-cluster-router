@@ -1,11 +1,11 @@
 # llm-cluster-router
 
-OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with fair-share per-user queuing.
+OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with global concurrency limiting and priority-based routing.
 
 ## Features
 
 - **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
-- **Fair-share queues** — per-user sliding-window rate limiting prevents any single consumer from starving others
+- **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload (v0.1.0; per-user fair-share queuing planned for v0.2.0)
 - **Multi-upstream** — route to multiple vLLM, Ollama, or any OpenAI-compatible backend
 - **SSE streaming** — full Server-Sent Events pass-through for streaming completions
 - **Tier-based routing** — assign nodes to tiers (agent, fast, reasoning) with priority and weight
