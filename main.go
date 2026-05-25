@@ -235,7 +235,7 @@ func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, 
 		}
 		node := &upstreamNode{cfg: nc, baseURL: parsed}
 		node.healthy.Store(true)
-		node.breaker = newCircuitBreaker(5, 30*time.Second).withName(nc.Name)
+		node.breaker = newCircuitBreaker(5, 30*time.Second).WithName(nc.Name)
 		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
 		nodes = append(nodes, node)
 	}
@@ -669,7 +669,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		node.healthy.Store(false)
 		nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
 		if node.breaker != nil {
-			node.breaker.recordFailure()
+			node.breaker.RecordFailure()
 		}
 		if fallback := r.selectNodeFromSnap(snap, model, tier, node.cfg.Name); fallback != nil {
 			fallbackURL := *fallback.baseURL
@@ -724,9 +724,9 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	// problem, so we only record a success for <500.
 	if node.breaker != nil {
 		if resp.StatusCode >= 500 {
-			node.breaker.recordFailure()
+			node.breaker.RecordFailure()
 		} else {
-			node.breaker.recordSuccess()
+			node.breaker.RecordSuccess()
 		}
 	}
 }
@@ -854,10 +854,10 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 		if targetTier != "" && node.cfg.Tier != targetTier {
 			continue
 		}
-		// Skip nodes whose circuit breaker is open. allow() is
+		// Skip nodes whose circuit breaker is open. Allow() is
 		// the routing-time check; nodes constructed via test
 		// helpers without a breaker fall through (nil-safe).
-		if node.breaker != nil && !node.breaker.allow() {
+		if node.breaker != nil && !node.breaker.Allow() {
 			continue
 		}
 		if model == "" || supportsModel(node.cfg.Models, model) {

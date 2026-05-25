@@ -13,28 +13,28 @@ func TestCircuitBreaker_OpensOnConsecutiveFailures(t *testing.T) {
 	t.Parallel()
 
 	cb := newCircuitBreaker(3, 50*time.Millisecond)
-	if !cb.allow() {
+	if !cb.Allow() {
 		t.Fatal("breaker should start closed and allow calls")
 	}
-	cb.recordFailure()
-	cb.recordFailure()
-	if !cb.allow() {
+	cb.RecordFailure()
+	cb.RecordFailure()
+	if !cb.Allow() {
 		t.Fatal("breaker should still allow after 2 of 3 failures")
 	}
-	cb.recordFailure()
-	if cb.allow() {
+	cb.RecordFailure()
+	if cb.Allow() {
 		t.Fatal("breaker should be open after the 3rd consecutive failure")
 	}
 
 	// Half-open after cooldown.
 	time.Sleep(70 * time.Millisecond)
-	if !cb.allow() {
+	if !cb.Allow() {
 		t.Fatal("breaker should half-open after cooldown")
 	}
 
 	// A success while half-open closes the breaker.
-	cb.recordSuccess()
-	if !cb.allow() {
+	cb.RecordSuccess()
+	if !cb.Allow() {
 		t.Fatal("breaker should be closed after a success")
 	}
 }
@@ -46,17 +46,17 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 	t.Parallel()
 
 	cb := newCircuitBreaker(2, 30*time.Millisecond)
-	cb.recordFailure()
-	cb.recordFailure()
-	if cb.allow() {
+	cb.RecordFailure()
+	cb.RecordFailure()
+	if cb.Allow() {
 		t.Fatal("breaker should be open after 2 failures")
 	}
 	time.Sleep(40 * time.Millisecond)
-	if !cb.allow() {
+	if !cb.Allow() {
 		t.Fatal("breaker should half-open after cooldown")
 	}
-	cb.recordFailure()
-	if cb.allow() {
+	cb.RecordFailure()
+	if cb.Allow() {
 		t.Fatal("breaker should be open again after half-open failure")
 	}
 }
@@ -68,12 +68,12 @@ func TestCircuitBreaker_SuccessResetsFailureCount(t *testing.T) {
 	t.Parallel()
 
 	cb := newCircuitBreaker(3, time.Second)
-	cb.recordFailure()
-	cb.recordFailure()
-	cb.recordSuccess()
-	cb.recordFailure()
-	cb.recordFailure()
-	if !cb.allow() {
+	cb.RecordFailure()
+	cb.RecordFailure()
+	cb.RecordSuccess()
+	cb.RecordFailure()
+	cb.RecordFailure()
+	if !cb.Allow() {
 		t.Fatal("breaker should still be closed after success reset")
 	}
 }
@@ -104,7 +104,7 @@ func TestUpstreamNode_ExposesCircuitBreaker(t *testing.T) {
 	if r.nodes[0].breaker == nil {
 		t.Fatal("upstreamNode.breaker must be non-nil for circuit-breaker integration")
 	}
-	if !r.nodes[0].breaker.allow() {
+	if !r.nodes[0].breaker.Allow() {
 		t.Fatal("breaker should start closed")
 	}
 }
@@ -132,9 +132,9 @@ func TestSelectNode_SkipsBrokenCircuit(t *testing.T) {
 	}
 	// Force the first node's breaker open.
 	for i := 0; i < 10; i++ {
-		r.nodes[0].breaker.recordFailure()
+		r.nodes[0].breaker.RecordFailure()
 	}
-	if r.nodes[0].breaker.allow() {
+	if r.nodes[0].breaker.Allow() {
 		t.Fatal("expected first node's breaker to be open")
 	}
 
