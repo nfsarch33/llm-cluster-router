@@ -31,6 +31,18 @@ health_check:
   unhealthy_threshold: 3
   healthy_threshold: 1
 
+# Per-user fair-share rate limiting. When enabled, each user (identified
+# by the X-User header, or a hash of the bearer token) gets an independent
+# sliding-window token bucket. This prevents any single user from
+# monopolising the shared GPU cluster.
+# Disabled by default; the global queue depth + concurrency semaphore
+# still provide backpressure.
+fair_share:
+  enabled: false
+  max_requests_per_user: 10
+  window: 60s
+  burst: 3
+
 nodes:
   - name: gpu-0-agent
     url: http://127.0.0.1:8001

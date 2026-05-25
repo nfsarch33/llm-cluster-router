@@ -5,7 +5,8 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 ## Features
 
 - **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
-- **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload (v0.1.0; per-user fair-share queuing planned for v0.2.0)
+- **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload
+- **Per-user fair-share queuing** — sliding-window token bucket per user (keyed by `X-User` header or bearer token hash) prevents any single user from monopolising the cluster (v0.2.0)
 - **Multi-upstream** — route to multiple vLLM, Ollama, or any OpenAI-compatible backend
 - **SSE streaming** — full Server-Sent Events pass-through for streaming completions
 - **Tier-based routing** — assign nodes to tiers (agent, fast, reasoning) with priority and weight
@@ -55,6 +56,13 @@ health_check:
   path: /health
   unhealthy_threshold: 3
   healthy_threshold: 1
+
+# Per-user fair-share (disabled by default)
+fair_share:
+  enabled: false
+  max_requests_per_user: 10
+  window: 60s
+  burst: 3
 
 nodes:
   - name: gpu-0-agent

@@ -77,4 +77,9 @@ var (
 		Help:    "Upstream health check latency.",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
 	}, []string{"node"})
+
+	FairShareRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "llm_router_fairshare_rejected_total",
+		Help: "Requests rejected by the per-user fair-share limiter.",
+	}, []string{"user"})
 )

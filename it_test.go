@@ -109,6 +109,15 @@ func itWithMaxQueueDepth(n int) itRouterOpt {
 	return func(c *config) { c.Defaults.MaxQueueDepth = n }
 }
 
+func itWithFairShare(maxPerUser int, window time.Duration, burst int) itRouterOpt {
+	return func(c *config) {
+		c.FairShare.Enabled = true
+		c.FairShare.MaxRequestsPerUser = maxPerUser
+		c.FairShare.Window = durationValue{Duration: window}
+		c.FairShare.Burst = burst
+	}
+}
+
 // itWaitForHealthyNodes polls the router's nodes until at least `want` are
 // healthy or the deadline passes.
 func itWaitForHealthyNodes(t *testing.T, r *router, want int, within time.Duration) {
@@ -542,5 +551,136 @@ func TestIT_PrometheusExpositionFormat(t *testing.T) {
 	if !strings.Contains(out, `llm_router_requests_total{model="model-0"`) &&
 		!strings.Contains(out, `llm_router_requests_total{node="upstream-0"`) {
 		t.Errorf("/metrics missing per-model requests_total label\n--- full /metrics ---\n%s", out)
+	}
+}
+
+// TestIT_FairShareNoStarvation verifies that with per-user fair-share enabled,
+// 10 users sending 5 requests each all complete within 2x of the average
+// completion time. No single user should monopolise the scheduler.
+func TestIT_FairShareNoStarvation(t *testing.T) {
+	const (
+		users       = 10
+		reqsPerUser = 5
+		totalReqs   = users * reqsPerUser
+	)
+
+	upstream := itMockOpenAI(t, "model-0", func(req *http.Request) itMockResponse {
+		time.Sleep(5 * time.Millisecond)
+		return itMockResponse{
+			StatusCode: http.StatusOK,
+			Body:       `{"id":"x","model":"model-0","choices":[{"message":{"content":"ok"}}]}`,
+		}
+	})
+	t.Cleanup(upstream.Close)
+
+	srv, _ := itSetupRouter(t, []*httptest.Server{upstream},
+		itWithMaxConcurrency(4), itWithMaxQueueDepth(128),
+		itWithFairShare(50, 10*time.Second, 10))
+
+	type userResult struct {
+		completed atomic.Int64
+		elapsed   atomic.Int64
+	}
+	results := make([]userResult, users)
+	var wg sync.WaitGroup
+
+	for u := 0; u < users; u++ {
+		u := u
+		for i := 0; i < reqsPerUser; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start := time.Now()
+				body := fmt.Sprintf(`{"model":"model-0","messages":[{"role":"user","content":"u%d-r%d"}]}`, u, i)
+				req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(body))
+				if err != nil {
+					t.Errorf("build req: %v", err)
+					return
+				}
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-User", fmt.Sprintf("user-%d", u))
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Errorf("do req: %v", err)
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					results[u].completed.Add(1)
+					results[u].elapsed.Add(time.Since(start).Milliseconds())
+				}
+			}()
+		}
+	}
+	wg.Wait()
+
+	var totalCompleted int64
+	for u := 0; u < users; u++ {
+		c := results[u].completed.Load()
+		totalCompleted += c
+		if c != int64(reqsPerUser) {
+			t.Errorf("user-%d: expected %d completions, got %d", u, reqsPerUser, c)
+		}
+	}
+	if totalCompleted != int64(totalReqs) {
+		t.Fatalf("total completed %d, expected %d", totalCompleted, totalReqs)
+	}
+
+	var totalElapsed int64
+	for u := 0; u < users; u++ {
+		totalElapsed += results[u].elapsed.Load()
+	}
+	avgPerUser := totalElapsed / int64(users)
+	for u := 0; u < users; u++ {
+		e := results[u].elapsed.Load()
+		if avgPerUser > 0 && e > avgPerUser*2 {
+			t.Errorf("user-%d took %dms total, avg is %dms — possible starvation (>2x average)",
+				u, e, avgPerUser)
+		}
+	}
+}
+
+// TestIT_FairShareRejectsHeavyUser verifies that a single user hitting the
+// per-user limit gets 429 while other users still succeed.
+func TestIT_FairShareRejectsHeavyUser(t *testing.T) {
+	upstream := itMockOpenAI(t, "model-0", func(req *http.Request) itMockResponse {
+		return itMockResponse{
+			StatusCode: http.StatusOK,
+			Body:       `{"id":"x","model":"model-0","choices":[{"message":{"content":"ok"}}]}`,
+		}
+	})
+	t.Cleanup(upstream.Close)
+
+	srv, _ := itSetupRouter(t, []*httptest.Server{upstream},
+		itWithMaxConcurrency(8), itWithMaxQueueDepth(128),
+		itWithFairShare(3, time.Minute, 3))
+
+	doReq := func(user string) int {
+		body := `{"model":"model-0","messages":[{"role":"user","content":"hi"}]}`
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-User", user)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do req: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for i := 0; i < 3; i++ {
+		if code := doReq("heavy-user"); code != http.StatusOK {
+			t.Fatalf("req %d: expected 200, got %d", i, code)
+		}
+	}
+
+	if code := doReq("heavy-user"); code != http.StatusTooManyRequests {
+		t.Fatalf("4th request from heavy-user: expected 429, got %d", code)
+	}
+
+	if code := doReq("light-user"); code != http.StatusOK {
+		t.Fatalf("light-user request: expected 200, got %d", code)
 	}
 }

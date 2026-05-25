@@ -41,6 +41,7 @@ import (
 	"time"
 
 	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
+	"github.com/nfsarch33/llm-cluster-router/internal/fairshare"
 	"github.com/nfsarch33/llm-cluster-router/internal/gpuprobe"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
@@ -109,10 +110,11 @@ type (
 //     concurrency budgets coexist; this is intentional and bounded
 //     by the in-progress request count.
 type router struct {
-	cfg       config
-	client    *http.Client
-	semaphore chan struct{}
-	nodes     []*upstreamNode
+	cfg           config
+	client        *http.Client
+	semaphore     chan struct{}
+	nodes         []*upstreamNode
+	fairScheduler *fairshare.Scheduler
 
 	mu sync.RWMutex // protects cfg, client, semaphore, nodes during Reload
 
@@ -305,6 +307,7 @@ var (
 	promptTokensPerSecond     = metrics.PromptTokensPerSecond
 	nodeHealthyGauge          = metrics.NodeHealthyGauge
 	healthLatency             = metrics.HealthLatency
+	fairShareRejectedTotal    = metrics.FairShareRejectedTotal
 )
 
 func runServe(args []string) error {
@@ -399,12 +402,20 @@ func newRouter(cfg config) (*router, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &router{
+	r := &router{
 		cfg:       cfg,
 		client:    client,
 		semaphore: sem,
 		nodes:     nodes,
-	}, nil
+	}
+	if cfg.FairShare.Enabled {
+		r.fairScheduler = fairshare.New(fairshare.Config{
+			MaxRequestsPerUser: cfg.FairShare.MaxRequestsPerUser,
+			Window:             cfg.FairShare.Window.Duration,
+			Burst:              cfg.FairShare.Burst,
+		})
+	}
+	return r, nil
 }
 
 var limitBody = proxy.LimitBody
@@ -524,6 +535,24 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "request cancelled while queued", http.StatusRequestTimeout)
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "cancelled").Inc()
 		return
+	}
+
+	if r.fairScheduler != nil {
+		user := req.Header.Get("X-User")
+		if user == "" {
+			auth := req.Header.Get("Authorization")
+			token := strings.TrimPrefix(auth, "Bearer ")
+			user = fairshare.UserFromToken(token)
+		}
+		if user != "" && !r.fairScheduler.Acquire(user) {
+			fairShareRejectedTotal.WithLabelValues(user).Inc()
+			http.Error(w, `{"error":"per-user rate limit exceeded"}`, http.StatusTooManyRequests)
+			requestsTotal.WithLabelValues(model, node.cfg.Name, "fairshare_rejected").Inc()
+			return
+		}
+		if user != "" {
+			defer r.fairScheduler.Release(user)
+		}
 	}
 
 	r.inflight.Add(1)

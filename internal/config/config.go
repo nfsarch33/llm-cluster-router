@@ -16,14 +16,25 @@ import (
 
 // Config is the top-level router configuration loaded from YAML.
 type Config struct {
-	Listen      string       `yaml:"listen"`
-	MetricsAddr string       `yaml:"metrics_addr"`
-	DebugAddr   string       `yaml:"debug_addr"`
-	LogLevel    string       `yaml:"log_level"`
-	AuthToken   string       `yaml:"auth_token"`
-	Defaults    Defaults     `yaml:"defaults"`
-	HealthCheck HealthConfig `yaml:"health_check"`
-	Nodes       []NodeConfig `yaml:"nodes"`
+	Listen      string          `yaml:"listen"`
+	MetricsAddr string          `yaml:"metrics_addr"`
+	DebugAddr   string          `yaml:"debug_addr"`
+	LogLevel    string          `yaml:"log_level"`
+	AuthToken   string          `yaml:"auth_token"`
+	Defaults    Defaults        `yaml:"defaults"`
+	HealthCheck HealthConfig    `yaml:"health_check"`
+	FairShare   FairShareConfig `yaml:"fair_share"`
+	Nodes       []NodeConfig    `yaml:"nodes"`
+}
+
+// FairShareConfig controls per-user rate limiting. When Enabled is
+// false (the default), the scheduler is not instantiated and all
+// requests pass through to the global semaphore only.
+type FairShareConfig struct {
+	Enabled            bool          `yaml:"enabled"`
+	MaxRequestsPerUser int           `yaml:"max_requests_per_user"`
+	Window             DurationValue `yaml:"window"`
+	Burst              int           `yaml:"burst"`
 }
 
 // Defaults holds global default limits for queue depth, concurrency,
@@ -127,6 +138,17 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.HealthCheck.HealthyThreshold <= 0 {
 		cfg.HealthCheck.HealthyThreshold = 1
+	}
+	if cfg.FairShare.Enabled {
+		if cfg.FairShare.MaxRequestsPerUser <= 0 {
+			cfg.FairShare.MaxRequestsPerUser = 10
+		}
+		if cfg.FairShare.Window.Duration <= 0 {
+			cfg.FairShare.Window.Duration = 60 * time.Second
+		}
+		if cfg.FairShare.Burst <= 0 {
+			cfg.FairShare.Burst = 3
+		}
 	}
 	if len(cfg.Nodes) == 0 {
 		return cfg, errors.New("config must define at least one node")
