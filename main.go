@@ -41,6 +41,7 @@ import (
 	"time"
 
 	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
+	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -896,53 +897,10 @@ func (r *router) runHealthPass(ctx context.Context) {
 }
 
 func probeNode(parent context.Context, hc healthConfig, node *upstreamNode) bool {
-	ctx, cancel := context.WithTimeout(parent, hc.Timeout.Duration)
-	defer cancel()
-
-	for _, path := range healthProbePaths(hc.Path) {
-		ok, status := probeNodePath(ctx, node, path)
-		if ok {
-			return true
-		}
-		if status != http.StatusNotFound {
-			return false
-		}
-	}
-	return false
+	return health.ProbeNode(parent, hc.Timeout.Duration, hc.Path, node.baseURL)
 }
 
-func healthProbePaths(primary string) []string {
-	paths := []string{primary}
-	if primary != "/v1/models" {
-		paths = append(paths, "/v1/models")
-	}
-	return paths
-}
-
-func probeNodePath(ctx context.Context, node *upstreamNode, path string) (bool, int) {
-	target := *node.baseURL
-	target.Path = strings.TrimRight(node.baseURL.Path, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return false, 0
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false, 0
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300, resp.StatusCode
-}
-
-func isRetryableConnError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "server closed idle connection") ||
-		strings.Contains(msg, "connection reset by peer") ||
-		strings.Contains(msg, "broken pipe")
-}
+var isRetryableConnError = health.IsRetryableConnError
 
 func extractModel(body []byte) string {
 	var payload struct {
