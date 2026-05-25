@@ -43,6 +43,7 @@ import (
 	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -407,43 +408,8 @@ var forbiddenUpstreamHostSuffixes = cfg.ForbiddenUpstreamHostSuffixes
 var validateUpstreamURL = cfg.ValidateUpstreamURL
 var expandEnvValue = cfg.ExpandEnvValue
 
-func bearerAuth(token string) func(http.HandlerFunc) http.HandlerFunc {
-	return func(next http.HandlerFunc) http.HandlerFunc {
-		if token == "" {
-			return next
-		}
-		return func(w http.ResponseWriter, r *http.Request) {
-			auth := r.Header.Get("Authorization")
-			if auth != "Bearer "+token {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-			next(w, r)
-		}
-	}
-}
-
-// bearerAuthFunc is the dynamic-token form of bearerAuth. It calls
-// getToken() on each request so SIGHUP-driven token rotation is
-// picked up immediately without rebuilding the http.ServeMux. An
-// empty token disables auth entirely (matching bearerAuth).
-func bearerAuthFunc(getToken func() string) func(http.HandlerFunc) http.HandlerFunc {
-	return func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			token := getToken()
-			if token == "" {
-				next(w, r)
-				return
-			}
-			auth := r.Header.Get("Authorization")
-			if auth != "Bearer "+token {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-			next(w, r)
-		}
-	}
-}
+var bearerAuth = proxy.BearerAuth
+var bearerAuthFunc = proxy.BearerAuthFunc
 
 func newRouter(cfg config) (*router, error) {
 	nodes, client, sem, err := buildReloadable(cfg)
@@ -458,12 +424,7 @@ func newRouter(cfg config) (*router, error) {
 	}, nil
 }
 
-func limitBody(limit int64, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
-		next.ServeHTTP(w, r)
-	})
-}
+var limitBody = proxy.LimitBody
 
 func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	type nodeStatus struct {
@@ -897,31 +858,10 @@ var isRetryableConnError = health.IsRetryableConnError
 var extractModel = rtr.ExtractModel
 var supportsModel = rtr.SupportsModel
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
+var writeJSON = proxy.WriteJSON
+var copyHeaders = proxy.CopyHeaders
 
-func copyHeaders(dst, src http.Header) {
-	for key, values := range src {
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-type flushWriter struct {
-	http.ResponseWriter
-}
-
-func (fw flushWriter) Write(p []byte) (int, error) {
-	n, err := fw.ResponseWriter.Write(p)
-	if flusher, ok := fw.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return n, err
-}
+type flushWriter = proxy.FlushWriter
 
 func runBench(args []string) error {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
