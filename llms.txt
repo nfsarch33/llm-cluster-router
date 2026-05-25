@@ -55,7 +55,7 @@
 ## Related Repos
 
 - [fleet-bench](https://github.com/nfsarch33/fleet-bench) — benchmark harness for LLM lane validation
-- [ironclaw-ops](https://github.com/nfsarch33/ironclaw-ops) — operator control-plane (colocated router source)
+- [helixon-ops](https://github.com/nfsarch33/helixon-ops) — operator control-plane (colocated router source)
 
 ## Operational Notes
 
