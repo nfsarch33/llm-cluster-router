@@ -43,6 +43,7 @@ import (
 	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
+	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -698,13 +699,7 @@ func (r *router) addQueueDepthByTier(tier string, delta int64) {
 	queueDepthByTierGauge.WithLabelValues(tier).Set(float64(next))
 }
 
-func metricLabel(value, fallback string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return fallback
-	}
-	return value
-}
+var metricLabel = rtr.MetricLabel
 
 type limitedBuffer struct {
 	limit int
@@ -840,10 +835,7 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 	return candidates[idx]
 }
 
-func nodeEnabled(value string) bool {
-	value = strings.TrimSpace(strings.ToLower(value))
-	return value == "" || value == "1" || value == "true" || value == "yes" || value == "on"
-}
+var nodeEnabled = rtr.NodeEnabled
 
 func (r *router) healthLoop(ctx context.Context) {
 	r.runHealthPass(ctx)
@@ -902,24 +894,8 @@ func probeNode(parent context.Context, hc healthConfig, node *upstreamNode) bool
 
 var isRetryableConnError = health.IsRetryableConnError
 
-func extractModel(body []byte) string {
-	var payload struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return ""
-	}
-	return payload.Model
-}
-
-func supportsModel(models []string, model string) bool {
-	for _, candidate := range models {
-		if candidate == model {
-			return true
-		}
-	}
-	return false
-}
+var extractModel = rtr.ExtractModel
+var supportsModel = rtr.SupportsModel
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
