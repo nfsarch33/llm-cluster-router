@@ -40,10 +40,10 @@ import (
 	"syscall"
 	"time"
 
+	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -75,60 +75,16 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "usage: %s <serve|bench|probe-gpu> [flags]\n", filepath.Base(os.Args[0]))
 }
 
-type config struct {
-	Listen      string       `yaml:"listen"`
-	MetricsAddr string       `yaml:"metrics_addr"`
-	DebugAddr   string       `yaml:"debug_addr"`
-	LogLevel    string       `yaml:"log_level"`
-	AuthToken   string       `yaml:"auth_token"`
-	Defaults    defaults     `yaml:"defaults"`
-	HealthCheck healthConfig `yaml:"health_check"`
-	Nodes       []nodeConfig `yaml:"nodes"`
-}
-
-type defaults struct {
-	MaxQueueDepth  int           `yaml:"max_queue_depth"`
-	MaxConcurrency int           `yaml:"max_concurrency"`
-	RequestTimeout durationValue `yaml:"request_timeout"`
-	MaxBodySize    int64         `yaml:"max_body_size"`
-}
-
-type healthConfig struct {
-	Interval           durationValue `yaml:"interval"`
-	Timeout            durationValue `yaml:"timeout"`
-	Path               string        `yaml:"path"`
-	UnhealthyThreshold int           `yaml:"unhealthy_threshold"`
-	HealthyThreshold   int           `yaml:"healthy_threshold"`
-}
-
-type durationValue struct {
-	time.Duration
-}
-
-func (d *durationValue) UnmarshalYAML(node *yaml.Node) error {
-	var value string
-	if err := node.Decode(&value); err != nil {
-		return err
-	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil {
-		return err
-	}
-	d.Duration = parsed
-	return nil
-}
-
-type nodeConfig struct {
-	Name     string   `yaml:"name"`
-	URL      string   `yaml:"url"`
-	Tier     string   `yaml:"tier"`
-	Enabled  string   `yaml:"enabled"`
-	Weight   int      `yaml:"weight"`
-	Models   []string `yaml:"models"`
-	APIKey   string   `yaml:"api_key"`
-	APIKeys  []string `yaml:"api_keys"`
-	Priority int      `yaml:"priority"`
-}
+// Type aliases bridge the config package types back into package main
+// so existing tests and code compile without changes. These will be
+// removed incrementally as downstream packages consume config directly.
+type (
+	config        = cfg.Config
+	defaults      = cfg.Defaults
+	healthConfig  = cfg.HealthConfig
+	durationValue = cfg.DurationValue
+	nodeConfig    = cfg.NodeConfig
+)
 
 // router serves OpenAI-compatible traffic across a fleet of upstream
 // LLM nodes. The mutable subset of its state -- cfg, nodes, client,
@@ -489,121 +445,13 @@ func runServe(args []string) error {
 	return server.ListenAndServe()
 }
 
-func loadConfig(path string) (config, error) {
-	var cfg config
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
-	}
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
-	}
-	if cfg.Listen == "" {
-		cfg.Listen = ":8080"
-	}
-	if cfg.MetricsAddr == "" {
-		cfg.MetricsAddr = ":9091"
-	}
-	if cfg.Defaults.MaxQueueDepth <= 0 {
-		cfg.Defaults.MaxQueueDepth = 8
-	}
-	if cfg.Defaults.MaxConcurrency <= 0 {
-		cfg.Defaults.MaxConcurrency = 2
-	}
-	if cfg.Defaults.RequestTimeout.Duration <= 0 {
-		cfg.Defaults.RequestTimeout.Duration = 120 * time.Second
-	}
-	if cfg.Defaults.MaxBodySize <= 0 {
-		cfg.Defaults.MaxBodySize = 1 << 20
-	}
-	if cfg.HealthCheck.Interval.Duration <= 0 {
-		cfg.HealthCheck.Interval.Duration = 15 * time.Second
-	}
-	if cfg.HealthCheck.Timeout.Duration <= 0 {
-		cfg.HealthCheck.Timeout.Duration = 5 * time.Second
-	}
-	if cfg.HealthCheck.Path == "" {
-		cfg.HealthCheck.Path = "/health"
-	}
-	if cfg.HealthCheck.UnhealthyThreshold <= 0 {
-		cfg.HealthCheck.UnhealthyThreshold = 3
-	}
-	if cfg.HealthCheck.HealthyThreshold <= 0 {
-		cfg.HealthCheck.HealthyThreshold = 1
-	}
-	if len(cfg.Nodes) == 0 {
-		return cfg, errors.New("config must define at least one node")
-	}
-	cfg.AuthToken = expandEnvValue(cfg.AuthToken)
-	for i := range cfg.Nodes {
-		cfg.Nodes[i].APIKey = expandEnvValue(cfg.Nodes[i].APIKey)
-		for j := range cfg.Nodes[i].APIKeys {
-			cfg.Nodes[i].APIKeys[j] = expandEnvValue(cfg.Nodes[i].APIKeys[j])
-		}
-		cfg.Nodes[i].Enabled = expandEnvValue(cfg.Nodes[i].Enabled)
-		if err := validateUpstreamURL(cfg.Nodes[i].Name, cfg.Nodes[i].URL); err != nil {
-			return cfg, err
-		}
-	}
-	return cfg, nil
-}
+// loadConfig delegates to the config package.
+var loadConfig = cfg.LoadConfig
 
-// forbiddenUpstreamHostSuffixes is the locked list of hostnames the
-// router refuses to route to. The list is intentionally narrow: it
-// targets corporate or managed gateways whose use would silently push
-// every prompt — and any embedded secrets, PII, or proprietary data —
-// across a trust boundary the operator did not opt into.
-//
-// Suffix matching is case-insensitive and applied after the URL host
-// is lowercased. Both bare apex (zende.sk) and any subdomain
-// (ai-gateway.zende.sk) are blocked. Adding a new entry is a one-line
-// review in this file plus a regression test in main_test.go; do not
-// add behind feature flags.
-var forbiddenUpstreamHostSuffixes = []string{
-	"zende.sk",
-	"zendesk.com",
-}
-
-// validateUpstreamURL parses node.url and rejects it when the host
-// matches a forbiddenUpstreamHostSuffixes entry. The check is
-// case-insensitive and matches the apex domain plus any subdomain.
-//
-// Empty or malformed URLs are passed through; downstream node setup
-// will surface those with a clearer error than this function can.
-func validateUpstreamURL(nodeName, rawURL string) error {
-	if rawURL == "" {
-		return nil
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return nil
-	}
-	host := strings.ToLower(parsed.Hostname())
-	if host == "" {
-		return nil
-	}
-	for _, suffix := range forbiddenUpstreamHostSuffixes {
-		if host == suffix || strings.HasSuffix(host, "."+suffix) {
-			return fmt.Errorf(
-				"node %q: forbidden upstream host %q (matches %q); "+
-					"see router.sample.yml — this router is for self-hosted clusters only",
-				nodeName, host, suffix,
-			)
-		}
-	}
-	return nil
-}
-
-func expandEnvValue(s string) string {
-	if !strings.HasPrefix(s, "${") || !strings.HasSuffix(s, "}") {
-		return s
-	}
-	key := s[2 : len(s)-1]
-	if v, ok := os.LookupEnv(key); ok {
-		return v
-	}
-	return ""
-}
+// Delegate to config package; keep package-level names so tests compile.
+var forbiddenUpstreamHostSuffixes = cfg.ForbiddenUpstreamHostSuffixes
+var validateUpstreamURL = cfg.ValidateUpstreamURL
+var expandEnvValue = cfg.ExpandEnvValue
 
 func bearerAuth(token string) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
