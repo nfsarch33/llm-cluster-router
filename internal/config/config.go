@@ -44,7 +44,28 @@ type Defaults struct {
 	MaxConcurrency int           `yaml:"max_concurrency"`
 	RequestTimeout DurationValue `yaml:"request_timeout"`
 	MaxBodySize    int64         `yaml:"max_body_size"`
+	// Circuit tunes the per-upstream circuit breaker fleet-wide. It was
+	// previously hardcoded to 5 failures / 30s in main.go; exposing it here
+	// lets operators retune the breaker for a single-tier provider (e.g.
+	// MiniMax) without a code change. Per-node overrides live on NodeConfig.
+	Circuit CircuitConfig `yaml:"circuit"`
 }
+
+// CircuitConfig tunes a per-upstream circuit breaker. Threshold is the
+// consecutive-failure count that opens the breaker; Cooldown is how long it
+// stays open before allowing a half-open probe. Zero values fall back to the
+// breaker defaults (5 failures / 30s) so existing configs keep working.
+type CircuitConfig struct {
+	Threshold int           `yaml:"threshold"`
+	Cooldown  DurationValue `yaml:"cooldown"`
+}
+
+// Default circuit-breaker tuning, matching the historical hardcoded values so
+// behaviour is unchanged when the config omits a circuit block.
+const (
+	DefaultCircuitThreshold = 5
+	DefaultCircuitCooldown  = 30 * time.Second
+)
 
 // HealthConfig controls the upstream health-check loop.
 type HealthConfig struct {
@@ -85,6 +106,31 @@ type NodeConfig struct {
 	APIKey   string   `yaml:"api_key"`
 	APIKeys  []string `yaml:"api_keys"`
 	Priority int      `yaml:"priority"`
+	// Circuit optionally overrides the global Defaults.Circuit tuning for this
+	// single upstream. Unset (zero) fields inherit the global default.
+	Circuit CircuitConfig `yaml:"circuit"`
+}
+
+// ResolvedCircuit returns the effective breaker threshold and cooldown for
+// this node: a positive per-node override wins, otherwise the global default
+// (which LoadConfig has already populated). It never returns non-positive
+// values, so callers can pass the result straight to the breaker constructor.
+func (n NodeConfig) ResolvedCircuit(def Defaults) (threshold int, cooldown time.Duration) {
+	threshold = def.Circuit.Threshold
+	if n.Circuit.Threshold > 0 {
+		threshold = n.Circuit.Threshold
+	}
+	if threshold <= 0 {
+		threshold = DefaultCircuitThreshold
+	}
+	cooldown = def.Circuit.Cooldown.Duration
+	if n.Circuit.Cooldown.Duration > 0 {
+		cooldown = n.Circuit.Cooldown.Duration
+	}
+	if cooldown <= 0 {
+		cooldown = DefaultCircuitCooldown
+	}
+	return threshold, cooldown
 }
 
 // ForbiddenUpstreamHostSuffixes is the locked list of hostnames the
@@ -123,6 +169,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Defaults.MaxBodySize <= 0 {
 		cfg.Defaults.MaxBodySize = 1 << 20
+	}
+	if cfg.Defaults.Circuit.Threshold <= 0 {
+		cfg.Defaults.Circuit.Threshold = DefaultCircuitThreshold
+	}
+	if cfg.Defaults.Circuit.Cooldown.Duration <= 0 {
+		cfg.Defaults.Circuit.Cooldown.Duration = DefaultCircuitCooldown
 	}
 	if cfg.HealthCheck.Interval.Duration <= 0 {
 		cfg.HealthCheck.Interval.Duration = 15 * time.Second
