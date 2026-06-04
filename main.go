@@ -240,7 +240,8 @@ func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, 
 		}
 		node := &upstreamNode{cfg: nc, baseURL: parsed}
 		node.healthy.Store(true)
-		node.breaker = newCircuitBreaker(5, 30*time.Second).WithName(nc.Name)
+		ctThreshold, ctCooldown := nc.ResolvedCircuit(cfg.Defaults)
+		node.breaker = newCircuitBreaker(ctThreshold, ctCooldown).WithName(nc.Name)
 		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
 		nodes = append(nodes, node)
 	}
@@ -267,9 +268,9 @@ type upstreamNode struct {
 	// breaker is the per-upstream circuit breaker. It is
 	// consulted by selectNodeFromSnap so an upstream that is
 	// returning errors faster than the slower health-check loop
-	// notices is removed from rotation immediately. Defaults to a
-	// 5-failure threshold + 30s cooldown; future PRs can expose
-	// these as per-node config.
+	// notices is removed from rotation immediately. Threshold and
+	// cooldown come from config (defaults.circuit, with optional
+	// per-node overrides), defaulting to 5 failures / 30s when unset.
 	breaker *circuitBreaker
 }
 

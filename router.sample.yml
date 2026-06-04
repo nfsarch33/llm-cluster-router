@@ -23,6 +23,15 @@ defaults:
   max_concurrency: 2
   request_timeout: 120s
   max_body_size: 1048576
+  # Per-upstream circuit breaker tuning. Opens after `threshold` consecutive
+  # failures and stays open for `cooldown` before a half-open probe. Defaults
+  # to 5 / 30s when omitted. Raise the threshold / shorten the cooldown for a
+  # single-tier provider (e.g. MiniMax) that flaps briefly under 429 bursts so
+  # one rate-limit window does not eject the only upstream. Per-node `circuit`
+  # blocks override these globally-applied defaults.
+  circuit:
+    threshold: 5
+    cooldown: 30s
 
 health_check:
   interval: 15s
@@ -75,3 +84,20 @@ nodes:
   #     - ${MINIMAX_API_KEY_1}
   #     - ${MINIMAX_API_KEY_2}
   #   models: ["minimax-text"]
+  #
+  # OpenRouter Tier-4 MiniMax-M3 fallback. When both primary MiniMax keys are
+  # simultaneously rate-limited (the eval-RED root cause), this independent
+  # upstream gives M3 traffic somewhere to go instead of cascading to 503.
+  # A higher `priority` makes it a strict fallback (primary preferred), and a
+  # more tolerant per-node breaker keeps it from being ejected on a single
+  # 429 burst.
+  # - name: openrouter-minimax-m3
+  #   url: https://openrouter.ai/api
+  #   tier: reasoning
+  #   priority: 20
+  #   weight: 1
+  #   api_key: ${OPENROUTER_API_KEY}
+  #   models: ["minimax-m3", "minimaxai/minimax-m2"]
+  #   circuit:
+  #     threshold: 8
+  #     cooldown: 15s
