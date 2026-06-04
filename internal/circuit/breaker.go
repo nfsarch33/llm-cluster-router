@@ -33,6 +33,11 @@ type Breaker struct {
 	cooldown  time.Duration
 	openedAt  time.Time
 	nodeName  string
+	// now is the time source. It defaults to time.Now but can be
+	// replaced via WithClock so chaos/recovery tests can advance a fake
+	// clock and assert open -> half-open -> closed transitions
+	// deterministically without real sleeps (keeping tests race-clean).
+	now func() time.Time
 }
 
 // NewBreaker builds a closed breaker. threshold is the count of
@@ -49,7 +54,29 @@ func NewBreaker(threshold int, cooldown time.Duration) *Breaker {
 		state:     Closed,
 		threshold: threshold,
 		cooldown:  cooldown,
+		now:       time.Now,
 	}
+}
+
+// WithClock replaces the breaker's time source. Pass nil to reset to the
+// real clock. Intended for tests; returns the breaker for chaining.
+func (cb *Breaker) WithClock(now func() time.Time) *Breaker {
+	cb.mu.Lock()
+	if now == nil {
+		now = time.Now
+	}
+	cb.now = now
+	cb.mu.Unlock()
+	return cb
+}
+
+// nowFn returns the configured clock, defaulting to time.Now for breakers
+// constructed without NewBreaker (e.g. zero-value structs in tests).
+func (cb *Breaker) nowFn() time.Time {
+	if cb.now == nil {
+		return time.Now()
+	}
+	return cb.now()
 }
 
 // WithName attaches a node name for metric labelling.
@@ -70,7 +97,7 @@ func (cb *Breaker) Allow() bool {
 	case Closed:
 		return true
 	case Open:
-		if time.Since(cb.openedAt) >= cb.cooldown {
+		if cb.nowFn().Sub(cb.openedAt) >= cb.cooldown {
 			cb.transition(HalfOpen)
 			return true
 		}
@@ -98,12 +125,12 @@ func (cb *Breaker) RecordFailure() {
 	defer cb.mu.Unlock()
 	switch cb.state {
 	case HalfOpen:
-		cb.openedAt = time.Now()
+		cb.openedAt = cb.nowFn()
 		cb.transition(Open)
 	case Closed:
 		cb.failures++
 		if cb.failures >= cb.threshold {
-			cb.openedAt = time.Now()
+			cb.openedAt = cb.nowFn()
 			cb.transition(Open)
 		}
 	case Open:

@@ -485,6 +485,57 @@ func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// maxFailoverAttempts bounds how many distinct upstreams a single request may
+// try before giving up. The exclude-set already guarantees each upstream is
+// tried at most once per request, so this is a belt-and-braces ceiling that
+// makes "no infinite loop" hold even if selection logic regresses.
+const maxFailoverAttempts = 5
+
+// isFailoverStatus reports whether an upstream HTTP status should trigger
+// failover to the next node in the chain (and count as a breaker failure).
+// 429 (rate-limited) and any 5xx (502/503 capacity, 500 upstream error) mean
+// "this upstream cannot serve the request right now"; a 4xx other than 429 is
+// the caller's fault (bad input) and is relayed back without failover.
+func isFailoverStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// doUpstream issues the proxied request to a single node and returns the raw
+// upstream response (caller owns Body.Close) or a transport error. It applies
+// the existing one-shot transparent retry for idle-connection resets so a
+// stale keep-alive conn does not look like a node failure. The per-node API
+// key (single or round-robin) is attached here.
+func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstreamNode, method, reqPath, rawQuery string, srcHeader http.Header, body []byte, model string) (*http.Response, error) {
+	upstreamURL := *node.baseURL
+	upstreamURL.Path = strings.TrimRight(node.baseURL.Path, "/") + reqPath
+	upstreamURL.RawQuery = rawQuery
+
+	build := func() (*http.Request, error) {
+		ureq, err := http.NewRequestWithContext(ctx, method, upstreamURL.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		copyHeaders(ureq.Header, srcHeader)
+		if key := node.nextAPIKey(); key != "" {
+			ureq.Header.Set("Authorization", "Bearer "+key)
+		}
+		return ureq, nil
+	}
+
+	ureq, err := build()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := snap.client.Do(ureq)
+	if err != nil && isRetryableConnError(err) {
+		requestRetries.WithLabelValues(model, node.cfg.Name).Inc()
+		if retryReq, rerr := build(); rerr == nil {
+			resp, err = snap.client.Do(retryReq)
+		}
+	}
+	return resp, err
+}
+
 func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 
@@ -563,63 +614,98 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		inflightGauge.Set(float64(r.inflight.Load()))
 	}()
 
-	upstreamURL := *node.baseURL
-	upstreamURL.Path = strings.TrimRight(node.baseURL.Path, "/") + req.URL.Path
-	upstreamURL.RawQuery = req.URL.RawQuery
-
-	ctx, cancel := context.WithTimeout(req.Context(), snap.cfg.Defaults.RequestTimeout.Duration)
-	defer cancel()
-
-	upstreamReq, err := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("build upstream request: %v", err), http.StatusInternalServerError)
-		requestsTotal.WithLabelValues(model, node.cfg.Name, "build_error").Inc()
-		return
-	}
-	copyHeaders(upstreamReq.Header, req.Header)
-	if key := node.nextAPIKey(); key != "" {
-		upstreamReq.Header.Set("Authorization", "Bearer "+key)
-	}
-
-	resp, err := snap.client.Do(upstreamReq)
-	if err != nil && isRetryableConnError(err) {
-		requestRetries.WithLabelValues(model, node.cfg.Name).Inc()
-		retryReq, retryErr := http.NewRequestWithContext(ctx, req.Method, upstreamURL.String(), bytes.NewReader(body))
-		if retryErr == nil {
-			copyHeaders(retryReq.Header, req.Header)
-			if key := node.nextAPIKey(); key != "" {
-				retryReq.Header.Set("Authorization", "Bearer "+key)
+	// Tier-aware failover loop. Each iteration tries one upstream and, on a
+	// transport error OR a failover-worthy status (429 / 5xx), records a
+	// breaker failure and advances to the next untried candidate down the
+	// priority-ordered chain (M3-key1 -> M3-key2 -> fallback tier). The
+	// exclude-set guarantees each upstream is tried at most once; the
+	// maxFailoverAttempts ceiling guarantees the loop always terminates.
+	//
+	// Each attempt gets its OWN request-timeout context (derived from the
+	// client's context) rather than sharing one budget across the whole
+	// chain. This is what lets a request fail over after a primary *timeout*:
+	// a shared, already-expired deadline would make every downstream attempt
+	// fail instantly. The cancel for whichever response we ultimately stream
+	// is deferred so its body stays readable during streaming; losing
+	// attempts' contexts are cancelled immediately.
+	//
+	// We only fail over BEFORE any bytes are written to the client, so a
+	// healthy upstream's stream is never interrupted. If every candidate
+	// fails, the last real upstream response (e.g. a genuine 502) is relayed
+	// so the caller sees the true status instead of a synthetic one.
+	tried := make(map[string]struct{}, maxFailoverAttempts)
+	var (
+		okResp     *http.Response // a non-failover (servable) upstream response
+		okNode     *upstreamNode
+		okCancel   context.CancelFunc
+		heldResp   *http.Response // most recent failover-status response, relayed if chain exhausts
+		heldNode   *upstreamNode
+		heldCancel context.CancelFunc
+		lastErr    error
+		candidate  = node
+		attemptIdx int
+	)
+	for ; candidate != nil && attemptIdx < maxFailoverAttempts; attemptIdx++ {
+		tried[candidate.cfg.Name] = struct{}{}
+		attemptCtx, attemptCancel := context.WithTimeout(req.Context(), snap.cfg.Defaults.RequestTimeout.Duration)
+		resp, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, body, model)
+		if err != nil {
+			attemptCancel()
+			candidate.healthy.Store(false)
+			nodeHealthyGauge.WithLabelValues(candidate.cfg.Name, candidate.cfg.Tier).Set(0)
+			if candidate.breaker != nil {
+				candidate.breaker.RecordFailure()
 			}
-			resp, err = snap.client.Do(retryReq)
-		}
-	}
-	if err != nil {
-		node.healthy.Store(false)
-		nodeHealthyGauge.WithLabelValues(node.cfg.Name, node.cfg.Tier).Set(0)
-		if node.breaker != nil {
-			node.breaker.RecordFailure()
-		}
-		if fallback := r.selectNodeFromSnap(snap, model, tier, node.cfg.Name); fallback != nil {
-			fallbackURL := *fallback.baseURL
-			fallbackURL.Path = strings.TrimRight(fallback.baseURL.Path, "/") + req.URL.Path
-			fallbackURL.RawQuery = req.URL.RawQuery
-			fallbackReq, fallbackErr := http.NewRequestWithContext(ctx, req.Method, fallbackURL.String(), bytes.NewReader(body))
-			if fallbackErr == nil {
-				copyHeaders(fallbackReq.Header, req.Header)
-				if key := fallback.nextAPIKey(); key != "" {
-					fallbackReq.Header.Set("Authorization", "Bearer "+key)
-				}
-				resp, err = snap.client.Do(fallbackReq)
-				if err == nil {
-					node = fallback
-				} else {
-					requestRetries.WithLabelValues(model, fallback.cfg.Name).Inc()
-				}
+			lastErr = err
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+			if next != nil {
+				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
+			candidate = next
+			continue
 		}
+		if isFailoverStatus(resp.StatusCode) {
+			if candidate.breaker != nil {
+				candidate.breaker.RecordFailure()
+			}
+			requestsTotal.WithLabelValues(model, candidate.cfg.Name, "failover_"+strconv.Itoa(resp.StatusCode)).Inc()
+			if heldResp != nil {
+				heldResp.Body.Close()
+				heldCancel()
+			}
+			heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
+			lastErr = nil
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+			if next != nil {
+				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
+			}
+			candidate = next
+			continue
+		}
+		okResp, okNode, okCancel = resp, candidate, attemptCancel
+		if candidate.breaker != nil {
+			candidate.breaker.RecordSuccess()
+		}
+		break
 	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf("upstream request failed: %v", err), http.StatusBadGateway)
+
+	var resp *http.Response
+	switch {
+	case okResp != nil:
+		node, resp = okNode, okResp
+		defer okCancel()
+		if heldResp != nil {
+			heldResp.Body.Close()
+			heldCancel()
+		}
+	case heldResp != nil:
+		// Chain exhausted with no healthy upstream; relay the real upstream
+		// response (true status + body) rather than a synthetic error.
+		node, resp = heldNode, heldResp
+		defer heldCancel()
+	default:
+		// Every candidate failed at the transport layer.
+		http.Error(w, fmt.Sprintf("upstream request failed: %v", lastErr), http.StatusBadGateway)
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "bad_gateway").Inc()
 		return
 	}
@@ -646,17 +732,9 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	statusLabel := strconv.Itoa(resp.StatusCode)
 	requestsTotal.WithLabelValues(model, node.cfg.Name, statusLabel).Inc()
 	requestDuration.WithLabelValues(model, node.cfg.Name).Observe(time.Since(start).Seconds())
-	// 5xx upstream responses count as breaker failures even when
-	// the transport delivered the bytes. 4xx is treated as
-	// upstream-rejected-the-input (caller's fault), not a node
-	// problem, so we only record a success for <500.
-	if node.breaker != nil {
-		if resp.StatusCode >= 500 {
-			node.breaker.RecordFailure()
-		} else {
-			node.breaker.RecordSuccess()
-		}
-	}
+	// Breaker success/failure is recorded inside the failover loop above
+	// (every attempt's outcome is scored exactly once), so we do not
+	// re-score the relayed response here — doing so would double-count.
 }
 
 func (r *router) addQueueDepthByTier(tier string, delta int64) {
@@ -759,6 +837,25 @@ func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *ups
 }
 
 func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string) *upstreamNode {
+	var excluded map[string]struct{}
+	if excludeName != "" {
+		excluded = map[string]struct{}{excludeName: {}}
+	}
+	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded)
+}
+
+// selectNodeFromSnapExcluding is the set-aware form of node selection used by
+// the multi-hop failover loop in handleProxy. It applies the same
+// health/breaker/tier/model filters and priority-bucket + weighted
+// round-robin selection as selectNodeFromSnap, but skips every node whose
+// name is in `excluded`. This lets a request walk the ordered fallback chain
+// (e.g. minimax-m3-key1 -> minimax-m3-key2 -> local-gpu fallback) without
+// re-trying an upstream that already failed for this request. Lower-priority
+// buckets are only consulted once every node in a higher-priority bucket is
+// either unhealthy, breaker-open, or already excluded — which is exactly how
+// the strict M3 -> fallback ordering is expressed in config (M3 keys share the
+// lowest priority; the fallback tier sits at a higher priority number).
+func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -770,7 +867,7 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 		if !node.healthy.Load() {
 			continue
 		}
-		if excludeName != "" && node.cfg.Name == excludeName {
+		if _, skip := excluded[node.cfg.Name]; skip {
 			continue
 		}
 		if targetTier != "" && node.cfg.Tier != targetTier {
@@ -836,6 +933,15 @@ func (r *router) runHealthPass(ctx context.Context) {
 	hc := snap.cfg.HealthCheck
 	var wg sync.WaitGroup
 	for _, node := range snap.nodes {
+		// Self-heal: a node with health_check_disabled:true is never
+		// re-probed, so once the proxy marks it unhealthy on a transient
+		// error it can never recover until a restart. Skipping it here is
+		// the documented (discouraged) behaviour; the breaker still governs
+		// routing for these nodes. Leave the flag false so the loop below
+		// flips healthy back to true after the upstream recovers.
+		if node.cfg.HealthCheckDisabled {
+			continue
+		}
 		wg.Add(1)
 		go func(node *upstreamNode) {
 			defer wg.Done()

@@ -109,6 +109,19 @@ type NodeConfig struct {
 	// Circuit optionally overrides the global Defaults.Circuit tuning for this
 	// single upstream. Unset (zero) fields inherit the global default.
 	Circuit CircuitConfig `yaml:"circuit"`
+	// HealthCheckDisabled, when true, removes this upstream from the active
+	// health-probe loop. It defaults to false (probe enabled).
+	//
+	// FOOTGUN: disabling the probe is what made the MiniMax-M3 bridge "never
+	// recover" — the proxy marks a node unhealthy on a transport error, and
+	// ONLY the health loop flips it back. With the probe disabled the node is
+	// stuck out of rotation until a process restart, so a single transient
+	// blip becomes a permanent outage. Leave this false for any upstream that
+	// can self-recover (the circuit breaker already absorbs short error
+	// bursts and re-probes the upstream half-open after its cooldown). Only
+	// set it true for an upstream that legitimately has no health endpoint
+	// AND whose liveness is asserted by other means.
+	HealthCheckDisabled bool `yaml:"health_check_disabled"`
 }
 
 // ResolvedCircuit returns the effective breaker threshold and cooldown for
