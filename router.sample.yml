@@ -74,7 +74,10 @@ nodes:
   #   api_key: ${DEEPSEEK_API_KEY}
   #   models: ["deepseek-chat"]
   #
-  # Multi-key round-robin (quota spreading for providers like MiniMax):
+  # Single-node multi-key round-robin (quota spreading within ONE upstream).
+  # NOTE: this shares ONE circuit breaker across both keys, so a breaker trip
+  # ejects BOTH keys together. Prefer the two-tier layout below when you need
+  # INDEPENDENT per-key breakers/quota.
   # - name: minimax-overflow
   #   url: https://api.minimax.chat
   #   tier: fast
@@ -85,19 +88,59 @@ nodes:
   #     - ${MINIMAX_API_KEY_2}
   #   models: ["minimax-text"]
   #
-  # OpenRouter Tier-4 MiniMax-M3 fallback. When both primary MiniMax keys are
-  # simultaneously rate-limited (the eval-RED root cause), this independent
-  # upstream gives M3 traffic somewhere to go instead of cascading to 503.
-  # A higher `priority` makes it a strict fallback (primary preferred), and a
-  # more tolerant per-node breaker keeps it from being ejected on a single
-  # 429 burst.
-  # - name: openrouter-minimax-m3
-  #   url: https://openrouter.ai/api
+  # ---------------------------------------------------------------------------
+  # M3 capacity fallback chain (Tier B -> Tier C). This is the resilient layout
+  # that fixes the eval-RED root cause: 8 heavy Level-3 code-gen tasks
+  # deterministically 502 against a SINGLE saturated M3 tier, and a breaker
+  # that never re-probed (health_check_disabled:true) so the only upstream
+  # never recovered. The chain below spreads M3 load across TWO independent
+  # keys, then strictly falls back to a local-GPU (or M2.7) tier, and lets the
+  # breaker self-heal.
+  #
+  # How the router expresses the ordered chain (no special-casing required):
+  #   * Same model id on every node ("minimax-m3") so any of them can serve a
+  #     given request. SupportsModel is an EXACT match — a fallback that should
+  #     absorb M3 traffic MUST advertise "minimax-m3".
+  #   * Equal lowest `priority` (0) on the two M3 keys => weighted round-robin
+  #     spreads load fairly across both keys (Tier B). Two distinct nodes =>
+  #     two INDEPENDENT circuit breakers and independent quota.
+  #   * Higher `priority` (10) on the fallback => it is only consulted once both
+  #     M3 keys are unhealthy / breaker-open / already tried for this request
+  #     (Tier C, strict fallback).
+  #   * On a 429 or 5xx RESPONSE (not just a transport error) the router records
+  #     a breaker failure AND fails over to the next untried node in the chain,
+  #     before any bytes are streamed to the client.
+  #   * health_check_disabled:false (the default) keeps each node in the probe
+  #     loop so a node marked unhealthy on a transient blip self-heals once the
+  #     upstream answers a health check again.
+  #
+  # Run two bridge instances (one per key) for TRULY independent quota:
+  # - name: minimax-m3-key1
+  #   url: http://127.0.0.1:8500        # minimax-openai-bridge pinned to key 1
   #   tier: reasoning
-  #   priority: 20
+  #   priority: 0
   #   weight: 1
-  #   api_key: ${OPENROUTER_API_KEY}
-  #   models: ["minimax-m3", "minimaxai/minimax-m2"]
+  #   api_key: ${MINIMAX_API_KEY_1}
+  #   models: ["minimax-m3", "MiniMax-M3"]
+  #   health_check_disabled: false       # self-heal: re-probe & recover after a trip
+  #   circuit:
+  #     threshold: 8                      # tolerate short 429/502 bursts...
+  #     cooldown: 15s                     # ...but re-probe quickly
+  # - name: minimax-m3-key2
+  #   url: http://127.0.0.1:8501        # second bridge instance pinned to key 2
+  #   tier: reasoning
+  #   priority: 0                         # same priority as key1 => fair spread
+  #   weight: 1
+  #   api_key: ${MINIMAX_API_KEY_2}
+  #   models: ["minimax-m3", "MiniMax-M3"]
+  #   health_check_disabled: false
   #   circuit:
   #     threshold: 8
   #     cooldown: 15s
+  # - name: local-gpu-codegen-fallback
+  #   url: http://127.0.0.1:8001        # 3090/4070 llama.cpp lane (or MiniMax-M2.7)
+  #   tier: reasoning
+  #   priority: 10                        # strict fallback: only when both M3 keys are down
+  #   weight: 1
+  #   models: ["minimax-m3", "MiniMax-M3", "qwen3.5-27b"]
+  #   health_check_disabled: false
