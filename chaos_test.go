@@ -107,6 +107,53 @@ func TestChaos_SelfRecoveryAfterUpstreamHealthy(t *testing.T) {
 	}
 }
 
+// TestChaos_DisabledNodeSelfHealsViaBreaker proves the "never recovers" fix
+// for a no-probe upstream (e.g. the live MiniMax bridge that 404s on /health,
+// so health_check_disabled must be true). Because the health loop can never
+// restore such a node, the proxy must NOT permanently mark it unhealthy on a
+// transport error — the circuit breaker becomes the sole liveness signal and
+// self-recovers via a half-open re-probe after its cooldown.
+func TestChaos_DisabledNodeSelfHealsViaBreaker(t *testing.T) {
+	t.Parallel()
+	const model = "minimax-m3"
+	clk := newChaosClock()
+	// Dead URL => every attempt is a transport error. Breaker threshold 2,
+	// 30s cooldown, fake clock.
+	node := newTestNode(t, "m3-bridge", "http://127.0.0.1:1", "coding-agent", 0, 1, []string{model}, 2, 30*time.Second, clk.Now)
+	node.cfg.HealthCheckDisabled = true
+	r := newFailoverRouter([]*upstreamNode{node}, 200*time.Millisecond)
+
+	// Two transport errors trip the breaker. The node must stay healthy=true
+	// (no probe loop to ever flip it back) — the breaker does the ejecting.
+	for i := 0; i < 2; i++ {
+		if code, _ := doChat(r, model); code != 502 {
+			t.Fatalf("request %d: expected 502 transport failure, got %d", i, code)
+		}
+		if !node.healthy.Load() {
+			t.Fatalf("a health_check_disabled node must NEVER be stored unhealthy (would strand it forever)")
+		}
+	}
+	if node.breaker.GetState() != circuitOpen {
+		t.Fatalf("breaker should be open after 2 transport errors, got %s", node.breaker.GetState())
+	}
+
+	// Breaker open => node ejected from rotation => 503 (no upstream contacted).
+	if code, _ := doChat(r, model); code != 503 {
+		t.Fatalf("expected 503 while breaker open, got %d", code)
+	}
+
+	// After the cooldown the breaker half-opens and the node is RE-PROBED
+	// (self-heal): selection admits it again. With the URL still dead it
+	// re-trips, but the key property is that recovery is attempted at all.
+	clk.Advance(31 * time.Second)
+	if code, _ := doChat(r, model); code != 502 {
+		t.Fatalf("expected the breaker to re-probe (and re-trip on still-dead URL) after cooldown, got %d", code)
+	}
+	if node.healthy.Load() != true {
+		t.Fatalf("node healthy flag must remain true throughout (breaker is the liveness signal)")
+	}
+}
+
 // TestChaos_FairSpreadAcrossTwoM3Keys proves quota-aware spreading: two
 // healthy, same-priority M3 keys should each absorb ~half the traffic via
 // weighted round-robin (this is Tier B's two-key spread).

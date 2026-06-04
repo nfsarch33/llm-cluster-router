@@ -651,8 +651,17 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		resp, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, body, model)
 		if err != nil {
 			attemptCancel()
-			candidate.healthy.Store(false)
-			nodeHealthyGauge.WithLabelValues(candidate.cfg.Name, candidate.cfg.Tier).Set(0)
+			// Self-heal: only the health loop can flip `healthy` back to true.
+			// For a node with health_check_disabled (e.g. a bridge with no
+			// /health endpoint) the loop is skipped, so storing healthy=false
+			// here would strand it forever — the original "never recovers"
+			// bug. In that case we rely solely on the circuit breaker, which
+			// self-recovers via a half-open probe after its cooldown. Probed
+			// nodes keep the fast-eject behaviour (the loop will restore them).
+			if !candidate.cfg.HealthCheckDisabled {
+				candidate.healthy.Store(false)
+				nodeHealthyGauge.WithLabelValues(candidate.cfg.Name, candidate.cfg.Tier).Set(0)
+			}
 			if candidate.breaker != nil {
 				candidate.breaker.RecordFailure()
 			}
