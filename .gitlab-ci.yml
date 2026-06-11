@@ -51,7 +51,7 @@ build:
   extends: .go_base
   stage: build
   script:
-    - CGO_ENABLED=0 go build -ldflags "-s -w" -o llm-cluster-router ./cmd/router/
+    - CGO_ENABLED=0 go build -ldflags "-s -w" -o llm-cluster-router .
   artifacts:
     paths:
       - llm-cluster-router

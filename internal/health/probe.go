@@ -53,7 +53,7 @@ func ProbeNodePath(ctx context.Context, baseURL *url.URL, path string) (bool, in
 	if err != nil {
 		return false, 0
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode >= 200 && resp.StatusCode < 300, resp.StatusCode
 }
 

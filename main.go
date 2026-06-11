@@ -289,7 +289,6 @@ type (
 	gpuProcess     = gpuprobe.Process
 	gpuSnapshot    = gpuprobe.Snapshot
 	gpuProbeReport = gpuprobe.Report
-	commandRunner  = gpuprobe.CommandRunner
 )
 
 // Metric aliases bridge the metrics package vars back into package
@@ -309,6 +308,14 @@ var (
 	nodeHealthyGauge          = metrics.NodeHealthyGauge
 	healthLatency             = metrics.HealthLatency
 	fairShareRejectedTotal    = metrics.FairShareRejectedTotal
+)
+
+// Keep bridge aliases referenced for golangci-lint unused check.
+var (
+	_ = llmRouterBuckets
+	_ = routerTokenRateBuckets
+	_ = forbiddenUpstreamHostSuffixes
+	_ = validateUpstreamURL
 )
 
 func runServe(args []string) error {
@@ -623,7 +630,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		requestsTotal.WithLabelValues(model, node.cfg.Name, "bad_gateway").Inc()
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// TTFT here is "router-perceived time-to-first-byte" -- from
 	// request-arrival to upstream returning headers. It is NOT
@@ -1057,7 +1064,7 @@ func runBenchRequest(client *http.Client, baseURL, model, apiKey, prompt string,
 	if err != nil {
 		return requestResult{Error: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return requestResult{Error: fmt.Sprintf("status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(payload)))}
@@ -1150,7 +1157,7 @@ func runCancelProbe(baseURL, model, apiKey, prompt string, cancelAfter time.Dura
 			ElapsedMillis:    durationMillis(time.Since(start)),
 		}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, readErr := io.Copy(io.Discard, resp.Body)
 	cancelled := readErr != nil && strings.Contains(strings.ToLower(readErr.Error()), "context canceled")
 	return cancelProbeResult{
@@ -1221,7 +1228,7 @@ func pollMetric(ctx context.Context, client *http.Client, metricsURL, metric str
 				continue
 			}
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			value := parsePrometheusGauge(string(body), metric)
 			for {
 				current := target.Load()
@@ -1241,7 +1248,7 @@ func fetchJSON(client *http.Client, target string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var payload map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err

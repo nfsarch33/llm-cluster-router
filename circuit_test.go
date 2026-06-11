@@ -155,3 +155,5 @@ func TestSelectNode_SkipsBrokenCircuit(t *testing.T) {
 // use to drive recordFailure. Defined here so test files can grow
 // without redeclaring it.
 var errFlaky = errors.New("flaky upstream")
+
+var _ = errFlaky
