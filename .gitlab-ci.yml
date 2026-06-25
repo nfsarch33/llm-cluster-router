@@ -3,6 +3,7 @@ stages:
   - test
   - build
   - security
+  - deploy
   - sync
   - notify
 
@@ -51,7 +52,7 @@ build:
   extends: .go_base
   stage: build
   script:
-    - CGO_ENABLED=0 go build -ldflags "-s -w" -o llm-cluster-router ./cmd/router/
+    - CGO_ENABLED=0 go build -ldflags "-s -w" -o llm-cluster-router .
   artifacts:
     paths:
       - llm-cluster-router
@@ -59,6 +60,21 @@ build:
   only:
     - main
     - tags
+
+deploy-wsl2:
+  stage: deploy
+  tags:
+    - fleet
+    - wsl2
+  needs:
+    - build
+  script:
+    - install -m 755 llm-cluster-router /home/jason/bin/llm-cluster-router
+    - systemctl --user restart llm-cluster-router.service || true
+    - timeout 10 curl -sf --max-time 5 http://127.0.0.1:8787/v1/models | head -c 200
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  allow_failure: true
 
 govulncheck:
   extends: .go_base
