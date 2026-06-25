@@ -363,6 +363,7 @@ func runServe(args []string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", r.handleHealth)
+	mux.HandleFunc("/health", r.handleHealth)
 	mux.HandleFunc("/v1/models", authWrap(r.handleModels))
 	mux.HandleFunc("/v1/chat/completions", authWrap(r.handleProxy))
 	mux.HandleFunc("/v1/completions", authWrap(r.handleProxy))
