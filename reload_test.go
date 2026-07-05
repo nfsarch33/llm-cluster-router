@@ -225,7 +225,7 @@ func modelIDs(t *testing.T, url string) []string {
 	if err != nil {
 		t.Fatalf("models request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var body struct {
 		Data []struct {
 			ID string `json:"id"`

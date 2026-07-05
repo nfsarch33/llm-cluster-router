@@ -26,3 +26,10 @@ func newCircuitBreaker(threshold int, cooldown time.Duration) *circuitBreaker {
 
 // circuitStateGauge re-exports the metric so dashboard tests find it.
 var circuitStateGauge = circuit.StateGauge
+
+// Keep bridge aliases referenced for golangci-lint unused check.
+var (
+	_ circuitState     = circuitClosed
+	_ *circuitBreaker  = newCircuitBreaker(1, time.Second)
+	_                  = circuitStateGauge
+)
