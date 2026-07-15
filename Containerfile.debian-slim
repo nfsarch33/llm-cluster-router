@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+#
+# Containerfile for llm-cluster-router (v14888)
+# Source: github.com/nfsarch33/llm-cluster-router
+#
+# MIGRATION: distroless/base-debian12:nonroot → debian:bookworm-slim + tini.
+# This is sprint 11 of v14878-v14895 and completes the distroless
+# decommission arc for the LLM router (last active runtime image).
+#
+# Listeners (per upstream main.go):
+#   :8080 - /v1/chat/completions proxy + /health, /readyz
+#   :9091 - Prometheus metrics
+#   :6060 - pprof/debug
+#
+# Runtime: distroless-free, tini for PID 1 signal handling.
+
+#####################
+# Stage 1: Go builder
+#####################
+FROM golang:1.26-bookworm AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    go mod download
+COPY . .
+
+ARG VERSION=dev
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+        -o /out/llm-cluster-router .
+
+#####################
+# Stage 2: Runtime (debian-slim + tini)
+#####################
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="llm-cluster-router" \
+      org.opencontainers.image.description="LLM Cluster Router (Helixon fleet central)" \
+      org.opencontainers.image.source="https://github.com/nfsarch33/llm-cluster-router" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      helixon.security.distroless-free=true \
+      io.helixon.sprint="v14888" \
+      io.helixon.service="llm-cluster-router"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+COPY --from=builder /out/llm-cluster-router /usr/local/bin/llm-cluster-router
+
+# Nonroot user (uid 1000 matches other Helixon fleet services)
+RUN groupadd --system --gid 1000 helixon \
+    && useradd  --system --uid 1000 --gid helixon helixon \
+    && mkdir -p /etc/llm-cluster-router /var/log/llm-cluster-router \
+    && chown -R helixon:helixon /var/log/llm-cluster-router
+
+USER helixon:helixon
+
+# /v1/chat proxy + /health, /readyz
+EXPOSE 8080
+# Prometheus metrics
+EXPOSE 9091
+# pprof/debug
+EXPOSE 6060
+
+# Mount config in via -v /path/to/router.yml:/etc/llm-cluster-router/router.yml:ro
+VOLUME ["/etc/llm-cluster-router"]
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/llm-cluster-router", \
+     "-config",  "/etc/llm-cluster-router/router.yml"]

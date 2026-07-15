@@ -1,0 +1,99 @@
+# llm-cluster-router fleet config — v14888
+# Win1/wsl1 + win4/wsl4 peer pool, no cloud fallbacks.
+#
+# Live endpoints verified via Tailscale DERP syd (wsl1 ↔ wsl4 RTT ~250ms).
+# Health probes every 15s; threshold 3; cooldown 30s.
+
+listen: ":8080"
+metrics_addr: ":9091"
+debug_addr: ":6060"
+log_level: info
+
+defaults:
+  max_queue_depth: 8
+  max_concurrency: 2
+  request_timeout: 180s
+  max_body_size: 4194304
+  circuit:
+    threshold: 5
+    cooldown: 30s
+
+health_check:
+  interval: 15s
+  timeout: 5s
+  path: /health
+  unhealthy_threshold: 3
+  healthy_threshold: 1
+
+# No fair-share: cluster is private, single user (jaslian).
+fair_share:
+  enabled: false
+
+# Per-user fair-share rate limiting. When enabled, each user (identified
+# by the X-User header, or a hash of the bearer token) gets an independent
+# sliding-window token bucket.
+# Disabled: solo fleet, no contention yet.
+nodes:
+  # ----- Local fast lane: wsl1 Ollama (qwen3.5-9b) -----
+  - name: wsl1-ollama-fast
+    url: http://127.0.0.1:11434
+    tier: fast
+    priority: 0
+    weight: 2
+    models:
+      - qwen3.5-9b
+      - qwen3.5-9b-instruct
+    circuit:
+      threshold: 3
+      cooldown: 20s
+
+  # ----- Local reasoning lane: wsl1 Qwen 3.6 27B (RTX 3090 #0) -----
+  - name: wsl1-llama-coder-27b
+    url: http://127.0.0.1:11435
+    tier: reasoning
+    priority: 0
+    weight: 4
+    models:
+      - qwen3.6-27b
+      - Qwen3.6-27B-Q4_K_M
+    circuit:
+      threshold: 5
+      cooldown: 30s
+
+  # ----- Secondary: wsl4 llama.cpp CUDA server (Qwen 3.6 27B) -----
+  # Reachable via Tailscale DERP from wsl1; 250-400ms RTT through relay.
+  # Marked priority 5 so wsl1 lane is preferred (no relay), but
+  # wsl4 picks up overflow automatically when wsl1 is saturated
+  # (queue depth >= max_queue_depth).
+  - name: wsl4-llama-coder-27b
+    url: http://desktop-p5bul0f-wsl4.tail447712.ts.net:11435
+    tier: reasoning
+    priority: 5
+    weight: 4
+    models:
+      - qwen3.6-27b
+      - Qwen3.6-27B-Q4_K_M
+    circuit:
+      threshold: 5
+      cooldown: 60s       # tolerate 30-60s relay latency blips
+    health_check:
+      interval: 30s       # probe less frequently (DERP relay)
+      timeout: 10s
+      unhealthy_threshold: 3
+      healthy_threshold: 1
+
+  # ----- Embedding lane (for sprintboard / engram / helixon-evolver) -----
+  - name: wsl1-engram-embedder
+    url: http://127.0.0.1:8281
+    tier: embed
+    priority: 0
+    weight: 2
+    models:
+      - nomic-embed-text:v1.5
+      - text-embedding-nomic-embed-text-v1.5
+    circuit:
+      threshold: 3
+      cooldown: 20s
+
+# Default model selection: agents query "qwen3.6-27b" for code, fast/9b for chat.
+# This explicit mapping prevents accidental Ollama fall-through.
