@@ -61,11 +61,11 @@ build:
     - main
     - tags
 
-deploy-wsl2:
+deploy-fleet-host:
   stage: deploy
   tags:
     - fleet
-    - wsl2
+    - gpu-host-1
   needs:
     - build
   script:
