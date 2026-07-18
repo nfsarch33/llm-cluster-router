@@ -1,0 +1,46 @@
+# llm-cluster-router — minimax live pilot wire-up (v18688-1).
+#
+# Per plan: route `minimax-chat` to api.minimaxi.com/v1 (NOT api.minimax.io).
+# The `MINIMAX_API_KEY` env var is resolved from the 1Password item
+# `minimax-api-1` (UUID ripotpfq43jzlreor4zo2ay734) at startup; this
+# yaml does NOT embed the key.
+#
+# Verification:
+#   curl -sS -X POST -H "Authorization: Bearer $MINIMAX_API_KEY" \
+#     -H "Content-Type: application/json" \
+#     --data '{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+#     https://api.minimaxi.com/v1/text/chatcompletion_v2
+
+listeners:
+  - name: minimax-chat
+    url: https://api.minimaxi.com/v1
+    paths:
+      - /text/chatcompletion_v2
+    auth:
+      env: MINIMAX_API_KEY
+      scheme: bearer
+    models:
+      - MiniMax-M3
+      - MiniMax-Text-01
+    upstream_limits:
+      inflight: 8
+      qps: 4
+
+# Health probe policy: live endpoint requires 200 within 5s.
+health:
+  poll_interval_seconds: 30
+  fail_threshold: 2
+  recover_threshold: 3
+  timeout_seconds: 5
+
+# Tier routing (v18688-1 plan §1):
+# - default tier → minimax-chat (cost-optimised)
+# - pilot tier  → minimax-chat (high-availability mirror)
+fair_share:
+  tier_capacity:
+    default: 32
+    pilot: 16
+
+# Mirror for HA (v18688-1 + v18687-2 lesson applied): the same api.minimaxi.com
+# endpoint is the only PR-1 upstream; v18688-2 will add a secondary region
+# if/when v18688-4 reveals cross-region drift.
