@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/http/pprof"
@@ -47,6 +48,7 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
+	"github.com/nfsarch33/llm-cluster-router/internal/tunnel"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -243,6 +245,37 @@ func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, 
 		ctThreshold, ctCooldown := nc.ResolvedCircuit(cfg.Defaults)
 		node.breaker = newCircuitBreaker(ctThreshold, ctCooldown).WithName(nc.Name)
 		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
+		if nc.Tunnel.Enabled {
+			// Capture the runtime config in the closure so each
+			// node's transport dials through its own SSH jump,
+			// not someone else's. The transport reuses the same
+			// Timeout / Idle settings as the router-wide client
+			// for symmetry.
+			rt, err := nc.Tunnel.ToRuntime()
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("tunnel config on node %s: %w", nc.Name, err)
+			}
+			sshCfg := tunnel.SSHTunnelConfig{
+				Host:           rt.Host,
+				Port:           rt.Port,
+				User:           rt.User,
+				IdentityFile:   rt.IdentityFile,
+				LocalPort:      rt.LocalPort,
+				ConnectTimeout: rt.ConnectTimeout,
+			}
+			dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tunnel.DialContext(ctx, sshCfg, network, addr)
+			}
+			node.tunnelClient = &http.Client{
+				Timeout: cfg.Defaults.RequestTimeout.Duration,
+				Transport: &http.Transport{
+					DialContext:         dial,
+					MaxIdleConns:        20,
+					MaxIdleConnsPerHost: 4,
+					IdleConnTimeout:     30 * time.Second,
+				},
+			}
+		}
 		nodes = append(nodes, node)
 	}
 	client := &http.Client{
@@ -272,7 +305,20 @@ type upstreamNode struct {
 	// cooldown come from config (defaults.circuit, with optional
 	// per-node overrides), defaulting to 5 failures / 30s when unset.
 	breaker *circuitBreaker
+
+	// tunnelClient, when non-nil, sends this node's outbound
+	// traffic through the configured SSH jump (see internal/tunnel).
+	// nil means "no tunnel; route via the router-wide http.Client
+	// just like every other non-tunnelled node".
+	tunnelClient *http.Client
 }
+
+// sshtunnelRuntime is the runtime mirror of config.TunnelConfig,
+// constructed only when the operator sets tunnel.enabled:true on a
+// node. Keeping the alias here avoids exporting the runtime type from
+// the config package for callers that only need to pass it to the
+// tunnel package.
+type sshtunnelRuntime = cfg.SSHTunnelRuntime
 
 // nextAPIKey returns the next API key via round-robin when multiple
 // keys are configured (api_keys), falls back to the single api_key,
@@ -534,11 +580,21 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 	if err != nil {
 		return nil, err
 	}
-	resp, err := snap.client.Do(ureq)
+	// Per-node tunnel client (configured via node.tunnel.enabled)
+	// carries the node-specific SSH identity; when set, route through
+	// it instead of the shared router-wide client. The node-level
+	// Timeout/Transport settings mirror the router-wide ones so a
+	// failure mode looks identical to the operator regardless of
+	// whether the leg was tunnelled or direct.
+	client := snap.client
+	if node.tunnelClient != nil {
+		client = node.tunnelClient
+	}
+	resp, err := client.Do(ureq)
 	if err != nil && isRetryableConnError(err) {
 		requestRetries.WithLabelValues(model, node.cfg.Name).Inc()
 		if retryReq, rerr := build(); rerr == nil {
-			resp, err = snap.client.Do(retryReq)
+			resp, err = client.Do(retryReq)
 		}
 	}
 	return resp, err

@@ -25,6 +25,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	cfg "github.com/nfsarch33/llm-cluster-router/internal/config"
 )
 
 func TestProbeNodeUsesConfiguredHealthPath(t *testing.T) {
@@ -651,8 +653,8 @@ func TestNextAPIKey_Empty(t *testing.T) {
 }
 
 func TestLoadConfigExpandsAPIKeysEnvVars(t *testing.T) {
-	t.Setenv("TEST_MK1", "sk-one")   // gitleaks:allow
-	t.Setenv("TEST_MK2", "sk-two")   // gitleaks:allow
+	t.Setenv("TEST_MK1", "sk-one") // gitleaks:allow
+	t.Setenv("TEST_MK2", "sk-two") // gitleaks:allow
 
 	yamlContent := `
 listen: ":9999"
@@ -1022,5 +1024,102 @@ nodes:
 	}
 	if cfg.AuthToken != "my-secret-auth" {
 		t.Fatalf("auth_token = %q, want my-secret-auth", cfg.AuthToken)
+	}
+}
+
+// TestBuildReloadable_WiresTunnel validates that a NodeConfig with
+// tunnel.enabled:true attaches a per-node *http.Client backed by
+// tunnel.DialContext, and that a NodeConfig without the tunnel
+// block leaves the per-node client nil. This proves the wiring is
+// conditional and does not affect non-tunnelled nodes.
+func TestBuildReloadable_WiresTunnel(t *testing.T) {
+	t.Parallel()
+
+	// Direct node: tunnelClient must be nil — the router-wide
+	// client carries the request.
+	directCfg := config{
+		Defaults: defaults{
+			MaxConcurrency: 1,
+			RequestTimeout: durationValue{Duration: time.Second},
+		},
+		Nodes: []nodeConfig{
+			{Name: "direct", URL: "http://api.example.invalid", Tier: "fast"},
+		},
+	}
+	directNodes, directClient, _, err := buildReloadable(directCfg)
+	if err != nil {
+		t.Fatalf("buildReloadable(direct): %v", err)
+	}
+	if directClient == nil {
+		t.Fatal("expected non-nil router-wide client for direct config")
+	}
+	if directNodes[0].tunnelClient != nil {
+		t.Fatalf("direct node should not have tunnelClient; got %+v", directNodes[0])
+	}
+
+	// Tunnelled node: buildReloadable must succeed and attach a
+	// non-nil tunnelClient. We do NOT dial ssh here — only that
+	// the closure-bound DialContext is wired. A separate test in
+	// the tunnel package verifies the actual ssh invocation.
+	tunnelCfg := config{
+		Defaults: defaults{
+			MaxConcurrency: 1,
+			RequestTimeout: durationValue{Duration: time.Second},
+		},
+		Nodes: []nodeConfig{
+			{
+				Name: "jump-only",
+				URL:  "http://api.example.invalid",
+				Tier: "fast",
+				Tunnel: cfg.TunnelConfig{
+					Enabled:      true,
+					Host:         "jump.example",
+					Port:         22,
+					User:         "u",
+					IdentityFile: "/k",
+					LocalPort:    14443,
+				},
+			},
+		},
+	}
+	tunnelNodes, tunnelClient, _, err := buildReloadable(tunnelCfg)
+	if err != nil {
+		t.Fatalf("buildReloadable(tunnelled): %v", err)
+	}
+	if tunnelClient == nil {
+		t.Fatal("expected non-nil router-wide client for tunnelled config")
+	}
+	if len(tunnelNodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(tunnelNodes))
+	}
+	if tunnelNodes[0].tunnelClient == nil {
+		t.Fatalf("expected non-nil tunnelClient on tunnelled node; got %+v", tunnelNodes[0])
+	}
+
+	// Bad tunnel config (missing identity file) must fail fast
+	// at boot, not at first request.
+	badCfg := config{
+		Defaults: defaults{
+			MaxConcurrency: 1,
+			RequestTimeout: durationValue{Duration: time.Second},
+		},
+		Nodes: []nodeConfig{
+			{
+				Name: "broken",
+				URL:  "http://api.example.invalid",
+				Tier: "fast",
+				Tunnel: cfg.TunnelConfig{
+					Enabled:   true,
+					Host:      "jump.example",
+					Port:      22,
+					User:      "u",
+					LocalPort: 14443,
+					// IdentityFile deliberately empty
+				},
+			},
+		},
+	}
+	if _, _, _, err := buildReloadable(badCfg); err == nil {
+		t.Fatal("expected buildReloadable to fail for invalid tunnel config")
 	}
 }
