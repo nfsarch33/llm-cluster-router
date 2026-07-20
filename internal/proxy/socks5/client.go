@@ -167,61 +167,84 @@ func StreamSSE(ctx context.Context, proxyAddr, target, httpMethod, httpPath, aut
 			return
 		}
 
-		buf := make([]byte, 8192)
-		headerEnd := -1
-		headerBuf := []byte{}
-		for headerEnd < 0 {
-			n, err := conn.Read(buf)
-			if err != nil {
-				errs <- fmt.Errorf("socks5 stream: read headers: %w", err)
-				return
-			}
-			headerBuf = append(headerBuf, buf[:n]...)
-			if idx := indexOf(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
-				headerEnd = idx + 4
-			}
-			if len(headerBuf) > 16384 {
-				errs <- fmt.Errorf("socks5 stream: headers too large")
-				return
-			}
+		bodyBuf, err := readHTTPHeaders(conn)
+		if err != nil {
+			errs <- err
+			return
 		}
-		bodyBuf := headerBuf[headerEnd:]
-
-		for {
-			for {
-				idx := indexOf(bodyBuf, []byte("\n"))
-				if idx < 0 {
-					break
-				}
-				line := string(bodyBuf[:idx])
-				bodyBuf = bodyBuf[idx+1:]
-				line = trimCR(line)
-				if line == "" {
-					continue
-				}
-				if len(line) > 6 && line[:6] == "data: " {
-					payload := line[6:]
-					if payload == "[DONE]" {
-						chunks <- SSEChunk{Data: payload, IsDone: true}
-						return
-					}
-					chunks <- SSEChunk{Data: payload}
-				}
-			}
-			n, err := conn.Read(buf)
-			if n > 0 {
-				bodyBuf = append(bodyBuf, buf[:n]...)
-			}
-			if err != nil {
-				if err == io.EOF {
-					return
-				}
-				errs <- fmt.Errorf("socks5 stream: read body: %w", err)
-				return
-			}
-		}
+		streamBodyLines(conn, bodyBuf, chunks, errs)
 	}()
 	return chunks, errs
+}
+
+// readHTTPHeaders reads bytes from conn until the CRLF-CRLF delimiter
+// is found, returning the bytes after the header block. Bounded at
+// 16 KiB to prevent runaway header growth.
+func readHTTPHeaders(conn net.Conn) ([]byte, error) {
+	buf := make([]byte, 8192)
+	headerBuf := []byte{}
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			headerBuf = append(headerBuf, buf[:n]...)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("socks5 stream: read headers: %w", err)
+		}
+		if idx := indexOf(headerBuf, []byte("\r\n\r\n")); idx >= 0 {
+			return headerBuf[idx+4:], nil
+		}
+		if len(headerBuf) > 16384 {
+			return nil, fmt.Errorf("socks5 stream: headers too large")
+		}
+	}
+}
+
+// streamBodyLines reads body bytes from conn, parses "data: ..." lines,
+// and emits SSEChunk values onto chunks until [DONE] is seen or EOF.
+// Errors are sent to errs (which has capacity 1).
+func streamBodyLines(conn net.Conn, initial []byte, chunks chan<- SSEChunk, errs chan<- error) {
+	bodyBuf := initial
+	buf := make([]byte, 8192)
+	for {
+		for {
+			idx := indexOf(bodyBuf, []byte("\n"))
+			if idx < 0 {
+				break
+			}
+			line := trimCR(string(bodyBuf[:idx]))
+			bodyBuf = bodyBuf[idx+1:]
+			if payload, ok := parseDataLine(line); ok {
+				chunks <- SSEChunk{Data: payload, IsDone: payload == "[DONE]"}
+				if payload == "[DONE]" {
+					return
+				}
+			}
+		}
+		n, err := conn.Read(buf)
+		if n > 0 {
+			bodyBuf = append(bodyBuf, buf[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			errs <- fmt.Errorf("socks5 stream: read body: %w", err)
+			return
+		}
+	}
+}
+
+// parseDataLine returns (payload, true) if line is a "data: ..." SSE
+// line; ("", false) otherwise.
+func parseDataLine(line string) (string, bool) {
+	if line == "" {
+		return "", false
+	}
+	if len(line) > 6 && line[:6] == "data: " {
+		return line[6:], true
+	}
+	return "", false
 }
 
 // SSEChunk is one parsed "data:" line from a Server-Sent Events
