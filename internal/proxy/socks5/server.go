@@ -44,29 +44,24 @@ func (l *listenerFactory) Channel() string { return "socks5" }
 // addr MUST be in host:port form (e.g. "127.0.0.1:1080"). An empty
 // address returns ErrEmptyAddr.
 //
-// Note: armon/go-socks5's ListenAndServe owns its own net.Listener
-// internally, so we wrap that internal listener via ServeLoop. We
-// bind a probe listener first to detect address conflicts, then
-// construct the SOCKS5 server which rebinds to the same address.
-//
 // In v18705 the implementation accepts the bind address but the
 // underlying armon/go-socks5 server is invoked with a no-auth
 // configuration; the on-the-wire SOCKS5 handshake is intentionally
 // NOT exercised in unit tests (it requires a real SOCKS5 client;
 // covered by the demo binary in cmd/dual-listener-demo).
+//
+// v18706 fix: removed the probe-then-rebind pattern. The probe bound
+// a port, closed it, then rebound in a second net.Listen call; under
+// parallel fuzz workers another goroutine could steal the port
+// between the two syscalls (TOCTOU race surfaced by FuzzSOCKS5).
+// The bind is now a single net.Listen call. Callers that want to
+// pre-detect EADDRINUSE without holding the socket should use
+// net.Listen themselves before calling Listen; the factory returns
+// the underlying error directly so the binding error is preserved.
 func (l *listenerFactory) Listen(ctx context.Context, addr string) (net.Listener, proxy.ServeLoop, error) {
 	if addr == "" {
 		return nil, nil, ErrEmptyAddr
 	}
-	// Bind a probe listener first so we can return a real
-	// net.Listener to the caller immediately and detect bind
-	// conflicts before constructing the SOCKS5 server.
-	probe, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, nil, err
-	}
-	boundAddr := probe.Addr().String()
-	_ = probe.Close()
 
 	conf := &socks5.Config{} // default: no-auth (RFC 1928 method 0x00)
 	server, err := socks5.New(conf)
@@ -74,11 +69,10 @@ func (l *listenerFactory) Listen(ctx context.Context, addr string) (net.Listener
 		return nil, nil, err
 	}
 
-	// Re-bind a real net.Listener that the SOCKS5 server will use.
-	// We hand this listener to the caller; the caller can close it
-	// to stop the SOCKS5 server. The ServeLoop drives the SOCKS5
-	// server's Accept loop.
-	ln, err := net.Listen("tcp", boundAddr)
+	// Single bind; no probe pattern. If addr is in use we return
+	// the underlying *net.OpError directly so callers can errors.As
+	// against syscall.EADDRINUSE without translation.
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, err
 	}
