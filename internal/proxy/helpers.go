@@ -76,6 +76,9 @@ func BearerAuthFunc(getToken func() string) func(http.HandlerFunc) http.HandlerF
 			}
 			auth := r.Header.Get("Authorization")
 			if auth != "Bearer "+token {
+				if onReject != nil {
+					onReject(r.URL.Path)
+				}
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
@@ -83,3 +86,13 @@ func BearerAuthFunc(getToken func() string) func(http.HandlerFunc) http.HandlerF
 		}
 	}
 }
+
+// onReject is the package-level hook invoked when BearerAuthFunc rejects a
+// request. Wired by SetAuthRejectHook from main.go so the proxy package
+// does not depend on internal/metrics.
+var onReject func(path string)
+
+// SetAuthRejectHook installs a callback invoked on every bearer-token
+// rejection. Passing nil clears the hook (useful in tests). The callback
+// runs synchronously on the hot path; keep it cheap (one prom Counter Inc).
+func SetAuthRejectHook(fn func(path string)) { onReject = fn }

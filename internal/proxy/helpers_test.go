@@ -218,6 +218,56 @@ func TestBearerAuthFunc_EmptyGetTokenDisablesAuth(t *testing.T) {
 	}
 }
 
+func TestBearerAuthFunc_RejectionFiresHook(t *testing.T) {
+	// Save and restore the package-level hook so this test is isolated.
+	prev := onReject
+	defer func() { onReject = prev }()
+
+	var captured []string
+	SetAuthRejectHook(func(path string) {
+		captured = append(captured, path)
+	})
+
+	getToken := func() string { return "secret" }
+	handlerCalled := false
+	h := BearerAuthFunc(getToken)(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rr := httptest.NewRecorder()
+	h(rr, req)
+
+	if handlerCalled {
+		t.Error("downstream handler must not run on auth rejection")
+	}
+	if len(captured) != 1 || captured[0] != "/v1/chat/completions" {
+		t.Errorf("hook captured = %v, want [/v1/chat/completions]", captured)
+	}
+}
+
+func TestBearerAuthFunc_AcceptedRequestDoesNotFireHook(t *testing.T) {
+	prev := onReject
+	defer func() { onReject = prev }()
+
+	called := 0
+	SetAuthRejectHook(func(string) { called++ })
+
+	getToken := func() string { return "secret" }
+	h := BearerAuthFunc(getToken)(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+	h(rr, req)
+
+	if called != 0 {
+		t.Errorf("hook fired %d times on accepted request, want 0", called)
+	}
+}
+
 func TestFlushWriter_WriteForwardsAndFlushes(t *testing.T) {
 	flushCount := 0
 	inner := &countingFlusher{

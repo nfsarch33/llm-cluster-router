@@ -82,4 +82,9 @@ var (
 		Name: "llm_router_fairshare_rejected_total",
 		Help: "Requests rejected by the per-user fair-share limiter.",
 	}, []string{"user"})
+
+	AuthRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "llm_router_auth_rejected_total",
+		Help: "Requests rejected by the bearer-token auth middleware (401).",
+	}, []string{"path"})
 )
