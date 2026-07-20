@@ -139,6 +139,7 @@ func TestAgentraceAppender_DedupesConcurrentWrites(t *testing.T) {
 func TestMetricsRegistry_ExposesDualListenerSeries(t *testing.T) {
 	ConnectionsTotal.Reset()
 	BytesTotal.Reset()
+	DecryptFailedTotal.Reset()
 	reg := prometheus.NewRegistry()
 	if err := RegisterMetrics(reg); err != nil {
 		t.Fatalf("RegisterMetrics: %v", err)
@@ -147,9 +148,11 @@ func TestMetricsRegistry_ExposesDualListenerSeries(t *testing.T) {
 	// registry sees them (WithLabelValues creates them lazily).
 	ConnectionsTotal.WithLabelValues("socks5", "ok").Inc()
 	ConnectionsTotal.WithLabelValues("aes-mtls", "ok").Inc()
+	ConnectionsTotal.WithLabelValues("aes-mtls", "tampering").Inc()
 	BytesTotal.WithLabelValues("socks5", "in").Add(64)
 	BytesTotal.WithLabelValues("socks5", "out").Add(128)
 	RequestDuration.WithLabelValues("socks5", "GET").Observe(0.05)
+	DecryptFailedTotal.WithLabelValues("aes-mtls").Inc()
 
 	srv := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	defer srv.Close()
@@ -169,9 +172,11 @@ func TestMetricsRegistry_ExposesDualListenerSeries(t *testing.T) {
 	for _, want := range []string{
 		`llm_cluster_router_connections_total{listener="socks5",outcome="ok"}`,
 		`llm_cluster_router_connections_total{listener="aes-mtls",outcome="ok"}`,
+		`llm_cluster_router_connections_total{listener="aes-mtls",outcome="tampering"}`,
 		`llm_cluster_router_bytes_total{direction="in",listener="socks5"}`,
 		`llm_cluster_router_bytes_total{direction="out",listener="socks5"}`,
 		`llm_cluster_router_request_duration_seconds_bucket{listener="socks5",method="GET",`,
+		`llm_cluster_router_decrypt_failed_total{listener="aes-mtls"}`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("metrics output missing %q", want)
@@ -188,6 +193,7 @@ func TestConnectionsTotal_DtoRoundTrip(t *testing.T) {
 	ConnectionsTotal.WithLabelValues("socks5", "ok").Inc()
 	ConnectionsTotal.WithLabelValues("socks5", "error").Inc()
 	ConnectionsTotal.WithLabelValues("aes-mtls", "closed").Inc()
+	ConnectionsTotal.WithLabelValues("aes-mtls", "tampering").Inc()
 
 	reg := prometheus.NewRegistry()
 	if err := reg.Register(ConnectionsTotal); err != nil {
