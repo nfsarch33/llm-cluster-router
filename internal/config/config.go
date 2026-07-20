@@ -122,7 +122,98 @@ type NodeConfig struct {
 	// set it true for an upstream that legitimately has no health endpoint
 	// AND whose liveness is asserted by other means.
 	HealthCheckDisabled bool `yaml:"health_check_disabled"`
+
+	// Tunnel, when set, sends this node's outbound traffic through an
+	// SSH local-port forward to a Helixon "tunneld" jump (see `tunnel`
+	// package). The zero value means "no tunnel; route directly to
+	// URL". Per-node rather than global because most upstreams are
+	// served directly from the router host and only sensitive ones
+	// (e.g. audit-logged corporate endpoints) need the SSH leg.
+	//
+	// Operators wire the identity file via a side channel (the
+	// ssh-add daemon, or strict mode 0600 on the worker) — we do not
+	// embed key material in config so the file can stay
+	// operator-readable.
+	Tunnel TunnelConfig `yaml:"tunnel"`
 }
+
+// TunnelConfig is the YAML subset of tunnel.SSHTunnelConfig. Keeping
+// the config surface independent from the runtime type lets the
+// tunnel package own its own validation and lets us tighten the
+// router's binding without breaking existing YAML.
+type TunnelConfig struct {
+	// Enabled, when true, routes this node through the tunnel
+	// described below. Defaults to false.
+	Enabled bool `yaml:"enabled"`
+	// Host is the remote jump (e.g. Lightsail host). Required when
+	// Enabled is true.
+	Host string `yaml:"host"`
+	// Port is the remote SSH port. Defaults to 22 when zero.
+	Port int `yaml:"port"`
+	// User is the SSH login on the jump. Required when Enabled.
+	User string `yaml:"user"`
+	// IdentityFile is the absolute path of the SSH private key.
+	// Required when Enabled.
+	IdentityFile string `yaml:"identity_file"`
+	// LocalPort is the port tunneld (or another HTTP server) is
+	// listening on INSIDE the jump's loopback. Traffic relayed
+	// through the SSH -L forward lands here. Required when Enabled
+	// and must be 1..65535.
+	LocalPort int `yaml:"local_port"`
+	// ConnectTimeout is the per-dial SSH timeout. Defaults to 10s.
+	ConnectTimeout DurationValue `yaml:"connect_timeout"`
+}
+
+// ToRuntime converts the YAML-time config into the package-local
+// representation consumed by `tunnel.DialContext`. It returns an
+// error if the config is invalid so the router can refuse to start
+// with a broken tunnel rather than fail at first request.
+func (t TunnelConfig) ToRuntime() (SSHTunnelRuntime, error) {
+	if !t.Enabled {
+		return SSHTunnelRuntime{}, ErrTunnelDisabled
+	}
+	if t.Host == "" || t.User == "" || t.IdentityFile == "" {
+		return SSHTunnelRuntime{}, errTunnelMissingField{field: "host/user/identity_file"}
+	}
+	if t.LocalPort <= 0 || t.LocalPort > 65535 {
+		return SSHTunnelRuntime{}, errTunnelMissingField{field: "local_port"}
+	}
+	ct := t.ConnectTimeout.Duration
+	if ct == 0 {
+		ct = 10 * time.Second
+	}
+	return SSHTunnelRuntime{
+		Host:           t.Host,
+		Port:           t.Port,
+		User:           t.User,
+		IdentityFile:   t.IdentityFile,
+		LocalPort:      t.LocalPort,
+		ConnectTimeout: ct,
+	}, nil
+}
+
+// SSHTunnelRuntime is the runtime SSH-tunnel config attached to a
+// routed node. It mirrors tunnel.SSHTunnelConfig to keep the config
+// package free of an import cycle, then convert() in the router.
+type SSHTunnelRuntime struct {
+	Host           string
+	Port           int
+	User           string
+	IdentityFile   string
+	LocalPort      int
+	ConnectTimeout time.Duration
+}
+
+// ErrTunnelDisabled signals the caller asked for ToRuntime on a
+// disabled TunnelConfig; not a hard error.
+var ErrTunnelDisabled = errors.New("tunnel: not enabled")
+
+// errTunnelMissingField is wrapped into a friendly message for the
+// operator; we use an unexported type to avoid callers doing
+// branchy string matching.
+type errTunnelMissingField struct{ field string }
+
+func (e errTunnelMissingField) Error() string { return "tunnel: missing/invalid " + e.field }
 
 // ResolvedCircuit returns the effective breaker threshold and cooldown for
 // this node: a positive per-node override wins, otherwise the global default
