@@ -3,6 +3,10 @@ package proxy
 import (
 	"context"
 	"net"
+	"time"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/crypto"
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy/observability"
 )
 
 // ServeLoop is the long-running accept loop for a listener. It MUST
@@ -33,15 +37,52 @@ type ListenerFactory interface {
 // that wrap the returned net.Listener in a tls.Listener; this
 // factory only owns the TCP bind + ServeLoop plumbing so the
 // production main.go can compose it alongside future channels.
-type aesMTLSListenerFactory struct{}
+//
+// v18710-4: each accepted connection is wrapped with
+// `internal/crypto.Wrap` (AES-256-GCM) so the dual-listener demo
+// exercises the application-layer encryption path. The wrapper
+// surfaces tamper events via the TamperCount counter; this
+// ServeLoop forwards each tamper to
+// `observability.DecryptFailedTotal{listener="aes-mtls"}`.
+type aesMTLSListenerFactory struct {
+	// key is the 32-byte AES key. Production callers obtain it
+	// from a secret store; the demo defaults to a deterministic
+	// key so the v18710-4 release gate is reproducible. Storing
+	// the key here (rather than as a global) lets tests inject
+	// different keys and lets future config-based wiring swap
+	// the source.
+	key [32]byte
+}
 
 // NewAESMTLSListenerFactory returns a ListenerFactory for the
 // existing AES/mTLS HTTP path. The factory is intentionally
 // minimal: the production router already has its http.Server
 // constructed in main.go; this factory exists to make the
 // dual-listener interface composable.
+//
+// The default AES key is a deterministic placeholder; production
+// callers should swap it via NewAESMTLSListenerFactoryWithKey.
 func NewAESMTLSListenerFactory() ListenerFactory {
-	return &aesMTLSListenerFactory{}
+	return &aesMTLSListenerFactory{key: defaultDemoAESKey()}
+}
+
+// NewAESMTLSListenerFactoryWithKey returns a ListenerFactory
+// configured with the supplied AES-256 key. Used by tests and by
+// production callers that load the key from a secret store.
+func NewAESMTLSListenerFactoryWithKey(key [32]byte) ListenerFactory {
+	return &aesMTLSListenerFactory{key: key}
+}
+
+// defaultDemoAESKey returns a non-secret placeholder key for the
+// dual-listener demo. The bytes are NOT zero — that would mask
+// callers that forget to provide a key (zero-keyed AES still
+// "works" but is silent about misconfiguration).
+func defaultDemoAESKey() [32]byte {
+	var k [32]byte
+	for i := range k {
+		k[i] = byte(i + 1)
+	}
+	return k
 }
 
 func (a *aesMTLSListenerFactory) Channel() string { return "aes-mtls" }
@@ -54,12 +95,10 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 	if err != nil {
 		return nil, nil, err
 	}
+	key := a.key
 	serve := func(ctx context.Context, ln net.Listener) error {
 		// Watch ctx in a goroutine; on cancellation, close the
 		// listener so the blocked Accept call returns an error.
-		// The caller still owns the listener for normal cleanup
-		// (closing ln from outside the ServeLoop is safe; the
-		// second Close is a no-op that returns an error we ignore).
 		go func() {
 			<-ctx.Done()
 			_ = ln.Close()
@@ -70,18 +109,47 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 				if ctx.Err() != nil {
 					return nil
 				}
-				// Listener was closed by another path (caller
-				// shutdown or test teardown). Normal exit.
 				return nil
 			}
-			// The actual request handling is delegated to the
-			// caller's http.Server. This ServeLoop only models
-			// the listen/accept seam; production wiring will
-			// replace this no-op with a real handler.
-			_ = conn.Close()
+			// v18710-4: wrap the raw TCP conn with AES-256-GCM
+			// and forward tamper events to the observability
+			// metric. The wrapper's Close is sufficient to
+			// release the underlying conn; we do not need a
+			// separate defer.
+			wrapped := crypto.Wrap(conn, key)
+			startTamperForwarder(wrapped)
+			// Production HTTP handling is delegated to the
+			// caller's http.Server. We close the wrapped conn
+			// here so the demo's ServeLoop does not leak
+			// descriptors when no http.Server is registered.
+			_ = wrapped.Close()
 		}
 	}
 	return ln, serve, nil
+}
+
+// startTamperForwarder spawns a goroutine that polls the wrapper's
+// tamper counter every 10ms and increments
+// observability.DecryptFailedTotal{listener="aes-mtls"} on
+// observed deltas. Production wiring should refactor to a
+// per-event channel; for the v18710-4 demo the polling cadence is
+// acceptable.
+func startTamperForwarder(wc *crypto.WrapConn) {
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		var last uint64
+		for {
+			select {
+			case <-ticker.C:
+				now := wc.TamperCount()
+				if now > last {
+					observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
+					last = now
+				}
+			}
+		}
+	}()
 }
 
 // errEmptyAddr is returned by factories when addr is empty. It is

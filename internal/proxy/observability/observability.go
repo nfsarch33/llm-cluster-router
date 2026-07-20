@@ -176,7 +176,18 @@ func attributeString(key, value string) attribute.KeyValue {
 // --- Prometheus metrics ---
 
 // ConnectionsTotal is the dual-listener connection counter,
-// labelled by listener (socks5|aes-mtls) and outcome (ok|error|closed).
+// labelled by listener (socks5|aes-mtls) and outcome
+// (ok|error|closed|tampering).
+//
+// The "tampering" outcome was added in v18710-4 to surface AES-GCM
+// authentication failures from the AES/mTLS channel. Production
+// monitoring should alert on `rate(...{outcome="tampering"}[5m]) > 0`
+// because every increment represents an attacker (or a buggy client)
+// probing or mutating the wire.
+//
+// The other outcomes (ok|error|closed) are unchanged from the v18706
+// dual-listener demo and remain backward-compatible with existing
+// dashboards.
 var ConnectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "llm_cluster_router_connections_total",
 	Help: "Total connections accepted by the dual-listener, partitioned by listener and outcome.",
@@ -197,10 +208,25 @@ var RequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 }, []string{"listener", "method"})
 
+// DecryptFailedTotal counts AES-GCM authentication failures per
+// listener. v18710-4 introduces this metric to support the
+// Lightsail release readiness gate (ADR-083 C2/C7): any non-zero
+// rate over a 1-minute window is an incident.
+//
+// The metric is partitioned by listener (socks5|aes-mtls) so the
+// same Prometheus scrape target can show tampering on both
+// channels. Today only the AES/mTLS channel increments this
+// counter; the SOCKS5 listener is documented as "future" because
+// SOCKS5 itself does not authenticate frames.
+var DecryptFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "llm_cluster_router_decrypt_failed_total",
+	Help: "AES-GCM authentication failures by listener. Non-zero rate indicates tampering or corrupted transport.",
+}, []string{"listener"})
+
 // RegisterMetrics installs the dual-listener metrics on the
 // provided (production-isolated) registry. Call once at startup.
 func RegisterMetrics(reg *prometheus.Registry) error {
-	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration} {
+	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal} {
 		if err := reg.Register(c); err != nil {
 			// Already-registered (e.g. by a previous test) is fine; only fail on unexpected errors.
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -217,6 +243,7 @@ func Reset() {
 	ConnectionsTotal.Reset()
 	BytesTotal.Reset()
 	RequestDuration.Reset()
+	DecryptFailedTotal.Reset()
 }
 
 // silentIOReset discards any error from io.Closer; kept here so
