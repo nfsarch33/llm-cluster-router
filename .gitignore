@@ -1,5 +1,6 @@
 # Binaries
 llm-cluster-router
+helixchannel
 *.exe
 
 # Config with secrets
