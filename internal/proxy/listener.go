@@ -1,3 +1,22 @@
+// Package proxy provides the ListenerFactory contract and the
+// canonical HelixChannel AES/mTLS HTTP listener used by
+// llm-cluster-router.
+//
+// # HelixChannel (v18712)
+//
+// HelixChannel is the operator-facing name for the AES-256-GCM
+// application-layer encrypted HTTP channel introduced incrementally
+// across v18704-v18710 and standardised by ADR-085. The channel id
+// returned by Channel() is "aes-mtls" for back-compat with existing
+// dashboards and runbooks; the brand name "HelixChannel" is stamped
+// as a response header (see WithHelixChannelHeader) and exposed in
+// the additive metric families
+// llm_cluster_router_helixchannel_connections_total and
+// llm_cluster_router_helixchannel_bytes_total.
+//
+// See the README "HelixChannel (encrypted dual-listener)" section
+// for the threat model and the operator-facing config keys
+// (HELIXCHANNEL_*).
 package proxy
 
 import (

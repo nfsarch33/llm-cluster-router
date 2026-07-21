@@ -2,6 +2,59 @@
 
 OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with global concurrency limiting and priority-based routing.
 
+## HelixChannel (encrypted dual-listener)
+
+HelixChannel is the operator-facing name for the AES-256-GCM
+application-layer encrypted HTTP channel that fronts every router
+deployment. It is the brand name for the dual-listener design
+introduced incrementally across v18704-v18710 and standardised by
+ADR-085 (`adrs/ADR-085-helixchannel-prod-wire.md` in the
+`cursor-global-kb` repo).
+
+### Threat model
+
+- Wire captures on the path between the router and the upstreams
+  see ciphertext only; plaintext LLM prompts, completions, and
+  bearer tokens never appear on the wire.
+- An attacker who can R/W to the TCP socket cannot silently tamper
+  with a request because every frame is AES-GCM authenticated.
+  Tampering events are counted in
+  `llm_cluster_router_decrypt_failed_total{listener="aes-mtls"}`
+  and surface as an incident in Grafana.
+
+### ListenerFactory contract
+
+The router owns a `proxy.ListenerFactory` per channel. The
+factory's `Channel()` returns a stable identifier (currently
+`"aes-mtls"`) used for metrics, logging, and config keys. The
+factory's `Listen(ctx, addr)` returns a bound `net.Listener` plus
+the `ServeLoop` that should be run for it. The production
+`main.go` constructs the AES/mTLS factory by default; the
+`HELIXCHANNEL_ENABLED=false` env override keeps the legacy plain
+HTTP listener for back-compat.
+
+### Operator-facing config
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `HELIXCHANNEL_ENABLED` | `true` | Toggle the AES/mTLS factory. `false` keeps the legacy plain HTTP listener for back-compat. |
+| `HELIXCHANNEL_KEY` | demo placeholder | 32-byte AES-256 key. Production callers load this from a secret store (see `internal/proxy/listener.go`). |
+| `HELIXCHANNEL_LISTEN` | `cfg.Listen` | Override the bind address (host:port). Falls back to the legacy `listen:` YAML key. |
+
+The response header `HelixChannel-Version: <version>` is stamped
+on every reply; `curl -I https://host/` is the canonical proof-of-name
+artifact.
+
+### Additive metric families (v18712-1)
+
+Both legacy and new label keys are populated by the dual-listener
+ServeLoop, so existing Grafana panels keep working:
+
+- `llm_cluster_router_connections_total{listener="aes-mtls",direction="in"}`
+  — legacy channel label
+- `llm_cluster_router_helixchannel_connections_total{direction="in"}`
+  — operator-facing alias
+
 ## Features
 
 - **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
