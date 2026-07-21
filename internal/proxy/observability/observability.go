@@ -223,10 +223,37 @@ var DecryptFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "AES-GCM authentication failures by listener. Non-zero rate indicates tampering or corrupted transport.",
 }, []string{"listener"})
 
+// HelixChannelConnectionsTotal is the additive v18712-1 alias for
+// the AES/mTLS channel under the operator-facing name "HelixChannel".
+// It points at the SAME counter family as ConnectionsTotal but with
+// the listener label fixed to "helixchannel" so dashboards can show
+// the brand name alongside the legacy "aes-mtls" line. The two
+// counters are incremented in lock-step from the dual-listener
+// ServeLoop; the alias is read-only.
+//
+// Why an alias and not a new metric? Operators asked for the
+// HelixChannel name to appear in dashboards and runbook scripts
+// without changing existing Grafana panels that key off
+// listener="aes-mtls". Both labels are populated; queries that
+// filter by listener="helixchannel" return the same wire traffic
+// as listener="aes-mtls".
+var HelixChannelConnectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "llm_cluster_router_helixchannel_connections_total",
+	Help: "HelixChannel (AES-256-GCM application-layer encrypted) connections by direction. Additive v18712-1 alias for llm_cluster_router_connections_total{listener=\"helixchannel\"}.",
+}, []string{"direction"})
+
+// HelixChannelBytesTotal mirrors BytesTotal under the HelixChannel
+// brand. Read-only alias; both labels increment from the same
+// ServeLoop path.
+var HelixChannelBytesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "llm_cluster_router_helixchannel_bytes_total",
+	Help: "HelixChannel bytes proxied, partitioned by direction. Additive v18712-1 alias for llm_cluster_router_bytes_total{listener=\"helixchannel\"}.",
+}, []string{"direction"})
+
 // RegisterMetrics installs the dual-listener metrics on the
 // provided (production-isolated) registry. Call once at startup.
 func RegisterMetrics(reg *prometheus.Registry) error {
-	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal} {
+	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal, HelixChannelConnectionsTotal, HelixChannelBytesTotal} {
 		if err := reg.Register(c); err != nil {
 			// Already-registered (e.g. by a previous test) is fine; only fail on unexpected errors.
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -244,6 +271,8 @@ func Reset() {
 	BytesTotal.Reset()
 	RequestDuration.Reset()
 	DecryptFailedTotal.Reset()
+	HelixChannelConnectionsTotal.Reset()
+	HelixChannelBytesTotal.Reset()
 }
 
 // silentIOReset discards any error from io.Closer; kept here so
