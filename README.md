@@ -2,6 +2,15 @@
 
 OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with global concurrency limiting and priority-based routing.
 
+> **HelixChannel quickstart** — Build the doctor probe and validate
+> release-readiness before deploying:
+> ```bash
+> go build -o helixchannel ./cmd/helixchannel
+> ./helixchannel doctor   # JSON envelope: release-gate + ADR-085 + AES key + observability
+> ```
+> See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
+> `key-check`, and `header-stamp` subcommands.
+
 ## HelixChannel (encrypted dual-listener)
 
 HelixChannel is the operator-facing name for the AES-256-GCM
@@ -247,46 +256,12 @@ API keys in config support `${ENV_VAR}` expansion — never hardcode secrets in 
 
 ## Lightsail release readiness
 
-The router ships with a one-command release gate (`scripts/release-gate.sh`)
-that runs every Lightsail-readiness check from [ADR-083](adrs/ADR-083-llm-cluster-router-lightsail-threat-model.md)
-and reports a single GREEN/RED verdict. It is the canonical pre-deploy
-hook for any Lightsail release.
+See [`docs/release-readiness.md`](docs/release-readiness.md) for the full
+release gate (`scripts/release-gate.sh`), ADR-083 / ADR-085 cross-links, and
+Lightsail port-443 reverse-proxy procedure.
 
-```bash
-# Full gate (sentrux + ADR-083 + pentest + decrypt-forward + realmodel + doctor)
-bash scripts/release-gate.sh
-
-# Skip the realmodel E2E (requires DashScope credentials) or the
-# per-fleet doctor when running offline / in CI.
-bash scripts/release-gate.sh --no-realmodel
-bash scripts/release-gate.sh --no-doctor
-
-# Machine-readable output (single JSON envelope on stdout).
-bash scripts/release-gate.sh --json
-```
-
-The gate runs six rows:
-
-| # | Row | What it checks |
-|---|---|---|
-| 1 | `sentrux` | Structural regression vs saved baseline (modularity, coupling, depth) |
-| 2 | `adr083-checklist` | ADR-083 file exists + frontmatter + ≥12 post-conditions C1..C13 paired with verifiers |
-| 3 | `pentest` | Go adversarial tests (SOCKS5 fuzz + redaction + metric integrity) |
-| 4 | `decrypt-forward` | Wire-doctor E2E (no-plaintext + tamper-rejected binary post-conditions) |
-| 5 | `realmodel` | DashScope streaming SSE bridge through SSH-22 SOCKS5 (requires `DASHSCOPE_API_KEY`) |
-| 6 | `doctor` | `runx workspace doctor --quick` + sentrux shell-leak scan |
-
-The corresponding ADR-083 metrics surface on `/metrics`:
-
-- `llm_cluster_router_connections_total{listener,outcome}` — connection
-  counts partitioned by `socks5`/`aes-mtls` listener and outcome
-  (`success`, `rejected`, `tampering`).
-- `llm_cluster_router_decrypt_failed_total{listener}` — AES-GCM
-  authentication failures per listener. Any non-zero rate over a
-  1-minute window is an incident.
-
-See `adrs/ADR-083-llm-cluster-router-lightsail-threat-model.md` for the
-threat model and binary post-conditions.
+Quick validation: build `cmd/helixchannel` and run `./helixchannel doctor`
+to confirm release-readiness checks before deploying.
 
 ## License
 
