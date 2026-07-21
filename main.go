@@ -443,8 +443,43 @@ func runServe(args []string) error {
 	signal.Notify(sigCh, syscall.SIGHUP)
 	go watchReloadSignal(sigCh, *configPath, r, nil)
 
+	// v18712-2: select the ListenerFactory via the canonical
+	// selector. HELIXCHANNEL_ENABLED=true (default) wires the
+	// AES/mTLS factory that fronts every router deployment;
+	// setting HELIXCHANNEL_ENABLED=false keeps the legacy plain
+	// HTTP listener for back-compat. See ADR-085.
+	enabled := helixChannelEnabledFromEnv()
+	factory := proxy.SelectListenerFactory(enabled)
+	log.Printf("router listener channel=%s helixchannel_enabled=%t", factory.Channel(), enabled)
+
+	ln, _, err := factory.Listen(context.Background(), cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listener bind: %w", err)
+	}
+	defer ln.Close()
+
 	log.Printf("router listening on %s", cfg.Listen)
-	return server.ListenAndServe()
+	return server.Serve(ln)
+}
+
+// helixChannelEnabledFromEnv reads the HELIXCHANNEL_ENABLED env
+// var and returns true when the AES/mTLS factory should be used.
+// The default is true (HelixChannel on by default for v18712+);
+// set HELIXCHANNEL_ENABLED=false to opt out and use the legacy
+// plain HTTP listener. Empty/unset values default to true.
+//
+// Parsing is intentionally tolerant: any value other than
+// case-insensitive "false", "0", or "no" is treated as enabled.
+func helixChannelEnabledFromEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("HELIXCHANNEL_ENABLED")))
+	switch v {
+	case "", "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 // loadConfig delegates to the config package.

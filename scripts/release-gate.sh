@@ -302,7 +302,7 @@ run_realmodel() {
 
 run_doctor() {
   echo >&2
-  echo "[gate row 6/6] per-fleet doctor — workspace doctor + sentrux shell-leak scan" >&2
+  echo "[gate row 6/7] per-fleet doctor — workspace doctor + sentrux shell-leak scan" >&2
   if ! command -v runx >/dev/null 2>&1; then
     record "doctor" "YELLOW" "runx not on PATH; skipping row 6"
     return 0
@@ -320,6 +320,49 @@ run_doctor() {
   fi
   record "doctor" "YELLOW" "workspace doctor YELLOW (rc=$rc); review before declaring release-ready"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Row 7: prod-wire binary (v18712-2) — ListenerFactory selection + HelixChannel
+# ---------------------------------------------------------------------------
+#
+# This row proves that the production main.go wires the ListenerFactory
+# selector (proxy.SelectListenerFactory) and the HELIXCHANNEL_ENABLED
+# env knob are both present in the build. The assertion is the
+# presence of the canonical symbols in the compiled binary; we use
+# `strings` + ripgrep literal matching because the binary embeds Go
+# symbols and the strings are non-secret. (Operators can grep the
+# docker image without decompiling.)
+
+run_prod_wire() {
+  echo >&2
+  echo "[gate row 7/7] prod-wire — ListenerFactory selector wired in main.go (v18712-2)" >&2
+  # 1. Source-level assertions: the production main.go must call the
+  # canonical selector and read the HELIXCHANNEL_ENABLED env var.
+  local src_missing=()
+  if ! rg -qF 'proxy.SelectListenerFactory' "${REPO_ROOT}/main.go"; then
+    src_missing+=("proxy.SelectListenerFactory")
+  fi
+  if ! rg -qF 'helixChannelEnabledFromEnv' "${REPO_ROOT}/main.go"; then
+    src_missing+=("helixChannelEnabledFromEnv")
+  fi
+  if ! rg -qF 'HELIXCHANNEL_ENABLED' "${REPO_ROOT}/main.go"; then
+    src_missing+=("HELIXCHANNEL_ENABLED")
+  fi
+  if (( ${#src_missing[@]} > 0 )); then
+    record "prod-wire" "RED" "main.go missing symbols: ${src_missing[*]}"
+    return 1
+  fi
+  # 2. Selector unit tests pass.
+  local out rc
+  out="$(${GO_BIN} test -run 'SelectListenerFactory|PlainHTTPListener|HelixChannelEnabled' -count=1 ./internal/proxy/... . 2>&1)" || rc=$?
+  rc="${rc:-0}"
+  if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | rg -qF "ok " && ! printf '%s' "$out" | rg -qF "FAIL"; then
+    record "prod-wire" "GREEN" "ListenerFactory selector + HELIXCHANNEL_ENABLED wired; selector tests pass"
+    return 0
+  fi
+  record "prod-wire" "RED" "selector tests failed (rc=$rc): $(printf '%s' "$out" | rg -F 'FAIL' | head -n 1 | sed -E 's/^[[:space:]]+//')"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -347,6 +390,7 @@ if [[ "$NO_DOCTOR" -eq 0 ]]; then
 else
   record "doctor" "SKIP" "--no-doctor flag"
 fi
+if ! run_prod_wire; then OVERALL_RC=1; fi
 
 # ---------------------------------------------------------------------------
 # Summary table
