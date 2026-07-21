@@ -34,6 +34,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -78,6 +79,10 @@ func main() {
 	case "doctor":
 		if err := runDoctor(); err != nil {
 			fail("doctor", err)
+		}
+	case "endpoint-check":
+		if err := runEndpointCheck(os.Args[2:]); err != nil {
+			fail("endpoint-check", err)
 		}
 	default:
 		usage()
@@ -459,3 +464,122 @@ func helixChannelEnabledFromEnv() bool {
 //
 // (no real purpose beyond satisfying `go vet` when refactoring.)
 var _ = net.Listen
+
+// endpointCheckEnvelope is the JSON envelope emitted by the
+// `endpoint-check` subcommand (v18714-3). It is intentionally minimal:
+// the operator needs only reachability + latency for the two candidate
+// transports (TCP/22 legacy SSH SOCKS5 and TCP/443 TLS-tunneled
+// production) plus a single recommendation. Exit codes:
+//
+//	0  at least one endpoint reachable and recommendation emitted
+//	1  neither endpoint reachable (operator must investigate)
+//
+// `Recommendation` is one of:
+//
+//	"tcp22"   - TCP/22 reachable, TCP/443 not reachable
+//	"tcp443"  - TCP/443 reachable (regardless of TCP/22 state)
+//	"none"    - neither reachable
+type endpointCheckEnvelope struct {
+	Host            string `json:"host"`
+	TCP22Reachable  bool   `json:"tcp22_reachable"`
+	TCP22LatencyMs  int64  `json:"tcp22_latency_ms"`
+	TCP22Error      string `json:"tcp22_error,omitempty"`
+	TCP443Reachable bool   `json:"tcp443_reachable"`
+	TCP443LatencyMs int64  `json:"tcp443_latency_ms"`
+	TCP443Error     string `json:"tcp443_error,omitempty"`
+	Recommendation  string `json:"recommendation"`
+	ProbedAt        string `json:"probed_at"`
+}
+
+// runEndpointCheck probes the host for reachability of TCP/22 (legacy
+// SSH SOCKS5 channel) and TCP/443 (production TLS channel) and emits a
+// JSON envelope recommending the optimal path. v18714-3 / ADR-086.
+//
+// Usage:
+//
+//	helixchannel endpoint-check --host <hostname-or-ip>
+//
+// Flags:
+//
+//	--host           target host (required); e.g. "lightsail.example.com"
+//	--tcp22-port     TCP/22 port override (default "22"; tests use this
+//	                to bind an ephemeral listener and assert reachability)
+//	--tcp443-port    TCP/443 port override (default "443")
+//	--probe-timeout  per-port dial timeout (default 2s, capped at 30s)
+//
+// Anti-shell-leak: the HELIXCHANNEL_KEY env var is NEVER printed, even
+// in error messages, per no-shell-leak.mdc.
+func runEndpointCheck(args []string) error {
+	fs := flag.NewFlagSet("endpoint-check", flag.ContinueOnError)
+	host := fs.String("host", "", "target host to probe (required)")
+	tcp22Port := fs.String("tcp22-port", "22", "TCP/22 candidate port")
+	tcp443Port := fs.String("tcp443-port", "443", "TCP/443 candidate port")
+	probeTimeout := fs.Duration("probe-timeout", 2*time.Second, "per-port dial timeout (max 30s)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *host == "" {
+		return fmt.Errorf("--host is required")
+	}
+	if *probeTimeout <= 0 || *probeTimeout > 30*time.Second {
+		*probeTimeout = 2 * time.Second
+	}
+
+	env := endpointCheckEnvelope{
+		Host:     *host,
+		ProbedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+
+	tcp22OK, tcp22Lat, tcp22Err := probeHostPort(*host, *tcp22Port, *probeTimeout)
+	env.TCP22Reachable = tcp22OK
+	env.TCP22LatencyMs = tcp22Lat.Milliseconds()
+	if tcp22Err != nil {
+		env.TCP22Error = tcp22Err.Error()
+	}
+
+	tcp443OK, tcp443Lat, tcp443Err := probeHostPort(*host, *tcp443Port, *probeTimeout)
+	env.TCP443Reachable = tcp443OK
+	env.TCP443LatencyMs = tcp443Lat.Milliseconds()
+	if tcp443Err != nil {
+		env.TCP443Error = tcp443Err.Error()
+	}
+
+	switch {
+	case tcp443OK:
+		env.Recommendation = "tcp443"
+	case tcp22OK:
+		env.Recommendation = "tcp22"
+	default:
+		env.Recommendation = "none"
+	}
+
+	out, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+
+	if env.Recommendation == "none" {
+		return fmt.Errorf("neither TCP/22 nor TCP/443 reachable on %s", *host)
+	}
+	return nil
+}
+
+// probeHostPort dials host:port and returns (reachable, dial-latency,
+// error). A reachable connection is closed immediately; we measure
+// only the dial handshake to keep the probe bounded by probeTimeout.
+//
+// The error is the net.OpError returned by net.DialTimeout. We do NOT
+// wrap it so the operator can grep the dial class (timeout / refused
+// / no route) directly from the envelope.
+func probeHostPort(host, port string, timeout time.Duration) (bool, time.Duration, error) {
+	addr := net.JoinHostPort(host, port)
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	lat := time.Since(start)
+	if err != nil {
+		return false, lat, err
+	}
+	_ = conn.Close()
+	return true, lat, nil
+}
