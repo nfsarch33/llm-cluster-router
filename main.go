@@ -412,6 +412,12 @@ func runServe(args []string) error {
 	// Use a closure-form wrapper so the bearer token can be rotated
 	// via SIGHUP without restarting the listener. Each request
 	// consults r.AuthToken() afresh.
+	//
+	// Wire the auth-reject hook so the proxy package can emit
+	// llm_router_auth_rejected_total without importing internal/metrics.
+	proxy.SetAuthRejectHook(func(path string) {
+		metrics.AuthRejectedTotal.WithLabelValues(path).Inc()
+	})
 	authWrap := bearerAuthFunc(r.AuthToken)
 
 	mux := http.NewServeMux()
