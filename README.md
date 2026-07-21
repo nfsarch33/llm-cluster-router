@@ -11,6 +11,15 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 > See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
 > `key-check`, and `header-stamp` subcommands.
 
+> **Production ingress (v18714+)** — The HelixChannel production wire
+> reaches operators and pilot consumers via `TCP/443` (TLS-terminating
+> nginx → `127.0.0.1:14443` on the Lightsail instance), per
+> [ADR-086](../cursor-global-kb/adrs/ADR-086-helixchannel-port-443-migration.md).
+> The application-layer AES-256-GCM channel is unchanged; only the
+> transport moved from SSH-22 (pilot) to TLS/443 (production pilot).
+> Canonical reverse-proxy runbook:
+> [`cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md`](../cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md).
+
 ## HelixChannel (encrypted dual-listener)
 
 HelixChannel is the operator-facing name for the AES-256-GCM

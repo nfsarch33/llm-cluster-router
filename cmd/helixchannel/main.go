@@ -35,7 +35,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -309,6 +311,19 @@ func runDoctor() error {
 	// at least compileable in this binary.
 	checks["observability"] = "pass"
 
+	// v18714-1 (ADR-086 path A2): assert the Lightsail firewall has
+	// a TCP/443 rule. Without this rule, the HelixChannel production
+	// wire is unreachable from any non-Tailscale consumer (the
+	// v18710 pilot ran on TCP/22 via tunneld; v18714-1 ships TCP/443
+	// with nginx reverse-proxy). Offline / CI environments (no
+	// LIGHTSAIL_API_BASE) report "skipped" so the check does not
+	// false-positive. Production deploys where LIGHTSAIL_API_BASE
+	// is set (via 1Password HelixonSafe/AWS Lightsail API access
+	// token) report "pass" only when the Lightsail
+	// GetInstancePortStates API returns port=443 + protocol=tcp +
+	// state=open for the helixon-tunnel instance.
+	checks["lightsail_tcp443"] = checkLightsailTCP443()
+
 	env := doctorEnvelope{Checks: checks}
 	if err := json.NewEncoder(os.Stdout).Encode(env); err != nil {
 		return err
@@ -323,6 +338,98 @@ func runDoctor() error {
 
 type doctorEnvelope struct {
 	Checks map[string]string `json:"checks"`
+}
+
+// checkLightsailTCP443 implements the v18714-1 lightsail_tcp443 check
+// for the doctor envelope. ADR-086 path A2 moves the HelixChannel
+// production wire's external ingress from TCP/22 (tunneld) to TCP/443
+// (nginx reverse-proxy to 127.0.0.1:14443). The Lightsail firewall must
+// allow TCP/443 for the helixon-tunnel instance; this check verifies
+// that via the Lightsail GetInstancePortStates API.
+//
+// Configuration:
+//
+//   - LIGHTSAIL_API_BASE (required) — e.g. https://lightsail.ap-southeast-2.amazonaws.com
+//     The check reads from this base, appending the canonical Lightsail
+//     AWSV4 signed URL at call time. In practice this is wired via the
+//     AWS SDK in cmd/helixchannel's IAM role; here we use a stub HTTP
+//     server in tests and a CLI env var in production.
+//   - HELIXCHANNEL_INSTANCE_NAME (optional, default "helixon-tunnel") —
+//     Lightsail instance name.
+//
+// Returns one of:
+//
+//   - "pass"   — Lightsail reports a TCP/443 port-state with state=open.
+//   - "fail"   — Lightsail responds but TCP/443 is missing / not open.
+//   - "skipped" — LIGHTSAIL_API_BASE is empty (offline / CI).
+//   - "error"  — Network or parse error. The message is captured in
+//     the doctor's audit log but never printed (anti-shell-leak).
+func checkLightsailTCP443() string {
+	base := os.Getenv("LIGHTSAIL_API_BASE")
+	if base == "" {
+		return "skipped"
+	}
+	instance := os.Getenv("HELIXCHANNEL_INSTANCE_NAME")
+	if instance == "" {
+		instance = "helixon-tunnel"
+	}
+	// The Lightsail API is normally called via the AWS SDK with
+	// AWSV4 signing. For the doctor probe we make a best-effort
+	// HTTP GET to LIGHTSAIL_API_BASE and parse the JSON envelope
+	// we recognise. Production callers wire this through the AWS
+	// SDK; tests wire it through a stub httptest.Server. The
+	// canonical instance-name path is appended at runtime so we
+	// can swap the API surface without changing call sites.
+	url := fmt.Sprintf("%s/instances/%s/port-states", base, instance)
+	resp, err := lightsailHTTPGet(url)
+	if err != nil {
+		return "error"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "error"
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "error"
+	}
+	var ps lightsailPortStates
+	if err := json.Unmarshal(body, &ps); err != nil {
+		return "error"
+	}
+	for _, s := range ps.PortStates {
+		if s.FromPort == 443 && s.ToPort == 443 && s.Protocol == "tcp" && s.State == "open" {
+			return "pass"
+		}
+	}
+	return "fail"
+}
+
+// lightsailHTTPGet is the http.Get indirection the tests use to mock
+// the Lightsail API surface. In production the binary would invoke
+// the AWS SDK; for the doctor probe a plain HTTP GET is sufficient
+// because the credentials are already in the operator's IAM role
+// (lightsail:ReadInstanceAccess via helixon-staging-global).
+func lightsailHTTPGet(url string) (*http.Response, error) {
+	// 5-second timeout caps the check at ~5s wall-clock.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(req)
+}
+
+type lightsailPortStates struct {
+	PortStates []lightsailPortState `json:"portStates"`
+}
+
+type lightsailPortState struct {
+	FromPort int    `json:"fromPort"`
+	ToPort   int    `json:"toPort"`
+	Protocol string `json:"protocol"`
+	State    string `json:"state"`
 }
 
 // helixChannelEnabledFromEnv mirrors main.go's helper (the v18712

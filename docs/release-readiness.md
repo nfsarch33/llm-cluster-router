@@ -55,7 +55,12 @@ for the threat model and binary post-conditions.
 - **ADR-085** — HelixChannel production wire (lives in
   `cursor-global-kb/adrs/ADR-085-helixchannel-prod-wire.md`, supersedes ADR-084)
 - **Lightsail port-443 reverse-proxy procedure** —
-  `cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md` (v18712-3)
+  `cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md` (v18714-1;
+  supersedes the v18712-3 stub; ADR-086 path A2). The TCP/443 firewall
+  rule + nginx reverse-proxy in front of `127.0.0.1:14443` is the
+  operator-facing ingress for the HelixChannel production wire once
+  v18714-1 lands. AES-256-GCM application-layer channel is preserved
+  on the inner tunnel; only the transport moves from SSH-22 to TLS/443.
 - **Operator red-triage runbook** —
   `cursor-global-kb/sop/operator-red-triage.md` (v18712-5a)
 - **HelixChannel doctor probe** — `cmd/helixchannel/` binary with
