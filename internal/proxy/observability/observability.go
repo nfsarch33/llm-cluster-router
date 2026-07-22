@@ -250,10 +250,60 @@ var HelixChannelBytesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "HelixChannel bytes proxied, partitioned by direction. Additive v18712-1 alias for llm_cluster_router_bytes_total{listener=\"helixchannel\"}.",
 }, []string{"direction"})
 
+// HelixChannelSessionTotal counts HelixChannel sessions by terminal
+// outcome. Added in v18714-3 to give operators a per-session view of
+// the channel's health, distinct from the per-connection view in
+// HelixChannelConnectionsTotal.
+//
+// Why a new counter when HelixChannelConnectionsTotal already exists?
+// The connection-level metric tallies TCP accepts; the session-level
+// metric tallies logical HelixChannel sessions, where one session
+// may span many connections (HTTP keep-alive) and where the same
+// connection may carry multiple logically independent sessions after
+// reconnect. Splitting the two lets SREs alert on
+//
+//   - rate(helixchannel_session_total{outcome="success"}[5m])    — healthy traffic
+//   - rate(helixchannel_session_total{outcome="failure"}[5m])     — application errors
+//   - rate(helixchannel_session_total{outcome="tampering"}[5m])   — wire-modification attack
+//   - rate(helixchannel_session_total{outcome="decrypt_error"}[5m]) — key/IV mismatch
+//   - rate(helixchannel_session_total{outcome="closed"}[5m])      — graceful teardown
+//
+// The canonical outcomes are not enforced as an enum; callers may
+// introduce additional values (e.g. "rate_limited", "auth_failed")
+// without re-cutting this metric, but the five above are wired into
+// the v18714-3 dashboards and runbooks and MUST NOT be renamed
+// without a coordinated dashboard PR.
+//
+// Co-emitted with the OTel span attribute
+// "helixchannel.session.outcome" (see ObserveHelixChannelSession).
+var HelixChannelSessionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "llm_cluster_router_helixchannel_session_total",
+	Help: "HelixChannel sessions by terminal outcome (success|failure|tampering|decrypt_error|closed|...). Use this for SLO dashboards; use helixchannel_connections_total for connection-level traffic.",
+}, []string{"outcome"})
+
+// ObserveHelixChannelSession increments the session counter and, if
+// a span is active in ctx, records the outcome as an OTel span event
+// plus an attribute so traces and metrics agree. The function is the
+// single chokepoint for session-level outcome emission; callers MUST
+// use this rather than touching HelixChannelSessionTotal directly
+// when a context is available so the OTel side stays in sync.
+//
+// ctx may be context.Background() in which case only the metric is
+// updated.
+func ObserveHelixChannelSession(ctx context.Context, outcome string) {
+	HelixChannelSessionTotal.WithLabelValues(outcome).Inc()
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(attribute.String("helixchannel.session.outcome", outcome))
+		span.AddEvent("helixchannel.session.outcome", trace.WithAttributes(
+			attribute.String("outcome", outcome),
+		))
+	}
+}
+
 // RegisterMetrics installs the dual-listener metrics on the
 // provided (production-isolated) registry. Call once at startup.
 func RegisterMetrics(reg *prometheus.Registry) error {
-	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal, HelixChannelConnectionsTotal, HelixChannelBytesTotal} {
+	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal, HelixChannelConnectionsTotal, HelixChannelBytesTotal, HelixChannelSessionTotal} {
 		if err := reg.Register(c); err != nil {
 			// Already-registered (e.g. by a previous test) is fine; only fail on unexpected errors.
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
@@ -273,6 +323,7 @@ func Reset() {
 	DecryptFailedTotal.Reset()
 	HelixChannelConnectionsTotal.Reset()
 	HelixChannelBytesTotal.Reset()
+	HelixChannelSessionTotal.Reset()
 }
 
 // silentIOReset discards any error from io.Closer; kept here so
