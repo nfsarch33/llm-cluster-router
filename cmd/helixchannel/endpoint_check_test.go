@@ -283,6 +283,99 @@ func TestEndpointCheck_ProbeTimeoutHonoured(t *testing.T) {
 	}
 }
 
+// TestEndpointCheck_BaseURLFlagDerivesHost asserts the v18714-11
+// precedence: when --host is omitted, the host is extracted from
+// --base-url. The probe runs against 127.0.0.1 (the loopback we
+// control); port 1 is unbound so both legs fail and the envelope's
+// `host` field reflects what the binary derived from --base-url.
+func TestEndpointCheck_BaseURLFlagDerivesHost(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "endpoint-check",
+		"--base-url", "https://127.0.0.1:9999",
+		"--tcp22-port", "1",
+		"--tcp443-port", "1",
+		"--probe-timeout", "200ms")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	_ = cmd.Run() // exit code 1 expected (port unbound); we assert envelope shape only.
+
+	var env endpointCheckEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("endpoint-check stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Host != "127.0.0.1:9999" {
+		t.Fatalf("env.host = %q, want %q (derived from --base-url)", env.Host, "127.0.0.1:9999")
+	}
+}
+
+// TestEndpointCheck_HostFlagOverridesBaseURL asserts the explicit
+// --host flag wins over --base-url. This is the operator escape
+// hatch when the canonical hostname is temporarily broken (DNS
+// outage, cert rollover, etc.) and they need to probe the raw IP.
+func TestEndpointCheck_HostFlagOverridesBaseURL(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "endpoint-check",
+		"--host", "127.0.0.1",
+		"--base-url", "https://helixchannel.cylrl.dev",
+		"--tcp22-port", "1",
+		"--tcp443-port", "1",
+		"--probe-timeout", "200ms")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	_ = cmd.Run()
+
+	var env endpointCheckEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("endpoint-check stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Host != "127.0.0.1" {
+		t.Fatalf("env.host = %q, want %q (--host should win over --base-url)", env.Host, "127.0.0.1")
+	}
+}
+
+// TestEndpointCheck_EnvBaseURLDerivesHostDefault asserts the
+// v18714-11 default-fallback path: when neither --host nor
+// --base-url is given, the binary uses HELIXCHANNEL_BASE_URL env.
+// Setting HELIXCHANNEL_BASE_URL to a sentinel host lets the test
+// observe the derivation without depending on the canonical
+// helixchannel.cylrl.dev being resolvable from CI.
+func TestEndpointCheck_EnvBaseURLDerivesHostDefault(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "endpoint-check",
+		"--tcp22-port", "1",
+		"--tcp443-port", "1",
+		"--probe-timeout", "200ms")
+	cmd.Env = append(os.Environ(),
+		"HELIXCHANNEL_BASE_URL=https://127.0.0.1:8888",
+	)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	_ = cmd.Run()
+
+	var env endpointCheckEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("endpoint-check stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Host != "127.0.0.1:8888" {
+		t.Fatalf("env.host = %q, want %q (HELIXCHANNEL_BASE_URL fallback)", env.Host, "127.0.0.1:8888")
+	}
+}
+
 // listenFreeTCP binds an ephemeral TCP listener on 127.0.0.1 and
 // returns a small handle that exposes .Port() and .Close(). The
 // caller must Close the listener.

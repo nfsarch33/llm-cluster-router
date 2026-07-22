@@ -9,16 +9,33 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 > ./helixchannel doctor   # JSON envelope: release-gate + ADR-085 + AES key + observability
 > ```
 > See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
-> `key-check`, and `header-stamp` subcommands.
+> `key-check`, `header-stamp`, and `endpoint-check` subcommands.
 
 > **Production ingress (v18714+)** — The HelixChannel production wire
 > reaches operators and pilot consumers via `TCP/443` (TLS-terminating
-> nginx → `127.0.0.1:14443` on the Lightsail instance), per
+> nginx → `127.0.0.1:14443` on the Lightsail instance `helixon-tunnel`
+> at `52.64.8.153`), per
 > [ADR-086](../cursor-global-kb/adrs/ADR-086-helixchannel-port-443-migration.md).
 > The application-layer AES-256-GCM channel is unchanged; only the
 > transport moved from SSH-22 (pilot) to TLS/443 (production pilot).
 > Canonical reverse-proxy runbook:
 > [`cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md`](../cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md).
+
+> **Public hostname (v18714-11)** — Pilots (Kilo Code, Peer, and any
+> IDE that refuses to pin an OpenAI-compatible endpoint to a raw IP)
+> target `https://helixchannel.cylrl.dev/v1`. The DNS A-record is
+> managed via DreamHost and points at the Lightsail static IP
+> `52.64.8.153`; TLS is terminated by Let's Encrypt via `certbot` on
+> the Lightsail host. See
+> [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md)
+> for the full DNS + cert + nginx runbook.
+>
+> ```bash
+> # Probes both transports and recommends the better path.
+> ./helixchannel endpoint-check
+> # uses HELIXCHANNEL_BASE_URL env > --base-url flag > default
+> # https://helixchannel.cylrl.dev to derive the host.
+> ```
 
 ## HelixChannel (encrypted dual-listener)
 
