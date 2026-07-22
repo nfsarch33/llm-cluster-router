@@ -44,6 +44,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	clihelper "github.com/nfsarch33/llm-cluster-router/internal/cli"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 )
 
@@ -511,15 +512,23 @@ type endpointCheckEnvelope struct {
 // in error messages, per no-shell-leak.mdc.
 func runEndpointCheck(args []string) error {
 	fs := flag.NewFlagSet("endpoint-check", flag.ContinueOnError)
-	host := fs.String("host", "", "target host to probe (required)")
+	host := fs.String("host", "", "target host to probe (overrides --base-url)")
+	baseURL := fs.String("base-url", "", "HelixChannel base URL; host extracted from it when --host is empty. Precedence: HELIXCHANNEL_BASE_URL env > --base-url > https://helixchannel.cylrl.dev")
 	tcp22Port := fs.String("tcp22-port", "22", "TCP/22 candidate port")
 	tcp443Port := fs.String("tcp443-port", "443", "TCP/443 candidate port")
 	probeTimeout := fs.Duration("probe-timeout", 2*time.Second, "per-port dial timeout (max 30s)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// v18714-11: derive --host from the canonical base URL when the
+	// operator omits --host. Precedence: explicit --host > --base-url >
+	// HELIXCHANNEL_BASE_URL env > default https://helixchannel.cylrl.dev.
 	if *host == "" {
-		return fmt.Errorf("--host is required")
+		resolved, err := clihelper.HostFromBaseURL(clihelper.ResolveHelixChannelBaseURL(*baseURL))
+		if err != nil {
+			return fmt.Errorf("resolve host from base URL: %w", err)
+		}
+		*host = resolved
 	}
 	if *probeTimeout <= 0 || *probeTimeout > 30*time.Second {
 		*probeTimeout = 2 * time.Second
