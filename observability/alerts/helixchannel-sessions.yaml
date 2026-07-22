@@ -1,0 +1,88 @@
+# Prometheus alerting rules for HelixChannel (v18714-3).
+#
+# Source metrics:
+#   - llm_cluster_router_helixchannel_session_total{outcome}
+#     (`outcome` ∈ {success, failure, tampering, decrypt_error, closed})
+#
+# Severity ladder:
+#   - page     → operator-paged within 5min via Resend/Slack notification
+#   - warn     → logged + dashboard annotation, no page
+#
+# These rules are loaded by the llm-cluster-router production
+# Prometheus (vLLM / wsl2 cluster, Grafana :3000). Keep the
+# `for:` clauses conservative; we are not measuring SLI SLOs in
+# this file, only alerting on outright wire-modification events and
+# channel silence.
+
+groups:
+  - name: helixchannel-sessions.v18714-3
+    interval: 30s
+    rules:
+      # SLO-18714-3.B — wire-modification attempt detected.
+      # Page on the first non-zero tamper rate sustained for 60s
+      # because every tamper frame represents an attacker (or a
+      # buggy client) probing or modifying the wire.
+      - alert: HelixChannelTamperingDetected
+        expr: sum(rate(llm_cluster_router_helixchannel_session_total{outcome="tampering"}[1m])) > 0
+        for: 1m
+        labels:
+          severity: page
+          slo: "SLO-18714-3.B"
+          channel: helixchannel
+        annotations:
+          summary: "HelixChannel tampering detected on {{ $labels.instance }}"
+          description: |
+            Rate of AES-GCM authentication tag failures is {{ $value | printf "%.3f" }}/s
+            over the last 1 minute. Each tamper increment represents an active
+            wire-modification attempt. Rotate the channel key and review
+            observability/runbook.md#helixchannel-tampering.
+
+      # SLO-18714-3.B — decrypt errors (key/IV mismatch).
+      # Page on any sustained decrypt_error because it indicates the
+      # client and server are out of sync — either the key has
+      # drifted or the transport is corrupting ciphertext.
+      - alert: HelixChannelDecryptErrors
+        expr: sum(rate(llm_cluster_router_helixchannel_session_total{outcome="decrypt_error"}[1m])) > 0
+        for: 1m
+        labels:
+          severity: page
+          slo: "SLO-18714-3.B"
+          channel: helixchannel
+        annotations:
+          summary: "HelixChannel decrypt errors on {{ $labels.instance }}"
+          description: |
+            Rate of decrypt_error sessions is {{ $value | printf "%.3f" }}/s over
+            the last 1 minute. Key/IV mismatch suspected; verify HELIXCHANNEL_KEY
+            parity between client and server.
+
+      # SLO-18714-3.A — channel is silent (no successful sessions).
+      # Page on prolonged silence because the operator deploys rely on
+      # HelixChannel carrying minimaxi.com M3 traffic; if no success
+      # for 5 minutes, the production wire is broken.
+      - alert: HelixChannelSilent
+        expr: sum(rate(llm_cluster_router_helixchannel_session_total{outcome="success"}[5m])) == 0
+        for: 5m
+        labels:
+          severity: page
+          slo: "SLO-18714-3.A"
+          channel: helixchannel
+        annotations:
+          summary: "HelixChannel silent for >5min on {{ $labels.instance }}"
+          description: |
+            No successful HelixChannel sessions for 5 minutes. Production wire
+            appears broken. Check Lightsail instance health and recent deploys;
+            consult observability/runbook.md#helixchannel-silent.
+
+      # Warn-only — failure rate spike (5xx-class). Page if sustained > 5min.
+      - alert: HelixChannelFailureRateHigh
+        expr: sum(rate(llm_cluster_router_helixchannel_session_total{outcome="failure"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warn
+          slo: "SLO-18714-3.C"
+          channel: helixchannel
+        annotations:
+          summary: "HelixChannel failure rate elevated"
+          description: |
+            Failure rate is {{ $value | printf "%.3f" }}/s over 5 minutes. Investigate
+            upstream 5xx responses (minimaxi.com / vLLM / SOCKS5 path).

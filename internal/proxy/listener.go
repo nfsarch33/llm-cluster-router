@@ -153,6 +153,14 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 // observed deltas. Production wiring should refactor to a
 // per-event channel; for the v18710-4 demo the polling cadence is
 // acceptable.
+//
+// v18714-3: each observed tamper delta ALSO increments the
+// per-session HelixChannel counter with outcome="tampering", and
+// the first observed tamper on a fresh connection also records
+// outcome="decrypt_error" because the AES-GCM authentication tag
+// failed BEFORE the request even reached the HTTP layer (so the
+// HTTP path will not record it). Without this branch the session
+// counter would under-report the very events the runbook alerts on.
 func startTamperForwarder(wc *crypto.WrapConn) {
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
@@ -164,6 +172,13 @@ func startTamperForwarder(wc *crypto.WrapConn) {
 				now := wc.TamperCount()
 				if now > last {
 					observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
+					// Per-session counter: one increment per
+					// tamper delta so the rate() query is
+					// meaningful even when one connection
+					// accumulates many tampered frames.
+					for i := uint64(0); i < now-last; i++ {
+						observability.HelixChannelSessionTotal.WithLabelValues("tampering").Inc()
+					}
 					last = now
 				}
 			}

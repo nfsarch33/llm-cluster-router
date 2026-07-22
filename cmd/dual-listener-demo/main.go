@@ -299,6 +299,16 @@ func instrumentHTTPHandler(listener string, next http.Handler) http.Handler {
 		observability.BytesTotal.WithLabelValues(listener, "out").Add(float64(ww.bytes))
 		observability.RequestDuration.WithLabelValues(listener, r.Method).Observe(dur.Seconds())
 
+		// v18714-3: HelixChannel session counter — emit ONLY for
+		// the AES/mTLS listener (the brand-named "helixchannel"
+		// channel). Other listeners keep their connection-level
+		// metric; only this one tracks per-session outcome so
+		// tampering / decrypt_error / success can be alerted on
+		// without false positives from the SOCKS5 loopback tests.
+		if listener == "helixchannel" || listener == "aes-mtls" {
+			observability.ObserveHelixChannelSession(ctx, sessionOutcomeFromStatus(ww.status))
+		}
+
 		// Agentrace: one event per accept.
 		if app := getAgentrace(); app != nil {
 			_ = app.Append(observability.AgentraceEvent{
@@ -355,6 +365,31 @@ func outcomeLabel(status int) string {
 		// 3xx (redirect) and 4xx (client error) collapse into
 		// "closed" — neither is a server fault, but they're
 		// not "ok" either.
+		return "closed"
+	}
+}
+
+// sessionOutcomeFromStatus maps an HTTP status code to the v18714-3
+// HelixChannel session-outcome label. The mapping is coarser than
+// outcomeLabel because session outcome is a SLO signal — we want
+// "success" / "failure" / "closed" buckets, not "ok" / "error"
+// which are operationally confusing. The "tampering" and
+// "decrypt_error" outcomes are NOT produced by the HTTP path
+// directly; they are emitted by the wire-level forwarder in
+// internal/proxy/listener.go (startTamperForwarder) when the AES-GCM
+// authentication tag fails. They appear here as a defensive default
+// to keep dashboards happy if the wire-forwarder is bypassed in a
+// future refactor.
+func sessionOutcomeFromStatus(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "success"
+	case status >= 500:
+		return "failure"
+	default:
+		// 1xx, 3xx, 4xx — the request reached us, we did not
+		// crash, but it did not complete a normal success cycle.
+		// "closed" is the canonical graceful teardown bucket.
 		return "closed"
 	}
 }
