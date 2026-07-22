@@ -37,6 +37,40 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 > # https://helixchannel.cylrl.dev to derive the host.
 > ```
 
+### Per-tenant channel preference (v18714-7)
+
+Both encrypted channels are simultaneously live and operators / clients
+choose which one to dial. The default for new tenants is the AES-256-GCM
+channel on `helixchannel.cylrl.dev:443` (more secure); the SSH-22
+SOCKS5 channel on `helixon-tunnel:22` is the fallback when AES/mTLS
+fails or when a consumer (e.g. the Kilo Code pilot, CI runners) prefers
+the lower-friction SSH path.
+
+| Preference | Behaviour |
+|---|---|
+| `--channel prefer-aes-mtls` (default) | Try AES-256-GCM first; fall back to SOCKS5 on transport failure. |
+| `--channel prefer-socks5` | Try SSH-22 SOCKS5 first; fall back to AES-256-GCM on transport failure. |
+| `--channel aes-mtls` | Force AES-256-GCM. Hard fail if unreachable. |
+| `--channel socks5` | Force SOCKS5. Hard fail if unreachable. |
+| `--channel auto` | Probe both, pick the faster path per session. |
+
+Equivalent env var: `LLMROUTER_CHANNEL_PREFERENCE` (one of
+`prefer-aes-mtls|prefer-socks5|aes-mtls|socks5|auto`). The default
+when unset is `prefer-aes-mtls`.
+
+The canonical observability signal is
+`helixchannel_session_total{channel="...",outcome="..."}` (per
+v18714-3), and the Grafana dashboard
+`observability/grafana/helixchannel-sessions-dashboard.json`
+visualises the channel mix. Per-tenant routing decisions are
+recorded under the `channel` label so operators can audit which
+tenants lean on which transport.
+
+Decision rationale (full Bayesian analysis): see
+[`cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md`](../cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md)
+(posterior P(both, configurable per-tenant) = 0.86; second-place
+SOCKS5-only at 0.09; acceptance threshold 0.70).
+
 ## HelixChannel (encrypted dual-listener)
 
 HelixChannel is the operator-facing name for the AES-256-GCM
