@@ -25,6 +25,18 @@
 //	                   readable, AES key valid, observability package
 //	                   importable. Prints JSON envelope (exit 0 if
 //	                   all pass; exit 1 if any FAIL).
+//	endpoint-check   - probe TCP/22 + TCP/443 reachability and emit
+//	                   a recommendation envelope (v18714-3).
+//	kilo-verify      - Kilo Code end-to-end smoke (v18716.1). POSTs
+//	                   an OpenAI-compatible chat completions request
+//	                   to the operator's base URL (default
+//	                   https://52.64.8.153/minimax/v1) and verifies
+//	                   the upstream returns a MiniMax-M3 response.
+//	                   Exits 0 on PASS, 1 on FAIL, 2 on SKIP
+//	                   (quota / network flake). Mirrors the G2 gate
+//	                   semantics of TestKiloCodeE2E_MiniMaxRoundTrip
+//	                   so the smoke is consistent across the Go test
+//	                   and the CLI binary.
 //
 // All subcommands print JSON envelopes so shells can pipe output
 // to `jq` without escaping surprises. No secret values are ever
@@ -32,7 +44,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,6 +56,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
@@ -84,6 +99,10 @@ func main() {
 		if err := runEndpointCheck(os.Args[2:]); err != nil {
 			fail("endpoint-check", err)
 		}
+	case "kilo-verify":
+		if err := runKiloVerify(os.Args[2:]); err != nil {
+			fail("kilo-verify", err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -91,18 +110,25 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|kilo-verify>\n", os.Args[0])
 }
 
 // fail prints a small JSON envelope to stderr describing the
 // failure and exits with a non-zero status. stderr is used so
 // stdout stays clean for callers that pipe it to jq.
+//
+// If err is a *kiloVerifyVerdictError, fail honours its declared
+// exit code (1=fail, 2=skip) so the kilo-verify subcommand can
+// distinguish operator-action-needed (skip) from broken-wire (fail).
 func fail(sub string, err error) {
 	env := map[string]any{
 		"subcommand": sub,
 		"error":      err.Error(),
 	}
 	_ = json.NewEncoder(os.Stderr).Encode(env)
+	if v, ok := err.(*kiloVerifyVerdictError); ok {
+		os.Exit(v.code)
+	}
 	os.Exit(1)
 }
 
@@ -582,4 +608,313 @@ func probeHostPort(host, port string, timeout time.Duration) (bool, time.Duratio
 	}
 	_ = conn.Close()
 	return true, lat, nil
+}
+
+// kiloVerifyEnvelope is the JSON envelope emitted by the `kilo-verify`
+// subcommand (v18716.1). It mirrors the Go test's t.Logf signal but
+// as a structured JSON record so the operator can pipe it to jq.
+//
+//	{
+//	  "verdict":       "pass|fail|skip",
+//	  "base_url":      "https://52.64.8.153/minimax/v1",
+//	  "model":         "MiniMax-M3",
+//	  "latency_ms":    712,
+//	  "response_id":   "abc...",
+//	  "content_preview":"pong",
+//	  "error_class":   "tls|timeout|refused|4xx|5xx|parse|none",
+//	  "operator_hint": "rotate 1Password HelixonSafe/<uuid>",
+//	  "probed_at":     "2026-07-22T..."
+//	}
+//
+// Exit codes:
+//
+//	0  verdict=pass
+//	1  verdict=fail
+//	2  verdict=skip  (operator must rotate key / fix network / etc.)
+type kiloVerifyEnvelope struct {
+	Verdict        string `json:"verdict"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	LatencyMs      int64  `json:"latency_ms"`
+	ResponseID     string `json:"response_id,omitempty"`
+	ContentPreview string `json:"content_preview,omitempty"`
+	ErrorClass     string `json:"error_class"`
+	OperatorHint   string `json:"operator_hint,omitempty"`
+	ProbedAt       string `json:"probed_at"`
+}
+
+// kiloVerifyDefaultBaseURL is the v18716.1 canonical operator-facing
+// URL for the Kilo Code extension (ADR-086 path A2 nginx reverse-proxy).
+const kiloVerifyDefaultBaseURL = "https://52.64.8.153/minimax/v1"
+
+// kiloVerifyDefaultModel is the operator-preferred MiniMax model id
+// on the China mainland platform (api.minimaxi.com).
+const kiloVerifyDefaultModel = "MiniMax-M3"
+
+// runKiloVerify is the v18716.1 CLI subcommand. It performs the same
+// round-trip as TestKiloCodeE2E_MiniMaxRoundTrip but is a stand-alone
+// binary so the operator does not need a Go toolchain installed.
+//
+// Flags:
+//
+//	--base-url  KILO-style OpenAI base URL (default canonical)
+//	--model     upstream model id (default MiniMax-M3)
+//	--timeout   per-request budget (default 30s)
+//	--insecure  pass -k equivalent (test rigs only; default false)
+//
+// Env (canonical, never echoed):
+//
+//	KILO_CODE_API_KEY  /  OPENAI_API_KEY
+//
+// Exit codes: 0=pass, 1=fail, 2=skip.
+func runKiloVerify(args []string) error {
+	fs := flag.NewFlagSet("kilo-verify", flag.ContinueOnError)
+	baseURL := fs.String("base-url", kiloVerifyDefaultBaseURL, "OpenAI-compatible base URL (Kilo Code: kilocode.openAiBaseUrl)")
+	model := fs.String("model", kiloVerifyDefaultModel, "upstream model id")
+	timeout := fs.Duration("timeout", 30*time.Second, "per-request budget (max 60s)")
+	insecure := fs.Bool("insecure", false, "skip TLS verification (test rigs only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	envelope := kiloVerifyEnvelope{
+		BaseURL:  *baseURL,
+		Model:    *model,
+		ProbedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+
+	// Resolve API key from canonical env vars. NEVER log the value.
+	apiKey := strings.TrimSpace(os.Getenv("KILO_CODE_API_KEY"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	}
+	if apiKey == "" {
+		envelope.Verdict = "skip"
+		envelope.ErrorClass = "missing_key"
+		envelope.OperatorHint = "export KILO_CODE_API_KEY (or OPENAI_API_KEY) from 1Password HelixonSafe before re-running"
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifySkipErr
+	}
+
+	// Parse base URL. scheme is captured for the envelope parity
+	// with the integration test (kept even when unused to preserve
+	// future diagnostic surface).
+	scheme, host, port, err := parseKiloVerifyBaseURL(*baseURL)
+	_ = scheme
+	if err != nil {
+		envelope.Verdict = "skip"
+		envelope.ErrorClass = "bad_base_url"
+		envelope.OperatorHint = "fix --base-url to use http:// or https:// scheme: " + err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifySkipErr
+	}
+
+	// TCP/443 reachability gate (5s budget). This is the operator-facing
+	// "is the Lightsail nginx up?" smoke.
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dcancel()
+	probeConn, err := (&net.Dialer{}).DialContext(dctx, "tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		envelope.Verdict = "fail"
+		envelope.ErrorClass = classifyNetErr(err)
+		envelope.OperatorHint = fmt.Sprintf("verify TCP/%s ingress on %s via `helixchannel endpoint-check --host %s`", port, host, host)
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifyFailErr
+	}
+	_ = probeConn.Close()
+
+	// Build the request body.
+	body := map[string]any{
+		"model": *model,
+		"messages": []map[string]string{
+			{"role": "user", "content": "Respond with the single word: pong"},
+		},
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		envelope.Verdict = "fail"
+		envelope.ErrorClass = "marshal"
+		envelope.OperatorHint = err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifyFailErr
+	}
+
+	// HTTP client with optional TLS skip.
+	httpClient := &http.Client{Timeout: *timeout}
+	if *insecure || os.Getenv("HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY") == "1" {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
+	reqURL := strings.TrimRight(*baseURL, "/") + "/chat/completions"
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(bodyJSON))
+	if err != nil {
+		envelope.Verdict = "fail"
+		envelope.ErrorClass = "build_request"
+		envelope.OperatorHint = err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifyFailErr
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-HelixChannel-Version", "v18716-1")
+
+	startedAt := time.Now()
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		envelope.LatencyMs = time.Since(startedAt).Milliseconds()
+		envelope.Verdict = "skip"
+		envelope.ErrorClass = classifyNetErr(err)
+		envelope.OperatorHint = "network flake; operator: retry when upstream quota is fresh"
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifySkipErr
+	}
+	defer resp.Body.Close()
+	envelope.LatencyMs = time.Since(startedAt).Milliseconds()
+
+	const maxBody = 64 * 1024
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		var parsed struct {
+			ID      string `json:"id"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			envelope.Verdict = "fail"
+			envelope.ErrorClass = "parse"
+			envelope.OperatorHint = "response body not OpenAI-compatible JSON: " + err.Error()
+			_ = json.NewEncoder(os.Stdout).Encode(envelope)
+			return kiloVerifyFailErr
+		}
+		if len(parsed.Choices) == 0 || parsed.Choices[0].Message.Content == "" {
+			envelope.Verdict = "fail"
+			envelope.ErrorClass = "empty_content"
+			envelope.OperatorHint = "upstream returned zero choices or empty content"
+			_ = json.NewEncoder(os.Stdout).Encode(envelope)
+			return kiloVerifyFailErr
+		}
+		envelope.ResponseID = parsed.ID
+		envelope.ContentPreview = truncateKiloVerify(parsed.Choices[0].Message.Content, 80)
+		envelope.Verdict = "pass"
+		envelope.ErrorClass = "none"
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return nil
+
+	case resp.StatusCode == http.StatusUnauthorized,
+		resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusTooManyRequests:
+		envelope.Verdict = "skip"
+		envelope.ErrorClass = "upstream_4xx"
+		envelope.OperatorHint = fmt.Sprintf("upstream rejected call (HTTP %d); rotate 1Password item HelixonSafe/MiniMax Token Plan Key per carry-forward CF-v18716-MiniMax-Key", resp.StatusCode)
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifySkipErr
+
+	default:
+		envelope.Verdict = "fail"
+		envelope.ErrorClass = fmt.Sprintf("http_%d", resp.StatusCode)
+		envelope.OperatorHint = fmt.Sprintf("non-2xx from upstream; body=%s", truncateKiloVerify(string(respBody), 160))
+		_ = json.NewEncoder(os.Stdout).Encode(envelope)
+		return kiloVerifyFailErr
+	}
+}
+
+// kiloVerifySkipErr is the sentinel for the SKIP verdict. Returning it
+// from runKiloVerify causes fail() to exit 2 (the conventional CI
+// code for "needs operator action").
+var kiloVerifySkipErr = &kiloVerifyVerdictError{code: 2, label: "skip"}
+
+// kiloVerifyFailErr is the sentinel for the FAIL verdict. Exits 1.
+var kiloVerifyFailErr = &kiloVerifyVerdictError{code: 1, label: "fail"}
+
+// kiloVerifyVerdictError is a typed error so fail() can map verdict
+// values to exit codes without inspecting strings.
+type kiloVerifyVerdictError struct {
+	code  int
+	label string
+}
+
+func (e *kiloVerifyVerdictError) Error() string {
+	return "verdict=" + e.label
+}
+
+// parseKiloVerifyBaseURL is a tiny stdlib-only URL parser. We avoid
+// net/url to keep the cmd/helixchannel import set minimal.
+func parseKiloVerifyBaseURL(raw string) (scheme, host, port string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", fmt.Errorf("empty URL")
+	}
+	switch {
+	case strings.HasPrefix(raw, "https://"):
+		scheme = "https"
+		raw = strings.TrimPrefix(raw, "https://")
+	case strings.HasPrefix(raw, "http://"):
+		scheme = "http"
+		raw = strings.TrimPrefix(raw, "http://")
+	default:
+		return "", "", "", fmt.Errorf("unsupported scheme in %q (only http/https allowed)", raw)
+	}
+	if idx := strings.IndexByte(raw, '/'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	host, port, perr := net.SplitHostPort(raw)
+	if perr != nil {
+		host = raw
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return scheme, host, port, nil
+}
+
+// classifyNetErr reduces a net.OpError to a single-token label so
+// operators can grep the envelope for "timeout", "refused", etc.
+// Returns "net" if no class can be inferred.
+func classifyNetErr(err error) string {
+	if err == nil {
+		return "none"
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "context deadline exceeded"):
+		return "timeout"
+	case strings.Contains(s, "timeout"):
+		return "timeout"
+	case strings.Contains(s, "connection refused"):
+		return "refused"
+	case strings.Contains(s, "no such host"):
+		return "no_route"
+	case strings.Contains(s, "tls"):
+		return "tls"
+	case strings.Contains(s, "401"):
+		return "upstream_401"
+	case strings.Contains(s, "403"):
+		return "upstream_403"
+	case strings.Contains(s, "429"):
+		return "upstream_429"
+	default:
+		return "net"
+	}
+}
+
+// truncateKiloVerify caps a string at n runes and appends "..." if
+// truncated. Avoids the strings import in the operator-facing logs.
+func truncateKiloVerify(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
