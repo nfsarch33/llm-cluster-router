@@ -1,0 +1,146 @@
+{
+  "title": "HelixChannel Overview",
+  "uid": "helixchannel-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "15s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "listener",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(llm_cluster_router_connections_total, listener)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "HelixChannel tamper events",
+        "datasource": "Prometheus",
+        "enable": true,
+        "expr": "increase(llm_cluster_router_decrypt_failed_total{listener=~\"$listener\"}[1m]) > 0"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Connections total per listener",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 10}
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (listener, outcome) (rate(llm_cluster_router_connections_total{listener=~\"$listener\"}[1m]))",
+          "legendFormat": "{{listener}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Decrypt failed (AES-GCM tamper) per listener",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 20, "color": {"mode": "fixed", "fixedColor": "red"}}
+        },
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {"color": "green", "value": null},
+            {"color": "orange", "value": 1},
+            {"color": "red", "value": 5}
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (listener) (rate(llm_cluster_router_decrypt_failed_total{listener=~\"$listener\"}[1m]))",
+          "legendFormat": "{{listener}} tamper"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency p50 / p95 / p99",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5}
+        }
+      },
+      "targets": [
+        {
+          "refId": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le, listener) (rate(llm_cluster_router_request_duration_seconds_bucket{listener=~\"$listener\"}[5m])))",
+          "legendFormat": "p50 {{listener}}"
+        },
+        {
+          "refId": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le, listener) (rate(llm_cluster_router_request_duration_seconds_bucket{listener=~\"$listener\"}[5m])))",
+          "legendFormat": "p95 {{listener}}"
+        },
+        {
+          "refId": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le, listener) (rate(llm_cluster_router_request_duration_seconds_bucket{listener=~\"$listener\"}[5m])))",
+          "legendFormat": "p99 {{listener}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Active sessions (HelixChannel alias)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(llm_cluster_router_helixchannel_connections_total)",
+          "legendFormat": "helixchannel conns"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(llm_cluster_router_helixchannel_bytes_total)",
+          "legendFormat": "helixchannel bytes",
+          "hide": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,120 @@
+# OpenTelemetry collector config for the HelixChannel dual-listener
+# (v18716.5, additive on top of the v18709 OTel surface).
+#
+# Scope: forward OTLP gRPC traces + Prometheus scrape from
+# llm-cluster-router to a downstream collector (when present). The
+# pattern follows v18709's NOOP-when-collector-absent contract: the
+# llm-cluster-router init code already no-ops
+# observability.InitTracer when OTEL_EXPORTER_OTLP_ENDPOINT is
+# empty, so this file is the *deployment* companion for production
+# wiring (Lightsail, win1-wsl1 once restored).
+#
+# Receivers:
+#   - otlp: standard OTLP gRPC on :4317 + HTTP on :4318 for
+#     llm-cluster-router spans
+#   - prometheus: scrape the demo's /metrics endpoint on
+#     127.0.0.1:18090 (matches dual-listener-demo default)
+#
+# Processors:
+#   - batch: standard batch processor, 1s timeout / 8192 batch
+#     size. Bounded so a stale span dump does not blow memory on
+#     Lightsail (1 GB free headroom per ADR-083).
+#   - memory_limiter: 128 MiB hard cap; protects the collector
+#     from OOM if the upstream rate spikes.
+#   - attributes/helixchannel: enrich every span with the
+#     "service.name=helixchannel" + "deployment.environment"
+#     attributes when present.
+#
+# Exporters:
+#   - prometheus: expose the merged series on :8889 for downstream
+#     Prometheus scrape (matches the v18709 /metrics contract
+#     described in observability.go §RegisterMetrics).
+#   - file: rotated 100 MiB debug exporter to /var/log/otel/collector.jsonl
+#     for post-incident forensics. NOOP-equivalent on wsl3 where the
+#     /var/log path is read-only; the collector simply fails to open
+#     the file and continues.
+#
+# Extensions / connectors:
+#   - health_check on :13133 for fleet-doctor probes
+#   - pprof on :1777 for development debugging
+#
+# Wired when OTEL collector container is provisioned (CF-v18709b-6.B
+# open carry to v18716+; same blocker for Grafana, CF-v18714b-6.B).
+# Until then, the binary's own InitTracer is hermetic and the
+# collector config is a deployment-time artefact, not a runtime
+# dependency.
+#
+# Owner: cursor-parent@win3-wsl3 (v18716.5).
+# Machine-Id: win3-wsl3.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: helixchannel-demo
+          scrape_interval: 15s
+          static_configs:
+            - targets: [127.0.0.1:18090]
+              labels:
+                channel: helixchannel
+                environment: dev
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    timeout: 1s
+    send_batch_size: 8192
+  attributes/helixchannel:
+    actions:
+      - key: service.name
+        value: helixchannel
+        action: upsert
+      - key: deployment.environment
+        from_attribute: env
+        action: insert
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    const_labels:
+      exporter: helixchannel-otel-collector
+    resource_to_telemetry_conversion:
+      enabled: true
+  file:
+    path: /var/log/otel/collector.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 5
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [health_check, pprof]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/helixchannel, batch]
+      exporters: [file]
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888

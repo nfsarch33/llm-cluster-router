@@ -1,0 +1,42 @@
+# Quadlet unit: helixchannel-tunneld-qwen.container (v18716.6)
+#
+# Operates the HelixChannel tunneld paired with the operator's
+# Aliyun DashScope Qwen Token Plan subscription (token-plan
+# endpoint). Shares the same image and config shape as the
+# minimax sibling; only the config path + keyring differ.
+#
+# Image: helixon/tools-helixchannel:v0.2.0
+#
+# Why a sibling unit (vs reusing the minimax one):
+#   - The two providers live behind distinct secrets (1Password
+#     items `Aliyun Team Qwen Token Plan Key` and
+#     `minimax-api-1`); isolating them in separate Quadlet units
+#     keeps the keyring 0600 boundary scoped per-provider.
+#   - Health probes fail independently, so a Qwen outage does not
+#     restart the minimax tunnel and vice versa.
+
+[Unit]
+Description=HelixChannel tunneld (qwen Token Plan provider)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=helixon/tools-helixchannel:v0.2.0
+ContainerName=helixchannel-tunneld-qwen
+Volume=%h/config/helixchannel/router.qwen.live.yml:/etc/helixchannel/router.yml:ro,Z
+Volume=%h/.local/share/helixchannel/keys/qwen.json:/etc/helixchannel/keys.json:ro,Z
+Volume=%h/logs/helixchannel/tunneld-qwen:/var/log/helixchannel:Z
+Network=host
+Restart=always
+RestartSec=10
+MemoryMax=2G
+CPUQuota=200%
+Environment=LOG_LEVEL=info
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=
+Environment=AGENTRACE_BRIDGE_PATH=%h/logs/helixchannel/agentrace-tunneld-qwen.ndjson
+
+[Service]
+RestartSec=10
+
+[Install]
+WantedBy=default.target

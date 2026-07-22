@@ -1,0 +1,55 @@
+# Quadlet unit: helixchannel-nginx.container (v18716.6)
+#
+# Lightsail-side reverse-proxy that terminates TLS on :443 and
+# forwards Kilo Code / VS Code requests into the local HelixChannel
+# tunneld over the AES-256-GCM application-layer envelope
+# (ADR-085).
+#
+# This is the on-instance counterpart to the two tunneld units
+# above. It runs nginx in front of the daemon so Kilo Code can
+# speak plain OpenAI-compatible HTTPS without touching the
+# encryption layer.
+#
+# Why nginx in a Quadlet (not a host-installed nginx):
+#   - The image is reproducible from this repo; `podman pull`
+#     gives the operator a known-good nginx configuration
+#     (`nginx.conf` + `site-confs/helixchannel.conf` baked into
+#     the image at the path below).
+#   - Restart on failure is automatic (Quadlet default).
+#   - Logs land in the per-unit bind mount, which Quadlet scopes
+#     to the operator user.
+
+[Unit]
+Description=HelixChannel nginx reverse-proxy (Lightsail :443)
+After=network-online.target helixchannel-tunneld-minimax.service helixchannel-tunneld-qwen.service
+Wants=network-online.target
+
+[Container]
+Image=helixon/tools-helixchannel:v0.2.0
+ContainerName=helixchannel-nginx
+# Run the bundled nginx binary in the foreground; the in-image
+# CMD is overridden here so the daemon does not boot inside the
+# same container as nginx.
+ExecStart=/usr/sbin/nginx -g 'daemon off;'
+# Bundled nginx config + site config (see Containerfile.helixchannel
+# for where these get copied from this repo at build time).
+Volume=%h/config/helixchannel/nginx.conf:/etc/nginx/nginx.conf:ro,Z
+Volume=%h/config/helixchannel/site-confs:/etc/nginx/conf.d:ro,Z
+# TLS material (certbot output): ro.
+Volume=/etc/letsencrypt:/etc/letsencrypt:ro
+# Per-unit logs.
+Volume=%h/logs/helixchannel/nginx:/var/log/nginx:Z
+# Host network: bind :443 directly so LetsEncrypt http-01 + the
+# Kilo Code HTTPS path both work without extra port mapping.
+Network=host
+Restart=always
+RestartSec=10
+MemoryMax=512M
+CPUQuota=100%
+Environment=NGINX_WORKERS=auto
+
+[Service]
+RestartSec=10
+
+[Install]
+WantedBy=default.target

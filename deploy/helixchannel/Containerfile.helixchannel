@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1.7
+#
+# Containerfile for the HelixChannel runtime image (v18716.6).
+# Source: github.com/nfsarch33/llm-cluster-router
+#
+# Scope: builds THREE binaries from this repo into a single
+# runtime image:
+#   1. /usr/local/bin/llm-cluster-router    -- production daemon
+#      (cmd at repo root; v14888 base)
+#   2. /usr/local/bin/helixchannel          -- operator CLI
+#      (cmd/helixchannel; hardened in v18716.3)
+#   3. /usr/local/bin/dual-listener-demo    -- observability smoke
+#      (cmd/dual-listener-demo; v18709 observability + v18716.5 bridge)
+#
+# Base: debian:bookworm-slim + tini (matches Containerfile.debian-slim
+# pattern; avoids distroless for the nginx sidecar and curl probe
+# convenience).
+#
+# Multi-stage build: builder stage uses Go 1.26-bookworm; runtime
+# stage is non-root with uid 1000 (helixon user) and exposes the
+# same ports the operator-facing router.yml expects (8080, 9091,
+# 6060) plus 18090 (dual-listener-demo metrics) and 11080/18080
+# (socks5/aes-mtls smoke).
+#
+# Labels (OCI): title/description/source/version/licenses +
+# helixon.security.distroless-free=true + sprint stamp.
+
+#####################
+# Stage 1: Go builder
+#####################
+FROM docker.io/library/golang:1.26-bookworm AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    go mod download
+COPY . .
+
+ARG VERSION=dev
+
+# Build all three binaries with cache mounts. CGO disabled so the
+# resulting artefacts run on any libc (or none, in distroless-lite
+# scenarios) without surprises.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    CGO_ENABLED=0 \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+        -o /out/llm-cluster-router .; \
+    CGO_ENABLED=0 \
+    go build -trimpath -ldflags="-s -w" \
+        -o /out/helixchannel       ./cmd/helixchannel; \
+    CGO_ENABLED=0 \
+    go build -trimpath -ldflags="-s -w" \
+        -o /out/dual-listener-demo ./cmd/dual-listener-demo
+
+#####################
+# Stage 2: Runtime
+#####################
+FROM docker.io/library/debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="helixchannel" \
+      org.opencontainers.image.description="HelixChannel runtime: router daemon + operator CLI + dual-listener-demo" \
+      org.opencontainers.image.source="https://github.com/nfsarch33/llm-cluster-router" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      helixon.security.distroless-free=true \
+      io.helixon.sprint="v18716" \
+      io.helixon.service="helixchannel"
+
+# Runtime deps:
+#   - ca-certificates: outbound TLS to upstream LLM endpoints.
+#   - tini: PID 1 signal handling (distroless decommission arc).
+#   - tzdata: timezone tables for rfc3339 timestamps.
+#   - curl: included for `--endpoint-check` and Quadlet readiness
+#     probes (the Quadlet unit pulls /healthz via curl rather than
+#     requiring an additional probe binary).
+#   - nginx: sidecar variant for the Lightsail reverse-proxy stack
+#     documented in docs/kilo-code-setup.md. Not strictly required
+#     for the daemon image but keeps a single image capable of the
+#     most common Lightsail deploy shape.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        tini \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+# Non-root helixon user (uid 1000 matches other Helixon fleet services).
+RUN groupadd --system --gid 1000 helixon \
+    && useradd  --system --uid 1000 --gid helixon --create-home helixon \
+    && mkdir -p /etc/helixchannel /var/log/helixchannel \
+    && chown -R helixon:helixon /var/log/helixchannel
+
+# Daemon + CLI + smoke binary land in /usr/local/bin.
+COPY --from=builder /out/llm-cluster-router    /usr/local/bin/llm-cluster-router
+COPY --from=builder /out/helixchannel          /usr/local/bin/helixchannel
+COPY --from=builder /out/dual-listener-demo    /usr/local/bin/dual-listener-demo
+
+USER helixon:helixon
+
+# Daemon listeners (per upstream main.go):
+EXPOSE 8080 9091 6060
+# Dual-listener-demo smoke ports (v18709 / v18716.5):
+EXPOSE 11080 18080 18090
+
+# Config mount: -v /path/to/router.yml:/etc/helixchannel/router.yml:ro
+VOLUME ["/etc/helixchannel"]
+
+# Healthcheck: hit the daemon /healthz endpoint. Quadlet units
+# override this with their own exec probe when needed; the in-image
+# default is a soft hint that the binary launched and the port is
+# open. Disables itself in the rare case the operator runs with a
+# custom config that does not expose :8080.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Default to daemon; Quadlet units and operator scripts override
+# the CMD via `podman run ... <subcommand>` for the CLI / smoke.
+CMD ["/usr/local/bin/llm-cluster-router", \
+     "-config",  "/etc/helixchannel/router.yml"]

@@ -1,0 +1,59 @@
+# Quadlet unit: helixchannel-tunneld-minimax.container (v18716.6)
+#
+# Operates the HelixChannel tunneld paired with the operator's
+# MiniMax TokenPlanMax subscription (api.minimaxi.com).
+# Bind-mounts the operator-owned router config + the per-tunnel
+# AES keyring; secrets are pulled via op inject at deploy time
+# (see README.md) so no plaintext key lands in the unit file.
+#
+# Image: helixon/tools-helixchannel:v0.2.0 (built via
+# Containerfile.helixchannel at this directory).
+#
+# Why Quadlet and not docker-compose / helm:
+#   - Per `cursor-config/rules/00-p0-podman-only.mdc` podman is the
+#     fleet container runtime.
+#   - Quadlet is systemd-managed; Restart=on-failure is built in.
+#   - The unit file is plain text, reviewable, and shares the
+#     `~/.config/containers/systemd/` peer surface the rest of
+#     the fleet uses.
+
+[Unit]
+Description=HelixChannel tunneld (minimax TokenPlanMax provider)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=helixon/tools-helixchannel:v0.2.0
+ContainerName=helixchannel-tunneld-minimax
+# Default CMD is the daemon. Tunneld mode is selected via the
+# router config file (see Volume= mount below).
+ExecStart=
+# Operator-owned config: rw (router reloads write back state).
+Volume=%h/config/helixchannel/router.minimax.live.yml:/etc/helixchannel/router.yml:ro,Z
+# Keyring: ro; populated by op inject at deploy time.
+Volume=%h/.local/share/helixchannel/keys/minimax.json:/etc/helixchannel/keys.json:ro,Z
+# Logs: rw so the daemon can append.
+Volume=%h/logs/helixchannel/tunneld-minimax:/var/log/helixchannel:Z
+# Network: join the helixchannel compose network if present;
+# otherwise the daemon binds to host network for the reverse-proxy
+# path documented in docs/kilo-code-setup.md.
+Network=host
+# Restart policy: Quadlet emits Restart=always by default;
+# RestartSec keeps the backoff sane.
+Restart=always
+RestartSec=10
+# Resource caps (operator-tunable; defaults are conservative).
+MemoryMax=2G
+CPUQuota=200%
+# Environment: log level, OTel exporter, agentrace bridge path.
+Environment=LOG_LEVEL=info
+Environment=OTEL_EXPORTER_OTLP_ENDPOINT=
+Environment=AGENTRACE_BRIDGE_PATH=%h/logs/helixchannel/agentrace-tunneld-minimax.ndjson
+
+[Service]
+# RestartSec duplicates the Quadlet Restart field but ensures
+# the systemd-level restart loop honours the same backoff.
+RestartSec=10
+
+[Install]
+WantedBy=default.target
