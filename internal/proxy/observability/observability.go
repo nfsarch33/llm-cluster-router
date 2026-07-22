@@ -94,6 +94,25 @@ func (a *AgentraceAppender) Append(event AgentraceEvent, key string) error {
 	return err
 }
 
+// appendRaw writes a pre-serialised JSON line (one byte slice per
+// call) directly to the underlying file. It is used by the
+// AgentraceBridge (v18716.5) to compose richer payload shapes
+// (channel tag, custom fields) that the typed AgentraceEvent
+// struct cannot represent without an API break. Singleflight
+// dedupe is intentionally NOT applied here — bridge callers want
+// every line to land, not be collapsed under a shared key.
+func (a *AgentraceAppender) appendRaw(line []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.f == nil {
+		return fmt.Errorf("agentrace: appender closed")
+	}
+	if _, err := a.f.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Close flushes and closes the underlying file. Idempotent.
 func (a *AgentraceAppender) Close() error {
 	a.closeOnce.Do(func() {

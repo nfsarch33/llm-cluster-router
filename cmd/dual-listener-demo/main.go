@@ -253,6 +253,35 @@ func runDualListenerDemo(ctx context.Context, aesAddr, socksAddr, mockBody strin
 		}
 	}()
 
+	// v18716.5: HelixChannel Agentrace bridge — emits channel-tagged
+	// events (tamper, engram doctor) to the operator's persistent
+	// log alongside the v18709 demo Agentrace stream. Nil-tolerant:
+	// if NewAgentraceBridge fails (e.g. AGENTRACE_BRIDGE_PATH points
+	// at an unwritable directory), we continue without the bridge so
+	// the demo never blocks on observability wiring.
+	bridgeLogPath := os.Getenv("AGENTRACE_BRIDGE_PATH")
+	bridge, err := observability.NewAgentraceBridge(bridgeLogPath)
+	if err != nil {
+		log.Printf("dual-listener-demo: agentrace bridge open (continuing without): %v", err)
+		bridge = nil
+	}
+	// v18716.5: EngramIngester periodically emits engram.doctor
+	// events to the bridge. Wired here with a static probe (status
+	// "ok", queue depth 0) for the demo; production wiring would
+	// inject a live probe. Stop() is deferred so the goroutine
+	// drains before the demo exits.
+	ingester := observability.NewEngramIngester(bridge, observability.EngramProbe{
+		Status:             "ok",
+		EmbedderQueueDepth: 0,
+		EmbedderBackend:    "engram.local",
+		LatencyMs:          0,
+	})
+	stopEngram := ingester.Start(30 * time.Second)
+	defer stopEngram()
+	if bridge != nil {
+		defer func() { _ = bridge.Close() }()
+	}
+
 	// Wait for ctx cancellation; on cancel, shut down all servers.
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
