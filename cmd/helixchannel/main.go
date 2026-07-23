@@ -521,16 +521,28 @@ var _ = net.Listen
 //	"tcp22"   - TCP/22 reachable, TCP/443 not reachable
 //	"tcp443"  - TCP/443 reachable (regardless of TCP/22 state)
 //	"none"    - neither reachable
+//
+// `ChannelPreference` (v18720-2) is the Kilo Code operator-facing
+// channel toggle hint derived from the reachability probe + the
+// `--channel` flag value. Allowed values:
+//
+//	"prefer-aes-mtls"  - AES/mTLS over TCP/443 (ADR-086 path A2 default)
+//	"prefer-socks5"     - SOCKS5 over TCP/22 (legacy fallback)
+//	"both"              - operator explicit; recommendation reflects the
+//	                      reachability probe result (tcp443 or tcp22)
+//	""                  - operator did not pass --channel; envelope
+//	                      records the natural probe outcome
 type endpointCheckEnvelope struct {
-	Host            string `json:"host"`
-	TCP22Reachable  bool   `json:"tcp22_reachable"`
-	TCP22LatencyMs  int64  `json:"tcp22_latency_ms"`
-	TCP22Error      string `json:"tcp22_error,omitempty"`
-	TCP443Reachable bool   `json:"tcp443_reachable"`
-	TCP443LatencyMs int64  `json:"tcp443_latency_ms"`
-	TCP443Error     string `json:"tcp443_error,omitempty"`
-	Recommendation  string `json:"recommendation"`
-	ProbedAt        string `json:"probed_at"`
+	Host              string `json:"host"`
+	TCP22Reachable    bool   `json:"tcp22_reachable"`
+	TCP22LatencyMs    int64  `json:"tcp22_latency_ms"`
+	TCP22Error        string `json:"tcp22_error,omitempty"`
+	TCP443Reachable   bool   `json:"tcp443_reachable"`
+	TCP443LatencyMs   int64  `json:"tcp443_latency_ms"`
+	TCP443Error       string `json:"tcp443_error,omitempty"`
+	Recommendation    string `json:"recommendation"`
+	ChannelPreference string `json:"channel_preference,omitempty"`
+	ProbedAt          string `json:"probed_at"`
 }
 
 // runEndpointCheck probes the host for reachability of TCP/22 (legacy
@@ -558,6 +570,11 @@ func runEndpointCheck(args []string) error {
 	tcp22Port := fs.String("tcp22-port", "22", "TCP/22 candidate port")
 	tcp443Port := fs.String("tcp443-port", "443", "TCP/443 candidate port")
 	probeTimeout := fs.Duration("probe-timeout", 2*time.Second, "per-port dial timeout (max 30s)")
+	// v18720-2: --channel flag carries the Kilo Code operator-facing
+	// channel preference hint. Valid values: "prefer-aes-mtls",
+	// "prefer-socks5", "both" (default). Empty string means "do not
+	// emit a channel_preference field".
+	channel := fs.String("channel", "both", "channel preference hint: prefer-aes-mtls | prefer-socks5 | both")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -573,6 +590,17 @@ func runEndpointCheck(args []string) error {
 	}
 	if *probeTimeout <= 0 || *probeTimeout > 30*time.Second {
 		*probeTimeout = 2 * time.Second
+	}
+	// v18720-2: validate the channel flag. Unknown values fail fast
+	// rather than silently defaulting.
+	allowedChannels := map[string]bool{
+		"":                true,
+		"prefer-aes-mtls": true,
+		"prefer-socks5":   true,
+		"both":            true,
+	}
+	if !allowedChannels[*channel] {
+		return fmt.Errorf("invalid --channel value %q (allowed: prefer-aes-mtls, prefer-socks5, both)", *channel)
 	}
 
 	env := endpointCheckEnvelope{
@@ -594,6 +622,11 @@ func runEndpointCheck(args []string) error {
 		env.TCP443Error = tcp443Err.Error()
 	}
 
+	// v18720-2: keep the canonical recommendation semantics (tcp443 |
+	// tcp22 | none) so existing consumers parse predictably. Reachability
+	// drives the recommendation: tcp443 wins over tcp22 when both are
+	// reachable. Channel-preference is a separate `channel_preference`
+	// hint that the operator (Kilo Code) reads alongside the verdict.
 	switch {
 	case tcp443OK:
 		env.Recommendation = "tcp443"
@@ -601,6 +634,20 @@ func runEndpointCheck(args []string) error {
 		env.Recommendation = "tcp22"
 	default:
 		env.Recommendation = "none"
+	}
+	// v18720-2: surface the operator-facing channel preference hint
+	// in the envelope. When --channel points at a channel that IS
+	// reachable the channel_preference value gives Kilo Code the
+	// "use this channel" verdict; when the preferred channel is NOT
+	// reachable the envelope still carries the preference so the
+	// consumer can show "prefer-aes-mtls but only tcp22 reachable"
+	// to the operator. Allowed channel_preference values:
+	//   - ""             → unset (no --channel flag)
+	//   - "prefer-aes-mtls" → operator chose AES/mTLS over TCP/443
+	//   - "prefer-socks5"   → operator chose legacy SOCKS5 over TCP/22
+	//   - "both"            → default; report no override
+	if *channel != "" {
+		env.ChannelPreference = *channel
 	}
 
 	out, err := json.Marshal(env)

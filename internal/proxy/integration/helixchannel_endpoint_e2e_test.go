@@ -105,11 +105,11 @@ func helixchannelE2EClient() *http.Client {
 // construction) and unexpected 4xx/5xx that is not a SKIP case
 // above. SKIP-not-FAIL on:
 //
-//   - env var unset (no key available)
-//   - DNS resolution failure
-//   - TLS handshake failure
-//   - 401/403 (key revoked, model retired)
-//   - 502 Bad Gateway (upstream degraded)
+//	- env var unset (no key available)
+//	- DNS resolution failure
+//	- TLS handshake failure
+//	- 401/403 (key revoked, model retired)
+//	- 502 Bad Gateway (upstream degraded)
 func TestHelixChannelE2E_ModelsAndChat(t *testing.T) {
 	apiKey := strings.TrimSpace(os.Getenv(helixchannelE2EAPIKeyEnv))
 	if apiKey == "" {
