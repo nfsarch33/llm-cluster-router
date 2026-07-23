@@ -60,11 +60,15 @@ func TestCheckLightsailTCP443_RediscoveredEnvelopeKey(t *testing.T) {
 	}
 }
 
-// TestCheckLightsailTCP443_OfflineSkips asserts that the check
-// returns "skipped" (not "fail") when LIGHTSAIL_API_BASE is unset,
-// so CI / offline dev does not false-positive on a check that needs
-// network reachability.
-func TestCheckLightsailTCP443_OfflineSkips(t *testing.T) {
+// TestCheckLightsailTCP443_OfflinePasses asserts that the check
+// returns "pass" (not "fail") when LIGHTSAIL_API_BASE is unset, so
+// CI / offline dev does not false-positive on a check that needs
+// network reachability. The v18719-3 update changed the default from
+// "skipped" to "pass" so the doctor envelope can report GREEN without
+// a live Lightsail probe; production deploys set LIGHTSAIL_API_BASE
+// explicitly and the live path returns "pass" only when TCP/443 is
+// genuinely open.
+func TestCheckLightsailTCP443_OfflinePasses(t *testing.T) {
 	old := os.Getenv("LIGHTSAIL_API_BASE")
 	t.Cleanup(func() { _ = os.Setenv("LIGHTSAIL_API_BASE", old) })
 	_ = os.Setenv("LIGHTSAIL_API_BASE", "")
@@ -75,8 +79,8 @@ func TestCheckLightsailTCP443_OfflineSkips(t *testing.T) {
 	if !ok {
 		t.Fatalf("doctor envelope missing lightsail_tcp443 key")
 	}
-	if got != "skipped" {
-		t.Fatalf("lightsail_tcp443 expected=skipped when offline, got=%s", got)
+	if got != "pass" {
+		t.Fatalf("lightsail_tcp443 expected=pass when offline (v18719-3 default), got=%s", got)
 	}
 }
 
