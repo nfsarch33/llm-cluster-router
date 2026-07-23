@@ -191,6 +191,165 @@ func TestDoctorSubcommand_ChecksADR085(t *testing.T) {
 	}
 }
 
+// TestCipherList_EmitsCanonicalSuite asserts that `cipher-list`
+// returns a JSON envelope with the canonical 4-row catalog and at
+// least one recommended suite (TLS_AES_256_GCM_SHA384, RFC 8446).
+//
+// RED until cipher-list is implemented (v18727-2).
+func TestCipherList_EmitsCanonicalSuite(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "cipher-list")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("cipher-list exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+
+	var env cipherListEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("cipher-list stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Channel != "aes-256-gcm" {
+		t.Fatalf("cipher-list.channel = %q, want aes-256-gcm", env.Channel)
+	}
+	if env.Count < 4 {
+		t.Fatalf("cipher-list.count = %d, want >=4 (canonical catalog has 4 rows)", env.Count)
+	}
+	// Confirm the canonical recommended suite is the first
+	// entry (cf. catalogCipherSuites ordering invariant).
+	if len(env.Ciphers) == 0 || env.Ciphers[0].IANA != "TLS_AES_256_GCM_SHA384" {
+		var got []string
+		for _, c := range env.Ciphers {
+			got = append(got, c.IANA)
+		}
+		t.Fatalf("cipher-list first row should be TLS_AES_256_GCM_SHA384; got %v", got)
+	}
+	if !env.Ciphers[0].Recommended {
+		t.Fatalf("cipher-list first row should be Recommended=true")
+	}
+	if !env.Ciphers[0].AEAD {
+		t.Fatalf("cipher-list first row should be AEAD=true")
+	}
+}
+
+// TestCipherList_RecommendedOnlyFilter asserts that
+// `cipher-list --recommended-only` returns only rows where
+// Recommended == true and reduces the count below the catalog total.
+func TestCipherList_RecommendedOnlyFilter(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "cipher-list", "--recommended-only")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("cipher-list --recommended-only exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+
+	var env cipherListEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("cipher-list stdout not JSON: %v", err)
+	}
+	if env.Count == 0 {
+		t.Fatalf("cipher-list --recommended-only.count = 0")
+	}
+	for i, c := range env.Ciphers {
+		if !c.Recommended {
+			t.Fatalf("cipher-list --recommended-only row %d (%q) has Recommended=false", i, c.IANA)
+		}
+	}
+}
+
+// TestCipherList_AsYAMLEmitsSSLCiphers asserts that
+// `cipher-list --as-yaml` emits a nginx-friendly ssl_ciphers block
+// with the recommended suite as the directive value.
+func TestCipherList_AsYAMLEmitsSSLCiphers(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "cipher-list", "--as-yaml")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("cipher-list --as-yaml exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "ssl_ciphers ") {
+		t.Fatalf("cipher-list --as-yaml missing 'ssl_ciphers' directive:\n%s", out)
+	}
+	if !strings.Contains(out, "TLS_AES_256_GCM_SHA384") {
+		t.Fatalf("cipher-list --as-yaml missing canonical suite:\n%s", out)
+	}
+}
+
+// TestCertPin_OfflineFailsClean asserts that `cert-pin --host
+// 127.0.0.1 --port 1` exits non-zero with a JSON envelope
+// containing an error key (per the envelope contract) and does not
+// leak internal argv. Offline test - never reaches Lightsail.
+func TestCertPin_OfflineFailsClean(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	// 127.0.0.1:1 is the canonical "guaranteed-no-listener" probe:
+	// the kernel will refuse immediately.
+	cmd := exec.Command(bin, "cert-pin", "--host", "127.0.0.1", "--port", "1", "--probe-timeout", "1s")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("cert-pin against 127.0.0.1:1 should exit non-zero")
+	}
+	// The CLI's fail() helper writes the error envelope to stderr
+	// (so stdout stays clean for jq pipes); check stderr.
+	if stderr.Len() == 0 {
+		t.Fatalf("cert-pin must emit JSON error envelope on failure; got empty stderr")
+	}
+	if !strings.Contains(stderr.String(), "\"error\"") {
+		t.Fatalf("cert-pin error envelope missing 'error' key: %s", stderr.String())
+	}
+	// Anti-shell-leak: no PII / tmp paths. Note: the dial-error
+	// text *will* echo the input address (127.0.0.1:1) — that's
+	// not a leak, that's the operator's own probe target echoed
+	// back. We only assert no /tmp/ paths.
+	if strings.Contains(stderr.String(), "/tmp/") {
+		t.Fatalf("cert-pin error envelope leaked tmp path: %s", stderr.String())
+	}
+}
+
+// TestCipherList_UnknownFlagErrors asserts that an unknown flag
+// returns a non-zero exit and the JSON error envelope (on stderr,
+// per the fail() helper contract).
+func TestCipherList_UnknownFlagErrors(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "cipher-list", "--no-such-flag")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("cipher-list --no-such-flag should exit non-zero")
+	}
+	if !strings.Contains(stderr.String(), "\"error\"") {
+		t.Fatalf("cipher-list unknown flag must emit error JSON envelope (stderr): %s", stderr.String())
+	}
+}
+
 // --- helpers ---
 
 // repoRoot returns the path to the llm-cluster-router repo root by

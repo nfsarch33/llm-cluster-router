@@ -33,6 +33,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,6 +45,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	clihelper "github.com/nfsarch33/llm-cluster-router/internal/cli"
@@ -85,6 +89,14 @@ func main() {
 		if err := runEndpointCheck(os.Args[2:]); err != nil {
 			fail("endpoint-check", err)
 		}
+	case "cipher-list":
+		if err := runCipherList(os.Args[2:]); err != nil {
+			fail("cipher-list", err)
+		}
+	case "cert-pin":
+		if err := runCertPin(os.Args[2:]); err != nil {
+			fail("cert-pin", err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -92,7 +104,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|cipher-list|cert-pin>\n", os.Args[0])
 }
 
 // fail prints a small JSON envelope to stderr describing the
@@ -591,4 +603,321 @@ func probeHostPort(host, port string, timeout time.Duration) (bool, time.Duratio
 	}
 	_ = conn.Close()
 	return true, lat, nil
+}
+
+// ---------------------------------------------------------------------
+// v18727-2: cipher-list (v2 cipher preference catalogue)
+//
+// The HelixChannel production wire (ADR-085) standardises on
+// AES-256-GCM in the application-layer encryption envelope, but the
+// TLS-termination on TCP/443 (ADR-086) negotiates one of several
+// cipher suites with the upstream nginx. The `cipher-list`
+// subcommand enumerates the cipher preferences we publish, with
+// per-suite metadata (IANA name, RFC, key length, AEAD flag,
+// recommended flag for the Lightsail production wire). Operators
+// use it to confirm the operator-side recommended cipher suite
+// before generating an nginx config.
+//
+// Flags:
+//
+//	--recommended-only    emit only the recommended suite(s)
+//	--as-yaml             emit YAML instead of JSON (for nginx ssl_ciphers)
+//
+// Exit codes:
+//
+//	0 - envelope emitted
+//	1 - unknown flag / parse error
+// ---------------------------------------------------------------------
+
+// CipherSuiteInfo is a single row in the cipher-list envelope. It is
+// the canonical operator-facing metadata; the same struct also feeds
+// the recommended list so the operator never has to consult a separate
+// document to know which suite to use.
+type CipherSuiteInfo struct {
+	Name        string `json:"name"`
+	IANA        string `json:"iana"`
+	RFC         string `json:"rfc"`
+	KeyBits     int    `json:"key_bits"`
+	AEAD        bool   `json:"aead"`
+	Recommended bool   `json:"recommended"`
+	PFS         bool   `json:"pfs"`
+}
+
+// cipherListEnvelope is the JSON envelope emitted by the
+// `cipher-list` subcommand.
+type cipherListEnvelope struct {
+	GeneratedAt string            `json:"generated_at"`
+	Channel     string            `json:"channel"`
+	Count       int               `json:"count"`
+	Ciphers     []CipherSuiteInfo `json:"ciphers"`
+}
+
+// catalogCipherSuites is the canonical operator-facing catalogue. The
+// `Recommended` flag is the truth the operator follows when generating
+// `ssl_ciphers` for the nginx reverse-proxy on the Lightsail
+// `helixon-tunnel` instance. Adding a new entry requires also updating
+// the YAML-template row in cmd/dual-listener-demo (cross-checked at
+// integration time).
+//
+// Order matters: `cipher-list --recommended-only` emits in catalogue
+// order, so the first recommended row is the canonical preference.
+func catalogCipherSuites() []CipherSuiteInfo {
+	return []CipherSuiteInfo{
+		{
+			Name:        "TLS_AES_256_GCM_SHA384",
+			IANA:        "TLS_AES_256_GCM_SHA384",
+			RFC:         "RFC 8446",
+			KeyBits:     256,
+			AEAD:        true,
+			Recommended: true,
+			PFS:         true,
+		},
+		{
+			Name:        "TLS_CHACHA20_POLY1305_SHA256",
+			IANA:        "TLS_CHACHA20_POLY1305_SHA256",
+			RFC:         "RFC 8439 / RFC 7905",
+			KeyBits:     256,
+			AEAD:        true,
+			Recommended: false,
+			PFS:         true,
+		},
+		{
+			Name:        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+			IANA:        "TLS_ECDHE_RSA_AES_256_GCM_SHA384",
+			RFC:         "RFC 5289",
+			KeyBits:     256,
+			AEAD:        true,
+			Recommended: false,
+			PFS:         true,
+		},
+		{
+			Name:        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+			IANA:        "TLS_ECDHE_ECDSA_AES_256_GCM_SHA384",
+			RFC:         "RFC 5289",
+			KeyBits:     256,
+			AEAD:        true,
+			Recommended: false,
+			PFS:         true,
+		},
+	}
+}
+
+// runCipherList parses --recommended-only and --as-yaml flags, then
+// emits either a JSON envelope or a YAML block suitable for nginx
+// ssl_ciphers directives.
+func runCipherList(args []string) error {
+	recommendedOnly := false
+	asYAML := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--recommended-only":
+			recommendedOnly = true
+		case "--as-yaml":
+			asYAML = true
+		default:
+			return fmt.Errorf("unknown flag for cipher-list: %s", args[i])
+		}
+	}
+	all := catalogCipherSuites()
+	filtered := make([]CipherSuiteInfo, 0, len(all))
+	for _, c := range all {
+		if recommendedOnly && !c.Recommended {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	if asYAML {
+		// Emit a nginx-friendly block: the leading
+		// `ssl_ciphers` directive is intentionally omitted so
+		// operators can grep the colon-separated list and paste
+		// it into either nginx.conf or stream{} block.
+		var b strings.Builder
+		b.WriteString("# helm-operator/helixchannel/nginx ssl_ciphers block\n")
+		b.WriteString("# Generated by `helixchannel cipher-list --as-yaml`\n")
+		b.WriteString("# Channel: aes-256-gcm (HelixChannel, ADR-085)\n")
+		for _, c := range filtered {
+			if !c.Recommended {
+				continue
+			}
+			b.WriteString("# - ")
+			b.WriteString(c.IANA)
+			b.WriteString(" (")
+			b.WriteString(fmt.Sprintf("%d-bit", c.KeyBits))
+			if c.AEAD {
+				b.WriteString(", AEAD")
+			}
+			if c.PFS {
+				b.WriteString(", PFS")
+			}
+			b.WriteString(")\n")
+		}
+		// Concatenated colon-separated list at the bottom: nginx's
+		// canonical ssl_ciphers format.
+		b.WriteString("ssl_ciphers ")
+		first := true
+		for _, c := range filtered {
+			if !c.Recommended {
+				continue
+			}
+			if !first {
+				b.WriteString(":")
+			}
+			b.WriteString(c.IANA)
+			first = false
+		}
+		b.WriteString(";\n")
+		_, err := fmt.Fprintln(os.Stdout, b.String())
+		return err
+	}
+	env := cipherListEnvelope{
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Channel:     "aes-256-gcm",
+		Count:       len(filtered),
+		Ciphers:     filtered,
+	}
+	out, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, string(out))
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// v18727-2: cert-pin (SPKI SHA-256 pin for the public hostname)
+//
+// Operations against `helixchannel.cylrl.dev` traverse TLS-443 and
+// rely on the Let's Encrypt / DreamHost-managed chain. To catch a
+// malicious CA substitution early (cf. CAA mis-issuance incidents),
+// operators can compute and verify the SubjectPublicKeyInfo SHA-256
+// pin of the leaf certificate. The `cert-pin` subcommand fetches
+// the leaf-cert SPKI digest from the live endpoint and optionally
+// verifies it against an operator-supplied pin.
+//
+// Flags:
+//
+//	--host           target host (default "helixchannel.cylrl.dev")
+//	--port           target port (default "443")
+//	--expect-pin     expected base64 SPKI SHA-256 digest; when set,
+//	                the subcommand asserts equality and exits 1 on
+//	                mismatch (silent fail for diff'ing).
+//	--probe-timeout  dial+handshake timeout (default 5s, cap 30s)
+//
+// Anti-shell-leak: the returned pin is the public SPKI digest (not
+// a secret), so printing it is allowed.
+//
+// Exit codes:
+//
+//	0 - pin computed (and matched --expect-pin if supplied)
+//	1 - transport error / handshake failure
+//	2 - pin mismatch against --expect-pin
+// ---------------------------------------------------------------------
+
+// certPinEnvelope is the JSON envelope emitted by `cert-pin`.
+type certPinEnvelope struct {
+	Host       string `json:"host"`
+	Port       string `json:"port"`
+	SPKISHA256 string `json:"spki_sha256_base64"`
+	Algo       string `json:"algo"`
+	FetchedAt  string `json:"fetched_at"`
+	ExpectPin  string `json:"expect_pin,omitempty"`
+	Match      *bool  `json:"match,omitempty"`
+}
+
+// runCertPin fetches the leaf certificate from host:port (default
+// helixchannel.cylrl.dev:443), computes the SPKI SHA-256 digest, and
+// emits the cert-pin envelope. When --expect-pin is set, the
+// subcommand asserts equality and exits 1 on mismatch.
+//
+// Flags:
+//
+//	--host           target host (default "helixchannel.cylrl.dev")
+//	--port           target port (default "443")
+//	--insecure       do not verify hostname/cert chain (pilot mode
+//	                where the cert may be self-signed before
+//	                Let's Encrypt is wired)
+//	--expect-pin     expected base64 SPKI SHA-256 digest; when set,
+//	                the subcommand asserts equality and exits 2 on
+//	                mismatch.
+//	--probe-timeout  dial+handshake timeout (default 5s, cap 30s)
+//
+// Anti-shell-leak: the returned pin is the public SPKI digest (not
+// a secret), so printing it is allowed.
+//
+// Exit codes:
+//
+//	0 - pin computed (and matched --expect-pin if supplied)
+//	1 - transport error / handshake failure
+//	2 - pin mismatch against --expect-pin
+//	3 - hostname SAN mismatch and --insecure was not supplied
+func runCertPin(args []string) error {
+	fs := flag.NewFlagSet("cert-pin", flag.ContinueOnError)
+	host := fs.String("host", "helixchannel.cylrl.dev", "target host for TLS handshake")
+	port := fs.String("port", "443", "target port")
+	expect := fs.String("expect-pin", "", "expected SPKI SHA-256 base64; exit 2 on mismatch")
+	insecure := fs.Bool("insecure", false, "skip hostname/cert verification (pilot mode; the live lease uses a self-signed CN=helixon-tunnel pilot cert)")
+	probe := fs.Duration("probe-timeout", 5*time.Second, "dial+handshake timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *probe <= 0 || *probe > 30*time.Second {
+		*probe = 5 * time.Second
+	}
+	addr := net.JoinHostPort(*host, *port)
+	tlsCfg := &tls.Config{}
+	if *insecure {
+		// InsecureSkipNames: connect, but skip hostname + cert
+		// verification. We still parse PeerCertificates to compute
+		// the pin.
+		tlsCfg = tlsCfg.Clone()
+		tlsCfg.InsecureSkipVerify = true
+		tlsCfg.ServerName = *host
+	} else {
+		tlsCfg.ServerName = *host
+	}
+	dialer := &net.Dialer{Timeout: *probe}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	if err != nil {
+		return fmt.Errorf("tls dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+	// SetDeadline so a half-handshake does not stall the
+	// subcommand past probe-timeout.
+	_ = conn.SetDeadline(time.Now().Add(*probe))
+	if err := conn.Handshake(); err != nil {
+		return fmt.Errorf("tls handshake %s: %w", addr, err)
+	}
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return fmt.Errorf("no peer certificates on %s", addr)
+	}
+	leaf := certs[0]
+	digest := leaf.RawSubjectPublicKeyInfo
+	if len(digest) == 0 {
+		return fmt.Errorf("empty SPKI on leaf cert for %s", addr)
+	}
+	sum := sha256.Sum256(digest)
+	pinB64 := base64.StdEncoding.EncodeToString(sum[:])
+
+	env := certPinEnvelope{
+		Host:       *host,
+		Port:       *port,
+		SPKISHA256: pinB64,
+		Algo:       "SHA-256",
+		FetchedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if *expect != "" {
+		env.ExpectPin = *expect
+		match := pinB64 == *expect
+		env.Match = &match
+	}
+	out, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, string(out))
+	if *expect != "" && pinB64 != *expect {
+		os.Exit(2)
+	}
+	return nil
 }
