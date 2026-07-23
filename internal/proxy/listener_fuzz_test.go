@@ -541,10 +541,10 @@ func TestPenTestPort443Listener(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				atomic.AddInt32(&cur, 1)
+				curVal := atomic.AddInt32(&cur, 1)
 				for {
 					old := atomic.LoadInt32(&maxConcurrent)
-					if cur <= old || atomic.CompareAndSwapInt32(&maxConcurrent, old, cur) {
+					if curVal <= old || atomic.CompareAndSwapInt32(&maxConcurrent, old, curVal) {
 						break
 					}
 				}
