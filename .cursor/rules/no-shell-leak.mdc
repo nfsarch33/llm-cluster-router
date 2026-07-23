@@ -6,25 +6,27 @@ alwaysApply: true
 # No Shell Leak
 
 Sensitive personal-stack identifiers must never appear in raw shell `argv`,
-in interactive zsh history, in `~/Library/Logs`, or in any session
-transcript visible to a model. Sensitive identifiers include:
+in interactive zsh history, in any user-level logs directory, or in any
+session transcript visible to a model. Sensitive identifiers include:
 
-- internal IPs (Tailscale `100.x.x.x`, OCI public IPs, LAN `10.x.x.x`)
-- SSH key file paths (`$HOME/.ssh/fleet_lan`, etc.) and key bytes
-- Bearer tokens, JFrog tokens, GitHub PATs, AWS bearer tokens, HuggingFace
-  tokens, 1Password Service Account tokens, or any credential string
-- Private repo absolute paths (`/Users/jason.lian/ai-agent-business-stack`,
-  `/Users/jason.lian/ironclaw`, ...)
+- internal IPs (overlay-NAT `100.x.x.x` ranges, cloud-provider public IPs,
+  LAN `10.x.x.x` ranges)
+- SSH key file paths (`$HOME/.ssh/<fleet-key>`, etc.) and key bytes
+- Bearer tokens, package-registry tokens, GitHub PATs, cloud-provider
+  bearer tokens, model-provider tokens, 1Password Service Account tokens,
+  or any credential string
+- Private repo absolute paths (under `$HOME/...`)
 - Container names tied to private GPU hosts
 - Git author email, signing identity selection, and hostname pairs
-- OCI instance IDs (`ocid1.*`), tenancy IDs, and compartment IDs
+- Cloud-provider instance IDs (`ocid1.*`, `i-<hex>`, tenancy IDs,
+  compartment IDs, project IDs)
 - 1Password (`op`) output that contains secret values
 - `env`/`printenv` output that includes any of the above token names
 
 The canonical wrapper for everything in that list is the `runx` Go CLI
-(`github.com/nfsarch33/runx`, installed at `$HOME/runs/runx`).
-`runx` resolves aliases at run time, loads key bytes from macOS Keychain,
-and writes structured NDJSON to `$HOME/logs/runx/`.
+(public Go module, installed at `$HOME/runs/runx`). `runx` resolves
+aliases at run time, loads key bytes from the host credential store, and
+writes structured NDJSON to `$HOME/logs/runx/`.
 
 ## Required Surfaces
 
@@ -42,16 +44,15 @@ names defined in `$HOME/.config/runx/config.yaml`:
   --repo <alias>` instead of raw `gh pr` from a private repo path.
 - GitHub API: `runx gh api|repo-view|repo-edit --repo <alias>` instead of
   raw `gh api` or `gh repo` with org/repo slugs.
-- Docker (local or remote): `runx docker ps|compose|exec|logs [--target
-  <host-alias>]` instead of raw `docker` or `docker compose` commands.
+- Container (local or remote): `runx container ps|compose|exec|logs
+  [--target <host-alias>]` instead of raw container-CLI commands.
 - Go toolchain: `runx go test|build|vet|mod-tidy --repo <alias>
   [--subdir go]` instead of `cd $HOME/private-repo && go test`.
 - Make targets: `runx make build|test|lint --repo <alias> [--subdir go]`
   instead of `cd $HOME/private-repo/go && make build`.
 - Flutter app commands: `runx flutter test|build --app <alias>`.
-- Sentrux quality gate: `runx sentrux gate|save|check|scan|rescan
-  --repo <alias>`.
-- EvoLoop probes: `runx evoloop smoke|doctor|recent`.
+- Quality gate: `runx sentrux gate|save|check|scan|rescan --repo <alias>`.
+- Self-improvement probes: `runx evoloop smoke|doctor|recent`.
 - Launch agent management: `runx launchctl status|reload <alias>` instead
   of raw `launchctl load|unload` with plist paths.
 - Network checks: `runx nc <forward-alias>` instead of `nc -zv`.
@@ -62,26 +63,30 @@ names defined in `$HOME/.config/runx/config.yaml`:
 - Logs: `runx logs show|tail|rotate <log-name>`.
 - Doctor: `runx doctor` for stack health.
 
-## Repo aliases (29 registered as of v299)
+## Repo aliases
 
-business, global-kb, ironclaw, openclaw, runx, ironclaw-mcp, ironclaw-ops,
-mission-control, pdf-mcp, linkedin-mcp, upwork-mcp, hermes, gstack, router,
-autoresearch, openclaw-rl, agentic-research, skills, academic-skills,
-secure-auth, windows-mcp, chromedp, auto-research-sleep, memo,
-**cursor-tools, fleet-bench, offload-telemetry, cylrl, ansible-win**.
+The full set of repo aliases lives in
+`$HOME/.config/runx/owners.yaml` and is paired one-to-one with entries
+in `$HOME/.config/runx/config.yaml`. Always run
+`runx repo list --alias` to enumerate the current canonical set; do
+not hard-code alias names in agent prompts, transcripts, or tracked
+files. Aliases that no longer resolve (e.g. archived or rebranded
+repos) are removed from the manifest; the manifest is the source of
+truth.
 
 All paths in the config use `$HOME/...` (resolved at load via
 `os.ExpandEnv` then `ExpandTilde`) for cross-machine portability.
 
 ## Rules for Agents
 
-1. Never put an internal IP, SSH key path, key bytes, bearer token, OCI ID,
-   private repo absolute path, or any credential value on the command
-   line, in `cat <<EOF` heredocs, or in transcript output.
+1. Never put an internal IP, SSH key path, key bytes, bearer token,
+   cloud-provider instance ID, private repo absolute path, or any
+   credential value on the command line, in `cat <<EOF` heredocs, or in
+   transcript output.
 2. Never spawn `autossh` or `ssh -L` from a launch agent. All long-lived
    forwards run as `runx tunnel daemon <name>`.
-3. Never log to `$HOME/Library/Logs/<service>.ndjson`. All `runx`-driven logs
-   land in `$HOME/logs/runx/<tool>.ndjson`.
+3. Never log to per-user logs paths that aren't owned by `runx`. All
+   `runx`-driven logs land in `$HOME/logs/runx/<tool>.ndjson`.
 4. Temporary Go binaries live in `$HOME/runs/`. Never run from `/tmp/`.
 5. If a workflow needs a new sensitive command, extend `runx` (add a
    subcommand and an alias entry) instead of inlining shell. New scripting
@@ -89,31 +94,33 @@ All paths in the config use `$HOME/...` (resolved at load via
    bash or python.
 6. Subprocesses spawned by `runx` already get `HISTFILE=/dev/null`,
    `HISTSIZE=0`, `RUNX_SESSION=1`, and `GH_PAGER=cat`.
-7. **Agent self-compliance**: when running sentrux, git, gh, make, go, or
-   docker against a private repo from within the Cursor Shell tool, use
-   `runx <subcmd> --repo <alias>` instead of raw commands. The alias-only
-   argv keeps transcripts clean even when Cursor logs the shell call.
+7. **Agent self-compliance**: when running quality, git, gh, make, go, or
+   container commands against a private repo from within the Cursor Shell
+   tool, use `runx <subcmd> --repo <alias>` instead of raw commands. The
+   alias-only argv keeps transcripts clean even when Cursor logs the
+   shell call.
 8. Never create or execute scripts in `/tmp/`. Use `runx run <preset>` or
    add a new preset to config for recurring patterns. Helper scripts that
    must live on disk go to `$HOME/logs/runx/<name>.sh` (analytics + audit
    only) or `$HOME/runs/<name>` (compiled Go binaries).
-9. For remote Docker operations, use `runx docker --target <host-alias>`
-   instead of SSH-ing to a host and running docker commands manually.
+9. For remote container operations, use
+   `runx container --target <host-alias>` instead of SSH-ing to a host
+   and running container commands manually.
 10. **`op` (1Password) output must NEVER be expanded into argv of another
     command**. Pipe `op read` into a Go program that consumes secrets via
-    stdin, or store the secret in macOS Keychain and have the Go program
-    fetch it via `/usr/bin/security`. Never `op read 'op://vault/item/field'
-    | xargs <cmd>` or `MYTOKEN=$(op read ...) <cmd> --token "$MYTOKEN"`.
+    stdin, or store the secret in the host credential store and have the
+    Go program fetch it via the standard credential API. Never
+    `op read 'op://vault/item/field' | xargs <cmd>` or
+    `MYTOKEN=$(op read ...) <cmd> --token "$MYTOKEN"`.
 11. **Never run `env`, `printenv`, or `env | grep TOKEN`** in any shell
     that ends up in a transcript -- those commands print every token in
-    the process env, including `AWS_BEARER_TOKEN_BEDROCK`,
-    `HUGGING_FACE_HUB_TOKEN`, `OP_SERVICE_ACCOUNT_TOKEN`,
-    `_SAVED_GITHUB_TOKEN`, etc. To check whether a specific var is set,
+    the process env. To check whether a specific var is set,
     use `[ -z "$VAR" ] && echo unset || echo set` (no value printed).
 
 ## References
 
 - Repo: `github.com/nfsarch33/runx` (Go, Cobra, MIT).
 - Config: `$HOME/.config/runx/config.yaml` (mode `0600`).
+- Owner manifest: `$HOME/.config/runx/owners.yaml` (mode `0600`).
 - SOP: `$HOME/Code/global-kb/sop/no-shell-leak.md`.
 - Logs: `$HOME/logs/runx/` (NDJSON, rotated).

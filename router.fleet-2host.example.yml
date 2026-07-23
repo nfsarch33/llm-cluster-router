@@ -1,7 +1,7 @@
 # llm-cluster-router fleet config — v14888
-# Win1/wsl1 + win4/wsl4 peer pool, no cloud fallbacks.
+# Primary GPU host + secondary GPU host peer pool, no cloud fallbacks.
 #
-# Live endpoints verified via Tailscale DERP syd (wsl1 ↔ wsl4 RTT ~250ms).
+# Live endpoints verified via Tailscale DERP (primary <-> secondary RTT ~250ms).
 # Health probes every 15s; threshold 3; cooldown 30s.
 
 listen: ":8080"
@@ -34,8 +34,8 @@ fair_share:
 # sliding-window token bucket.
 # Disabled: solo fleet, no contention yet.
 nodes:
-  # ----- Local fast lane: wsl1 Ollama (qwen3.5-9b) -----
-  - name: wsl1-ollama-fast
+  # ----- Local fast lane: primary-host Ollama (qwen3.5-9b) -----
+  - name: primary-ollama-fast
     url: http://127.0.0.1:11434
     tier: fast
     priority: 0
@@ -47,8 +47,8 @@ nodes:
       threshold: 3
       cooldown: 20s
 
-  # ----- Local reasoning lane: wsl1 Qwen 3.6 27B (RTX 3090 #0) -----
-  - name: wsl1-llama-coder-27b
+  # ----- Local reasoning lane: primary-host Qwen 3.6 27B (RTX 3090 #0) -----
+  - name: primary-llama-coder-27b
     url: http://127.0.0.1:11435
     tier: reasoning
     priority: 0
@@ -60,13 +60,13 @@ nodes:
       threshold: 5
       cooldown: 30s
 
-  # ----- Secondary: wsl4 llama.cpp CUDA server (Qwen 3.6 27B) -----
-  # Reachable via Tailscale DERP from wsl1; 250-400ms RTT through relay.
-  # Marked priority 5 so wsl1 lane is preferred (no relay), but
-  # wsl4 picks up overflow automatically when wsl1 is saturated
+  # ----- Secondary: secondary-host llama.cpp CUDA server (Qwen 3.6 27B) -----
+  # Reachable via Tailscale DERP from primary; 250-400ms RTT through relay.
+  # Marked priority 5 so primary lane is preferred (no relay), but
+  # secondary picks up overflow automatically when primary is saturated
   # (queue depth >= max_queue_depth).
-  - name: wsl4-llama-coder-27b
-    url: http://desktop-p5bul0f-wsl4.tail447712.ts.net:11435
+  - name: secondary-llama-coder-27b
+    url: http://<tailscale-host>:11435
     tier: reasoning
     priority: 5
     weight: 4
@@ -83,7 +83,7 @@ nodes:
       healthy_threshold: 1
 
   # ----- Embedding lane (for sprintboard / engram / helixon-evolver) -----
-  - name: wsl1-engram-embedder
+  - name: primary-engram-embedder
     url: http://127.0.0.1:8281
     tier: embed
     priority: 0

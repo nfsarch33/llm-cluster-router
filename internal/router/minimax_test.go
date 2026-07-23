@@ -93,8 +93,9 @@ func TestMinChat_ModelWhitelist(t *testing.T) {
 
 // TestMinimaxRoute_200OnHello exercises the live `api.minimaxi.com`
 // endpoint via the bearer flow. Skipped unless MINIMAX_LIVE_TEST=1
-// AND MINIMAX_API_KEY is set (resolved from 1Password item
-// `minimax-api-1` in production; tests read directly from env).
+// AND MINIMAX_API_KEY is set (resolved from a 1Password item in
+// production per $HOME/.config/runx/owners.yaml; tests read directly
+// from env).
 func TestMinimaxRoute_200OnHello(t *testing.T) {
 	if os.Getenv("MINIMAX_LIVE_TEST") != "1" {
 		t.Skip("MINIMAX_LIVE_TEST!=1; skipping live round-trip")

@@ -1,9 +1,9 @@
 # llm-cluster-router — minimax live pilot wire-up (v18688-1).
 #
 # Per plan: route `minimax-chat` to api.minimaxi.com/v1 (NOT api.minimax.io).
-# The `MINIMAX_API_KEY` env var is resolved from the 1Password item
-# `minimax-api-1` (UUID ripotpfq43jzlreor4zo2ay734) at startup; this
-# yaml does NOT embed the key.
+# The `MINIMAX_API_KEY` env var is resolved from a 1Password item at startup;
+# see $HOME/.config/runx/owners.yaml for the canonical vault/item mapping.
+# This yaml does NOT embed the key.
 #
 # Verification:
 #   curl -sS -X POST -H "Authorization: Bearer $MINIMAX_API_KEY" \
