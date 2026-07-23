@@ -350,6 +350,156 @@ func TestCipherList_UnknownFlagErrors(t *testing.T) {
 	}
 }
 
+// TestTailnetAllowlist_DefaultEmitsCanonicalRange asserts that
+// `helixchannel tailnet-allowlist` (no flags) prints a JSON envelope
+// with `canonical = "100.64.0.0/10"` and exactly one CIDR in the
+// list. v18730-2 defence-in-depth posture: the canonical Tailscale
+// CGNAT range is always enforced.
+func TestTailnetAllowlist_DefaultEmitsCanonicalRange(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "tailnet-allowlist")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("tailnet-allowlist default exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env struct {
+		Mode      string   `json:"mode"`
+		Canonical string   `json:"canonical"`
+		CIDRs     []string `json:"cidrs"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("tailnet-allowlist stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Mode != "default" {
+		t.Errorf("mode = %q, want default", env.Mode)
+	}
+	if env.Canonical != "100.64.0.0/10" {
+		t.Errorf("canonical = %q, want 100.64.0.0/10", env.Canonical)
+	}
+	if len(env.CIDRs) != 1 || env.CIDRs[0] != "100.64.0.0/10" {
+		t.Errorf("cidrs = %v, want only [100.64.0.0/10]", env.CIDRs)
+	}
+}
+
+// TestTailnetAllowlist_CheckTailNetPeerPasses asserts that a known
+// TailNet peer (wsl1 = 100.84.108.92) is reported as `allowed=true`
+// and the process exits 0. v18730-2.
+func TestTailnetAllowlist_CheckTailNetPeerPasses(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "tailnet-allowlist", "--check", "100.84.108.92")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("tailnet-allowlist --check 100.84.108.92 exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env struct {
+		IP      string `json:"ip"`
+		Allowed *bool  `json:"allowed"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("tailnet-allowlist stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.IP != "100.84.108.92" {
+		t.Errorf("ip = %q, want 100.84.108.92", env.IP)
+	}
+	if env.Allowed == nil || !*env.Allowed {
+		t.Errorf("allowed = %v, want true", env.Allowed)
+	}
+}
+
+// TestTailnetAllowlist_CheckPublicIPDenies asserts that a public IP
+// (8.8.8.8 = Google DNS) is reported as `allowed=false` and the
+// process exits 1. v18730-2 — the defence-in-depth gate must
+// reject non-TailNet traffic.
+func TestTailnetAllowlist_CheckPublicIPDenies(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "tailnet-allowlist", "--check", "8.8.8.8")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("tailnet-allowlist --check 8.8.8.8 must exit non-zero; got exit 0")
+	}
+	var env struct {
+		IP      string `json:"ip"`
+		Allowed *bool  `json:"allowed"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("tailnet-allowlist stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Allowed == nil || *env.Allowed {
+		t.Errorf("allowed = %v, want false", env.Allowed)
+	}
+}
+
+// TestTailnetAllowlist_AllowExtraCIDR asserts that an explicit
+// `--allow 10.99.0.0/16` adds the extra range to the canonical
+// CGNAT list and that an IP inside the extras (10.99.5.5) is
+// reported as allowed. v18730-2.
+func TestTailnetAllowlist_AllowExtraCIDR(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "tailnet-allowlist", "--allow", "10.99.0.0/16", "--check", "10.99.5.5")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("tailnet-allowlist --check 10.99.5.5 exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env struct {
+		CIDRs   []string `json:"cidrs"`
+		Allowed *bool    `json:"allowed"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("tailnet-allowlist stdout not JSON: %v", err)
+	}
+	if len(env.CIDRs) != 2 {
+		t.Errorf("cidrs = %v, want 2 entries (canonical + extra)", env.CIDRs)
+	}
+	if env.Allowed == nil || !*env.Allowed {
+		t.Errorf("allowed = %v, want true (10.99.5.5 in 10.99.0.0/16)", env.Allowed)
+	}
+}
+
+// TestTailnetAllowlist_InvalidCIDRErrors asserts that an invalid
+// `--allow` value returns a JSON error envelope and a non-zero exit.
+// v18730-2.
+func TestTailnetAllowlist_InvalidCIDRErrors(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "tailnet-allowlist", "--allow", "not-a-cidr")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("tailnet-allowlist --allow not-a-cidr must exit non-zero")
+	}
+	if !strings.Contains(stderr.String(), "\"error\"") {
+		t.Fatalf("tailnet-allowlist invalid CIDR must emit JSON error envelope (stderr): %s", stderr.String())
+	}
+}
+
 // --- helpers ---
 
 // repoRoot returns the path to the llm-cluster-router repo root by

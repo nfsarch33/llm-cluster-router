@@ -50,6 +50,7 @@ import (
 
 	clihelper "github.com/nfsarch33/llm-cluster-router/internal/cli"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy/tailnet"
 )
 
 // proxyHelixChannelVersion is the HelixChannel-Version value we
@@ -97,6 +98,10 @@ func main() {
 		if err := runCertPin(os.Args[2:]); err != nil {
 			fail("cert-pin", err)
 		}
+	case "tailnet-allowlist":
+		if err := runTailnetAllowlist(os.Args[2:]); err != nil {
+			fail("tailnet-allowlist", err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -104,7 +109,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|cipher-list|cert-pin>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|cipher-list|cert-pin|tailnet-allowlist>\n", os.Args[0])
 }
 
 // fail prints a small JSON envelope to stderr describing the
@@ -918,6 +923,101 @@ func runCertPin(args []string) error {
 	fmt.Fprintln(os.Stdout, string(out))
 	if *expect != "" && pinB64 != *expect {
 		os.Exit(2)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// v18730-2: tailnet-allowlist (defence-in-depth for HelixChannel)
+//
+// HelixChannel's public hostname (`helixchannel.cylrl.dev`) is
+// reachable from any TailNet peer that has a valid TLS handshake.
+// To prevent a misconfigured Tailscale ACL from silently exposing
+// the endpoint to the public internet, the upstream
+// `llm-cluster-router` listener rejects connections whose
+// RemoteAddr is not in the operator's TailNet. This subcommand is
+// the operator-facing inspector for that allowlist.
+//
+// Modes:
+//
+//	default mode (no --check)
+//	    Print the parsed allowlist (canonical CGNAT range plus
+//	    extras) so operators can confirm what is enforced.
+//
+//	--check <ip>
+//	    Answer the binary question "is <ip> in the allowlist?".
+//	    Exit 0 when yes, exit 1 when no. Operators wire this
+//	    into nginx `$remote_addr` allow/deny logic via a
+//	    periodic refresh (the upstream listener reloads on SIGHUP).
+//
+//	--allow <cidr[,cidr...]>
+//	    Override the extra CIDR list (HELIXCHANNEL_TAILNET_EXTRA
+//	    env var takes precedence per the daemon's runtime config).
+//
+// Exit codes:
+//
+//	0  - check passed (or default mode printed envelope)
+//	1  - check failed (IP not in allowlist) OR CIDR parse error
+//	2  - unknown flag
+//
+// Anti-shell-leak: this subcommand never prints secret values.
+// ---------------------------------------------------------------------
+
+// tailnetAllowlistEnvelope is the JSON envelope emitted by
+// `tailnet-allowlist`. The shape is identical in both modes
+// (`default` and `--check`) so callers can pipe a single jq filter.
+type tailnetAllowlistEnvelope struct {
+	Mode      string   `json:"mode"`                // "default" or "check"
+	IP        string   `json:"ip,omitempty"`        // --check target (omitted in default)
+	Allowed   *bool    `json:"allowed,omitempty"`   // true/false for --check
+	CIDRs     []string `json:"cidrs"`               // parsed CIDR list
+	Canonical string   `json:"canonical"`           // always "100.64.0.0/10"
+	ExtraRaw  string   `json:"extra_raw,omitempty"` // raw --allow input
+}
+
+// runTailnetAllowlist dispatches the subcommand. See the comment
+// block above for the contract.
+func runTailnetAllowlist(args []string) error {
+	fs := flag.NewFlagSet("tailnet-allowlist", flag.ContinueOnError)
+	checkIP := fs.String("check", "", "test a single IP (or host:port) against the allowlist; exit 0 if allowed, 1 if not")
+	allowList := fs.String("allow", "", "comma-separated extra CIDRs (or bare IPs); augments the canonical Tailscale CGNAT range")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	// Allow HELIXCHANNEL_TAILNET_EXTRA env var to seed the --allow
+	// list when the operator prefers env-driven config.
+	if envExtra := strings.TrimSpace(os.Getenv("HELIXCHANNEL_TAILNET_EXTRA")); envExtra != "" && *allowList == "" {
+		*allowList = envExtra
+	}
+	a, err := tailnet.New(*allowList)
+	if err != nil {
+		return err
+	}
+	cidrStrs := make([]string, 0, len(a.CIDRs()))
+	for _, p := range a.CIDRs() {
+		cidrStrs = append(cidrStrs, p.String())
+	}
+	env := tailnetAllowlistEnvelope{
+		Mode:      "default",
+		CIDRs:     cidrStrs,
+		Canonical: tailnet.TailscaleCGNAT.String(),
+		ExtraRaw:  *allowList,
+	}
+	if *checkIP != "" {
+		env.Mode = "check"
+		env.IP = *checkIP
+		allowed := a.Allow(*checkIP)
+		env.Allowed = &allowed
+	}
+	out, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, string(out))
+	if *checkIP != "" {
+		if !a.Allow(*checkIP) {
+			os.Exit(1)
+		}
 	}
 	return nil
 }
