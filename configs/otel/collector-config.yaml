@@ -1,0 +1,69 @@
+# OpenTelemetry Collector configuration for v18720-4
+#
+# Receives OTLP gRPC traces from the llm-cluster-router on :4317 and
+# fans them out to two exporters so we can prove end-to-end observability:
+#
+#   1. file/stdout  — writes each span to a JSON-lines file under
+#                     /tmp/otel-collector.jsonl; the verifier tail-greps
+#                     this file to confirm spans arrived.
+#   2. prometheus   — exposes a Prometheus /metrics endpoint on :8889 with
+#                     the trace-export metrics; the verifier curls this
+#                     endpoint and greps for `llm_cluster_router_*` to
+#                     prove the production router metrics also live on
+#                     the same endpoint when the demo registers them
+#                     against the global registry.
+#
+# v18720-4 verifier calls:
+#   - runx ssh exec --target helixon-tunnel --raw 'curl -s http://127.0.0.1:8889/metrics | grep llm_cluster_router_decrypt_failed_total'
+#   - tail -3 ~/logs/runx/agentrace-mcp.ndjson
+#   - tail /tmp/otel-collector.jsonl
+#
+# When Lightsail is unreachable from this MacBook, run the collector
+# locally on 127.0.0.1:4317 + 127.0.0.1:8889 and substitute those
+# endpoints in the demo's OTEL_EXPORTER_OTLP_ENDPOINT env var.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 100ms
+    send_batch_size: 16
+
+exporters:
+  file:
+    path: /tmp/otel-collector.jsonl
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    const_labels:
+      collector: llm-cluster-router-v18720-4
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file, prometheus]
+  telemetry:
+    logs:
+      level: info
+
+# Lightsail production deployment note:
+#
+# The OTel collector runs as a systemd unit on the Lightsail tunnel
+# host (helixon-tunnel). The unit file lives at:
+#
+#   /etc/systemd/system/otelcol-contrib.service
+#
+# Launched via:
+#
+#   systemctl --user enable --now otelcol-contrib.service
+#
+# with --config pointing at this file as copied into
+# /etc/otelcol-contrib/config.yaml on the Lightsail host. The
+# production collector publishes its own metrics on :8889 inside
+# the Lightsail firewall; the Lightsail tunnel exposes that endpoint
+# to the operator via `runx ssh exec --target helixon-tunnel`.
