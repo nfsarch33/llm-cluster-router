@@ -217,6 +217,48 @@ var RequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 }, []string{"listener", "method"})
 
+// RequestDurationByModel is the v18729-2 model-labelled histogram.
+// It co-exists with RequestDuration so dashboards keyed on
+// {listener,method} stay green; this one keys on {listener,model}.
+//
+// Why a distinct metric name (not just an extra label)? Prometheus
+// forbids two histograms with the same metric name but different
+// label sets on the same registry (Registry.Register returns
+// "different label names"). Adding a `model` label to the existing
+// vector would also explode cardinality (listener x method x model)
+// and force every existing dashboard to re-discover the series.
+//
+// The `_by_model` suffix keeps the metric name unique while making
+// the relationship to `llm_cluster_router_request_duration_seconds`
+// obvious. Model names are operator-controlled (MiniMax-M3,
+// qwen3.7-plus, qwen3.7-max, ...) so cardinality stays bounded.
+//
+// Bucket choice mirrors RequestDuration (5ms..5s). The TTFB alert
+// in observability/alerts/helixchannel.yaml reads p95 from this
+// histogram; the dashboards key off the v18729-2 helixchannel.json
+// panel set.
+var RequestDurationByModel = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "llm_cluster_router_request_duration_by_model_seconds",
+	Help:    "End-to-end request duration by listener and model. v18729-2 additive series; parallel to llm_cluster_router_request_duration_seconds which carries {listener,method}.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
+}, []string{"listener", "model"})
+
+// ObserveRequestDurationByModel records a model-labelled duration
+// sample. The call is a no-op if model is empty (defensive — the
+// upstream v1/chat/completions request may not always carry a
+// model name, e.g. on /healthz probes).
+//
+// listener must be one of {socks5, aes-mtls, tls-edge} so existing
+// alerts keep filtering on the canonical label values; any other
+// value is passed through verbatim and operators are expected to
+// add a corresponding dashboard panel.
+func ObserveRequestDurationByModel(listener, model string, seconds float64) {
+	if model == "" {
+		return
+	}
+	RequestDurationByModel.WithLabelValues(listener, model).Observe(seconds)
+}
+
 // DecryptFailedTotal counts AES-GCM authentication failures per
 // listener. v18710-4 introduces this metric to support the
 // Lightsail release readiness gate (ADR-083 C2/C7): any non-zero
@@ -312,7 +354,7 @@ func ObserveHelixChannelSession(ctx context.Context, outcome string) {
 // RegisterMetrics installs the dual-listener metrics on the
 // provided (production-isolated) registry. Call once at startup.
 func RegisterMetrics(reg *prometheus.Registry) error {
-	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, DecryptFailedTotal, HelixChannelConnectionsTotal, HelixChannelBytesTotal, HelixChannelSessionTotal} {
+	for _, c := range []prometheus.Collector{ConnectionsTotal, BytesTotal, RequestDuration, RequestDurationByModel, DecryptFailedTotal, HelixChannelConnectionsTotal, HelixChannelBytesTotal, HelixChannelSessionTotal} {
 		if err := reg.Register(c); err != nil {
 			// Already-registered (e.g. by a previous test) is fine; only fail on unexpected errors.
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {

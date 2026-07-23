@@ -1,0 +1,103 @@
+# Alertmanager routing for HelixChannel (v18729-2).
+#
+# Two channels:
+#   - Slack webhook (#helixchannel-ops) — operator-immediate notification
+#   - Resend email (operator) — secondary notification + audit log
+#
+# Both are wired for severity=page; severity=warn goes to Slack only
+# to avoid email fatigue.
+#
+# Configuration values come from 1Password HelixonSafe vault items
+# (Slack webhook URL, Resend API key) at runtime via envsubst /
+# helm values. NEVER hardcode secrets in this file.
+
+global:
+  resolve_timeout: 5m
+  # smtp_smarthost / smtp_from are NOT used: per the operator
+  # email-vendor-rotation rule, ALL email must go through Resend's
+  # REST API (https://api.resend.com/emails), never SMTP. The
+  # email_config block below triggers the API integration via the
+  # helix-dev-tools built-in notifier.
+  resend_api_key_file: /run/secrets/resend-api-key
+
+route:
+  group_by: ['alertname', 'channel', 'slo']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'helixchannel-default'
+  routes:
+    # Page-grade alerts go to Slack + operator email.
+    - match:
+        severity: page
+      receiver: 'helixchannel-page'
+      continue: true
+    # Warn-grade alerts go to Slack only.
+    - match:
+        severity: warn
+      receiver: 'helixchannel-warn'
+
+receivers:
+  - name: 'helixchannel-default'
+    # No-op; routed alerts pick a specific receiver below.
+
+  - name: 'helixchannel-page'
+    slack_configs:
+      - api_url_file: /run/secrets/slack-webhook-helixchannel
+        channel: '#helixchannel-ops'
+        send_resolved: true
+        title: '[PAGE] {{ .CommonLabels.alertname }} ({{ .CommonLabels.channel }})'
+        text: |
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          SLO: {{ .Labels.slo }}
+          {{ end }}
+        # icon_emoji + username are operator-decorated; kept default.
+    email_configs:
+      - to: 'jaslian+helixchannel-alerts@gmail.com'
+        send_resolved: true
+        # smtp_smarthost / smtp_from omitted: Resend REST API only.
+        # Alertmanager invokes the helix-dev-tools notifier shim
+        # which POSTs to https://api.resend.com/emails with the
+        # API key from /run/secrets/resend-api-key.
+        headers:
+          Subject: '[HelixChannel][PAGE] {{ .CommonLabels.alertname }}'
+        html: |
+          {{ range .Alerts }}
+          <h3>{{ .Annotations.summary }}</h3>
+          <p>{{ .Annotations.description }}</p>
+          <p>SLO: {{ .Labels.slo }}<br/>
+             Channel: {{ .Labels.channel }}<br/>
+             Started: {{ .StartsAt }}</p>
+          {{ end }}
+
+  - name: 'helixchannel-warn'
+    slack_configs:
+      - api_url_file: /run/secrets/slack-webhook-helixchannel
+        channel: '#helixchannel-ops'
+        send_resolved: true
+        title: '[WARN] {{ .CommonLabels.alertname }} ({{ .CommonLabels.channel }})'
+        text: |
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          SLO: {{ .Labels.slo }}
+          {{ end }}
+
+inhibit_rules:
+  # When HelixChannelSilent fires, suppress HelixChannelTTFBHigh
+  # (you can't measure latency on a silent channel).
+  - source_match:
+      alertname: HelixChannelSilent
+    target_match:
+      alertname: HelixChannelTTFBHigh
+    equal: ['channel']
+  # When HelixChannelDecryptErrors fires, suppress
+  # HelixChannelDecryptFailedRateHigh (they fire from overlapping
+  # sources; the session-level one is the canonical signal).
+  - source_match:
+      alertname: HelixChannelDecryptErrors
+    target_match:
+      alertname: HelixChannelDecryptFailedRateHigh
+    equal: ['channel']
