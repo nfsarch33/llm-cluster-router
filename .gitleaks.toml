@@ -1,41 +1,55 @@
-# gitleaks configuration for llm-cluster-router.
+# Custom Gitleaks ruleset (extends Gitleaks defaults).
+# Source of truth: cursor-global-kb/templates/gitleaks.toml (v18725-3).
+# Run: gitleaks detect --config .gitleaks.toml --source .
+# History scan: gitleaks detect --config .gitleaks.toml --source . --log-opts="--all"
 #
-# Rules: extends the gitleaks default ruleset (https://github.com/gitleaks/gitleaks).
-# Allowlists below are the SHORT list of intentional, audited exceptions —
-# every entry must point at a real test fixture or generated artifact.
-# DO NOT add an allowlist entry without a one-line "why this is safe" comment.
+# New rules added in v18725 (post P0 zdai + glrt leaks):
+#   - zdai-bearer     : ZD AI gateway bearer (cutover 2026-05-28 EOD; still hunted)
+#   - glrt-runner     : GitLab CE runner auth token
+#   - aws-access-key  : AKIA / ASIA prefix
+#   - ops-ey-jwt      : 1Password service-account JWT
+#   - gh-pat          : github_pat_*/gh[pour]_*_... variants
+#   - openai-anthropic: sk- prefixed keys (OpenAI/Anthropic/MiniMax)
+#
+# All rules are allowlistable via .gitleaksignore using the *fingerprint* hash,
+# never the rule ID. Never blanket-suppress entire files unless they are
+# genuine test fixtures with synthetic secrets.
 
 [extend]
 useDefault = true
 
-[allowlist]
-description = "audited synthetic fixtures and generated artefacts"
+[[rules]]
+id = "zdai-bearer"
+description = "Zendesk AI gateway bearer token (ZDGatewayOpenAI)"
+regex = '''zdai_[A-Za-z0-9_-]{40,80}'''
+tags = ["secret", "zd-gateway"]
 
-# Per-file regex allowlists. Restrict by path so a real key in a different
-# file still trips the scan.
-paths = [
-    # No path-level allowlists today. Add only when an entire generated
-    # file is unavoidable (e.g. coverage.out, test-output dumps).
-]
+[[rules]]
+id = "glrt-runner"
+description = "GitLab CE runner auth token"
+regex = '''glrt-[A-Za-z0-9_-]{16,}'''
+tags = ["secret", "gitlab-runner"]
 
-# Per-secret regexes. Use sparingly; prefer inline `# gitleaks:allow`
-# annotations in source so reviewers see the suppression alongside the
-# fixture.
-regexes = [
-    # 'sk-expanded-123' is a synthetic API key used in main_test.go to
-    # verify env-var expansion in node.api_key. The fixture is also
-    # annotated inline; this regex is belt-and-suspenders so the scan
-    # cannot drift if someone refactors the test and forgets the
-    # inline annotation.
-    "sk-expanded-123",
-]
+[[rules]]
+id = "aws-access-key"
+description = "AWS access key ID (AKIA/ASIA)"
+regex = '''(A|K|AS)IA[0-9A-Z]{16}'''
+tags = ["secret", "aws"]
 
-# Stop signals (entries that MUST NOT be allowlisted, even by accident).
-# stopwords are matched case-insensitively against any allowlisted hit
-# and re-promote it to a finding. This protects us from a future
-# allowlist that accidentally swallows a real production key.
-stopwords = [
-    "production",
-    "prod-",
-    "live-",
-]
+[[rules]]
+id = "ops-ey-jwt"
+description = "1Password service-account JWT"
+regex = '''ops_eyJ[A-Za-z0-9_-]{20,}'''
+tags = ["secret", "1password"]
+
+[[rules]]
+id = "gh-pat"
+description = "GitHub PAT (classic or fine-grained)"
+regex = '''gh[pousr]_[A-Za-z0-9]{30,}'''
+tags = ["secret", "github"]
+
+[[rules]]
+id = "openai-anthropic"
+description = "OpenAI / Anthropic / MiniMax-style API key"
+regex = '''sk-(live-|test-)?[A-Za-z0-9]{20,}'''
+tags = ["secret", "llm"]
