@@ -166,6 +166,15 @@ func newOTLPExporter(ctx context.Context, endpoint string) (sdktrace.SpanExporte
 	return otlpGRPCExporter(ctx, endpoint)
 }
 
+// NewOTLPGRPCExporter is the exported alias for newOTLPExporter,
+// used by the v18729-1 dual-publish package
+// (internal/proxy/agentrace). Kept separate from newOTLPExporter
+// so any future internal change to the wrapper does not surface
+// as a public API break.
+func NewOTLPGRPCExporter(ctx context.Context, endpoint string) (sdktrace.SpanExporter, error) {
+	return newOTLPExporter(ctx, endpoint)
+}
+
 // attributeString returns the canonical attribute.KeyValue with
 // the supplied key + string value. We export it as a helper so
 // tests and the binary use identical attribute constructors.
