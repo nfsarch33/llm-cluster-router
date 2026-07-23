@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -134,23 +135,88 @@ func TestOTelPipelineE2E(t *testing.T) {
 	demoCmd.Env = append(os.Environ(),
 		"OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:"+localOTLPPort,
 	)
-	demoStdout := &bytes.Buffer{}
-	demoCmd.Stdout = demoStdout
-	demoCmd.Stderr = demoStdout
-	if err := demoCmd.Start(); err != nil {
-		t.Fatalf("start dual-listener-demo: %v (output so far: %s)", err, demoStdout.String())
+	// Use a closed-pipe writer pattern (separate stdout/stderr) so the
+	// race detector does not flag concurrent String() reads while the
+	// process is still writing. We log only the prefix at start time,
+	// and re-log the full buffer (after Wait) during Cleanup if the
+	// process never produced healthy output.
+	demoStdout, err := demoCmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
 	}
-	t.Logf("dual-listener-demo PID=%d; output:\n%s", demoCmd.Process.Pid, demoStdout.String())
+	demoStderr, err := demoCmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	demoBuf := &bytes.Buffer{}
+	var demoMu sync.Mutex
+	demoPrefix := []byte{}
+	appendB := func(p []byte) {
+		demoMu.Lock()
+		demoBuf.Write(p)
+		if len(demoPrefix) < 1024 {
+			demoPrefix = append(demoPrefix, p...)
+			if len(demoPrefix) > 1024 {
+				demoPrefix = demoPrefix[:1024]
+			}
+		}
+		demoMu.Unlock()
+	}
+	go func() {
+		// tee the prefix so we have something to log immediately.
+		prefixDone := make(chan struct{})
+		go func() {
+			b := make([]byte, 1024)
+			for {
+				n, err := demoStderr.Read(b)
+				if n > 0 {
+					appendB(b[:n])
+				}
+				if err != nil {
+					close(prefixDone)
+					return
+				}
+			}
+		}()
+		// Drain stdout into the same buffer through a locked writer.
+		// io.Copy on bytes.Buffer is itself race-safe only when no other
+		// goroutine mutates the buffer; serialize via a custom writer.
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := demoStdout.Read(buf)
+			if n > 0 {
+				appendB(buf[:n])
+			}
+			if err != nil {
+				<-prefixDone
+				return
+			}
+		}
+	}()
+	if err := demoCmd.Start(); err != nil {
+		t.Fatalf("start dual-listener-demo: %v", err)
+	}
+	demoMu.Lock()
+	t.Logf("dual-listener-demo PID=%d; early output:\n%s", demoCmd.Process.Pid, string(demoPrefix))
+	demoMu.Unlock()
 
 	// Wait for demo to be healthy.
 	healthy := waitForHTTP("http://"+localMetricsAddr+"/healthz", 30*time.Second)
 	if !healthy {
 		_ = demoCmd.Process.Signal(syscall.SIGTERM)
-		t.Fatalf("dual-listener-demo did not become healthy within 30s; output:\n%s", demoStdout.String())
+		_, _ = demoCmd.Process.Wait()
+		demoMu.Lock()
+		out := append([]byte{}, demoBuf.Bytes()...)
+		demoMu.Unlock()
+		t.Fatalf("dual-listener-demo did not become healthy within 30s; output:\n%s", string(out))
 	}
 	t.Cleanup(func() {
 		_ = demoCmd.Process.Signal(syscall.SIGTERM)
 		_, _ = demoCmd.Process.Wait()
+		demoMu.Lock()
+		out := append([]byte{}, demoBuf.Bytes()...)
+		demoMu.Unlock()
+		t.Logf("dual-listener-demo final output:\n%s", string(out))
 	})
 
 	// Emit a sample request against the AES/mTLS listener. The demo only
