@@ -242,7 +242,7 @@ func TestHelixChannelRealModel_M3StreamingE2E(t *testing.T) {
 		// break the CI pipeline; the architectural proof (AES
 		// wire → decrypted SSE) is what matters here.
 		if strings.Contains(statusLine, " 401 ") || strings.Contains(statusLine, " 403 ") {
-			t.Skipf("upstream rejected credentials (key revoked / model retired); v18714-5 wire verified, key refresh required — operator action: rotate 1Password item HelixonSafe/ripotpfq43jzlreor4zo2ay734 (minimax-api-1). status=%s", statusLine)
+			t.Skipf("upstream rejected credentials (key revoked / model retired); v18714-5 wire verified, key refresh required — operator action: rotate the 1Password item named in $HOME/.config/runx/owners.yaml. status=%s", statusLine)
 		}
 		// 4xx other than 401/403 → dump the buffer for triage.
 		t.Fatalf("non-200 status %q (elapsed=%s, dataChunks=%d, rawBuf=%d bytes)\n--- raw response ---\n%s\n--- end raw response ---",

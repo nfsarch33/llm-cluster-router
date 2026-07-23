@@ -9,7 +9,7 @@
 #   - warn     → logged + dashboard annotation, no page
 #
 # These rules are loaded by the llm-cluster-router production
-# Prometheus (vLLM / wsl2 cluster, Grafana :3000). Keep the
+# Prometheus (vLLM on the primary GPU host, Grafana :3000). Keep the
 # `for:` clauses conservative; we are not measuring SLI SLOs in
 # this file, only alerting on outright wire-modification events and
 # channel silence.
