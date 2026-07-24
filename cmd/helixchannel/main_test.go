@@ -518,6 +518,241 @@ func repoRoot(t *testing.T) string {
 	return root
 }
 
+// TestStatusUpstreamMinimax_EmitsEnvelopeWithModelAndURL (v18741-1, TDD-RED).
+//
+// Asserts that `helixchannel status --upstream minimax` prints a JSON
+// envelope with at least:
+//
+//   - upstream = "minimax"
+//   - model = "MiniMax-M3" (the canonical v18688-1 model for the live
+//     wire — MiniMax-M3 is the China-mainland token-plan model id)
+//   - api_base = "https://api.minimaxi.com/v1" (NOT api.minimax.io —
+//     we are on the Chinese platform per `00-p0-minimaxi-com-only.mdc`)
+//   - api_key_set (bool) — reflects whether the MINIMAX_API_KEY env
+//     var was readable; the value itself is NEVER printed
+//     (anti-shell-leak per no-shell-leak.mdc).
+//   - probed_at (RFC3339Nano)
+//
+// Exit code 0. Failure here blocks v18741-3 (SC1 closure) per the
+// `cmd/helixchannel status --upstream minimax` TDD gate.
+func TestStatusUpstreamMinimax_EmitsEnvelopeWithModelAndURL(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	// Inject a deterministic MINIMAX_API_KEY so the test is not
+	// environment-dependent; the assertion is on `api_key_set=true`
+	// (length > 0), not on the value (anti-shell-leak).
+	cmd := exec.Command(bin, "status", "--upstream", "minimax")
+	cmd.Env = append(os.Environ(), "MINIMAX_API_KEY=dummy-v18741-not-a-real-key")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("status --upstream minimax exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env struct {
+		Upstream  string `json:"upstream"`
+		Model     string `json:"model"`
+		APIBase   string `json:"api_base"`
+		APIKeySet bool   `json:"api_key_set"`
+		ProbedAt  string `json:"probed_at"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("status stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Upstream != "minimax" {
+		t.Errorf("upstream = %q, want minimax", env.Upstream)
+	}
+	if env.Model != "MiniMax-M3" {
+		t.Errorf("model = %q, want MiniMax-M3", env.Model)
+	}
+	if env.APIBase != "https://api.minimaxi.com/v1" {
+		t.Errorf("api_base = %q, want https://api.minimaxi.com/v1 (NOT api.minimax.io)", env.APIBase)
+	}
+	if !env.APIKeySet {
+		t.Errorf("api_key_set = false, want true (env was injected)")
+	}
+	if env.ProbedAt == "" {
+		t.Errorf("probed_at is empty; want RFC3339Nano timestamp")
+	}
+	// Anti-shell-leak: the stdout JSON MUST NOT contain the literal
+	// Anti-shell-leak: the API key value MUST NOT appear in stdout.
+	if strings.Contains(stdout.String(), "dummy-v18741-not-a-real-key") {
+		t.Fatalf("status stdout leaked injected API key: %s", stdout.String())
+	}
+}
+
+// TestStatusUpstreamMinimax_ReportsKeySetFalseWhenMissing (v18741-1).
+//
+// Asserts that without MINIMAX_API_KEY in env, `status --upstream minimax`
+// still prints the envelope but reports api_key_set=false. The
+// binary does NOT error (the operator can probe the wire even before
+// rotating a fresh key); it just signals the missing-config state.
+func TestStatusUpstreamMinimax_ReportsKeySetFalseWhenMissing(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	// Build a minimal env that strips MINIMAX_API_KEY even if the
+	// parent shell has it set.
+	envClean := os.Environ()
+	clean := make([]string, 0, len(envClean))
+	for _, e := range envClean {
+		if !strings.HasPrefix(e, "MINIMAX_API_KEY=") {
+			clean = append(clean, e)
+		}
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "status", "--upstream", "minimax")
+	cmd.Env = clean
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("status --upstream minimax (missing key) exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env struct {
+		APIKeySet bool `json:"api_key_set"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("status stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.APIKeySet {
+		t.Errorf("api_key_set = true with MINIMAX_API_KEY stripped from env; want false")
+	}
+}
+
+// TestStatusUpstream_UnknownUpstreamFails (v18741-1).
+//
+// Asserts that `status --upstream <unknown>` exits non-zero with a
+// structured JSON envelope on stderr naming the unknown upstream.
+func TestStatusUpstream_UnknownUpstreamFails(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "status", "--upstream", "no-such-upstream-v18741")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("status --upstream no-such-upstream-v18741 must exit non-zero; got 0")
+	}
+	if !strings.Contains(stderr.String(), "no-such-upstream-v18741") {
+		t.Errorf("stderr should name the unknown upstream; got: %q", stderr.String())
+	}
+}
+
+// ---------------------------------------------------------------------
+// v18741-4: doctor --channel <aes-mtls|prefer-socks5>
+// ---------------------------------------------------------------------
+
+// doctorEnvelope mirrors the production doctor JSON shape so the
+// tests catch drift.
+type doctorEnvelopeTest struct {
+	Checks  map[string]string `json:"checks"`
+	Channel string            `json:"channel,omitempty"`
+}
+
+// TestDoctorChannelPreferSocks5_PassKeyPresent (v18741-4, TDD-RED).
+//
+// Asserts that `helixchannel doctor --channel prefer-socks5` prints
+// a JSON envelope that:
+//   - exposes `channel: "prefer-socks5"`
+//   - reports `prefer_socks5: pass` when SOCKS5 listener factory is
+//     wired (the proxy.Register call below proves it; this test is
+//     pinning the operator-facing surface, not re-running the smoke).
+//   - keeps the existing checks (release_gate_script, adr_085, etc.)
+//     intact.
+//
+// Exit code 0.
+func TestDoctorChannelPreferSocks5_PassKeyPresent(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "doctor", "--channel", "prefer-socks5")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("doctor --channel prefer-socks5 exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env doctorEnvelopeTest
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("doctor stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Channel != "prefer-socks5" {
+		t.Errorf("channel = %q, want prefer-socks5", env.Channel)
+	}
+	got, ok := env.Checks["prefer_socks5"]
+	if !ok {
+		t.Fatalf("doctor envelope missing prefer_socks5 check; got keys: %v", env.Checks)
+	}
+	if got != "pass" {
+		t.Errorf("prefer_socks5 = %q, want pass (the proxy package is imported by this binary; the SOCKS5 factory is wired)", got)
+	}
+	// Backward-compat: existing checks must still be there.
+	for _, name := range []string{"release_gate_script", "adr_085", "helixchannel_env", "aes_key", "observability"} {
+		if _, ok := env.Checks[name]; !ok {
+			t.Errorf("doctor envelope lost legacy check %q; channel flag should not regress other checks", name)
+		}
+	}
+}
+
+// TestDoctorChannelAesMtls_DefaultChannel (v18741-4).
+//
+// Asserts that `helixchannel doctor` (no --channel) defaults to
+// aes-mtls and emits channel: "aes-mtls".
+func TestDoctorChannelAesMtls_DefaultChannel(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "doctor")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("doctor (default) exited non-zero: %v (stderr=%q)", err, stderr.String())
+	}
+	var env doctorEnvelopeTest
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("doctor stdout not JSON: %v\nstdout=%q", err, stdout.String())
+	}
+	if env.Channel != "aes-mtls" {
+		t.Errorf("default channel = %q, want aes-mtls", env.Channel)
+	}
+}
+
+// TestDoctorChannelUnknown_Fails (v18741-4).
+//
+// Asserts that an unknown --channel value exits non-zero with a
+// structured error message naming the bad value.
+func TestDoctorChannelUnknown_Fails(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "doctor", "--channel", "no-such-channel-v18741")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("doctor --channel no-such-channel-v18741 must exit non-zero; got 0")
+	}
+	if !strings.Contains(stderr.String(), "no-such-channel-v18741") {
+		t.Errorf("stderr should name the bad channel; got: %q", stderr.String())
+	}
+}
+
 // envelope is the JSON envelope for the `version` subcommand.
 // Mirrors the production struct so the test catches JSON drift.
 type envelope struct {
@@ -542,4 +777,122 @@ func buildHelixchannelBinary(t *testing.T, root string) string {
 		t.Fatalf("go build ./cmd/helixchannel failed: %v\n%s", err, out)
 	}
 	return bin
+}
+
+// TestKiloVerify_EnvKeySet_NoTLSSkip (v18742-1 / v18742-2 TDD-RED).
+//
+// Asserts that `helixchannel kilo-verify` prints a JSON envelope (even
+// on TLS-cert failure, which is the v18716 bug being diagnosed) that
+// contains api_base + tls_skip=false + key_source="env", and that the
+// KILO_CODE_API_KEY value NEVER appears anywhere in stdout/stderr.
+// The exit code may be non-zero when the live probe fails (e.g. the
+// hostname cert is currently invalid); the contract is that the
+// envelope is well-formed and the key does NOT leak.
+func TestKiloVerify_EnvKeySet_NoTLSSkip(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "kilo-verify")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "KILO_CODE_API_KEY=dummy-illegal-test-key-do-not-leak")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	// We do NOT require exit 0 here: the live probe may fail with a
+	// TLS cert error (the v18716 bug). The envelope must still be valid.
+	_ = cmd.Run()
+
+	out := stdout.String()
+	// Anti-shell-leak: the key value MUST NOT appear anywhere.
+	if strings.Contains(out, "dummy-illegal-test-key-do-not-leak") {
+		t.Fatalf("SHELL LEAK: KILO_CODE_API_KEY value leaked to stdout:\n%s", out)
+	}
+	if strings.Contains(stderr.String(), "dummy-illegal-test-key-do-not-leak") {
+		t.Fatalf("SHELL LEAK: KILO_CODE_API_KEY value leaked to stderr:\n%s", stderr.String())
+	}
+
+	// Envelope must be valid JSON with the expected fields.
+	var env map[string]any
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("kilo-verify output is not valid JSON: %v\n%s", err, out)
+	}
+	if got, _ := env["key_source"].(string); got != "env" {
+		t.Fatalf("key_source: want env, got %v (full envelope: %v)", env["key_source"], env)
+	}
+	if got, _ := env["tls_skip"].(bool); got {
+		t.Fatalf("tls_skip: want false (default), got true (full envelope: %v)", env)
+	}
+	if got, _ := env["api_base"].(string); got != "https://helixchannel.cylrl.dev/v1" {
+		t.Fatalf("api_base: want https://helixchannel.cylrl.dev/v1, got %v", env["api_base"])
+	}
+}
+
+// TestKiloVerify_TLSSkipFlag (v18742-2 TDD-RED).
+//
+// Asserts that `helixchannel kilo-verify --tls-skip` sets tls_skip=true
+// in the envelope and does NOT exit non-zero purely on TLS cert failure.
+func TestKiloVerify_TLSSkipFlag(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "kilo-verify", "--tls-skip")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "KILO_CODE_API_KEY=dummy-test-skip")
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	// We do NOT require exit 0 here — the live probe may still fail
+	// with network errors. The single thing we assert is that the
+	// envelope records tls_skip=true.
+	if err := cmd.Run(); err != nil {
+		// Acceptable: probe reached network error; we still got an envelope.
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "\"tls_skip\": true") {
+		t.Fatalf("expected tls_skip: true in envelope, got:\n%s", out)
+	}
+	if strings.Contains(out, "dummy-test-skip") {
+		t.Fatalf("SHELL LEAK: KILO_CODE_API_KEY value leaked:\n%s", out)
+	}
+}
+
+// TestKiloVerify_NoKey_Fails (v18742-1 TDD-RED).
+//
+// Asserts that kilo-verify without KILO_CODE_API_KEY and without
+// --from-1password exits non-zero and reports key_source="missing" in
+// the envelope. Anti-shell-leak still holds.
+func TestKiloVerify_NoKey_Fails(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+	bin := buildHelixchannelBinary(t, root)
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(bin, "kilo-verify")
+	cmd.Dir = root
+	// Strip KILO_CODE_API_KEY explicitly.
+	env := os.Environ()
+	filtered := env[:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "KILO_CODE_API_KEY=") {
+			filtered = append(filtered, kv)
+		}
+	}
+	cmd.Env = filtered
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("kilo-verify without KILO_CODE_API_KEY should exit non-zero, got exit 0\nstdout=%s", stdout.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "\"key_source\": \"missing\"") {
+		t.Fatalf("expected key_source: missing in envelope, got:\n%s", out)
+	}
 }
