@@ -673,7 +673,43 @@ func TestRealModelRoundTrip_HermeticSOCKS5_ChatCompletions(t *testing.T) {
 	)
 	gotModel.Store("")
 	gotMessages.Store([]chatCompletionsMessage{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newHermeticChatUpstream(&gotModel, &gotMessages)
+	defer upstream.Close()
+
+	// 2. Build a SOCKS5 bridge that proxies the conn through to
+	// the upstream. The bridge is a local TCP listener that, on
+	// each Accept, handshakes as a SOCKS5 server and pipes the
+	// downstream conn to the httptest upstream.
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen socks5: %v", err)
+	}
+	defer socksLn.Close()
+	runSocks5Bridge(socksLn, upstream.Listener.Addr().String())
+
+	// 3. Dial the SOCKS5 bridge and exercise the round-trip.
+	conn, err := dialSOCKS5AndChat(t, socksLn.Addr().String(),
+		upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dialSOCKS5AndChat: %v", err)
+	}
+	defer conn.Close()
+
+	// 4. Assert the upstream saw the model + messages we sent.
+	if got := gotModel.Load().(string); got != "v18735-1-real-model" {
+		t.Fatalf("upstream saw model = %q, want v18735-1-real-model", got)
+	}
+	gotMsgs := gotMessages.Load().([]chatCompletionsMessage)
+	if len(gotMsgs) != 1 || gotMsgs[0].Content != "v18735-1-ping-from-realconn-test" {
+		t.Fatalf("upstream saw messages = %+v, want 1 user ping", gotMsgs)
+	}
+}
+
+// newHermeticChatUpstream builds an httptest server that mimics the
+// OpenAI-compatible chat-completions shape and records the inbound
+// model + messages via the supplied atomic.Value slots.
+func newHermeticChatUpstream(gotModel, gotMessages *atomic.Value) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatCompletionsFixture
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -699,59 +735,55 @@ func TestRealModelRoundTrip_HermeticSOCKS5_ChatCompletions(t *testing.T) {
 			},
 		})
 	}))
-	defer upstream.Close()
+}
 
-	// 2. Build a SOCKS5 bridge: a local TCP listener that, on
-	// each Accept, handshakes as a SOCKS5 server and pipes the
-	// downstream conn to the httptest upstream.
-	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen socks5: %v", err)
-	}
-	defer socksLn.Close()
-
+// runSocks5Bridge accepts connections on socksLn, handshakes each as
+// a SOCKS5 server, and pipes bytes bidirectionally to upstreamAddr.
+func runSocks5Bridge(socksLn net.Listener, upstreamAddr string) {
 	go func() {
 		for {
 			c, err := socksLn.Accept()
 			if err != nil {
 				return
 			}
-			go func(client net.Conn) {
-				defer client.Close()
-				if err := socks5AcceptNoAuth(client); err != nil {
-					return
-				}
-				// Dial the upstream through a pipe (no TLS
-				// because httptest.NewServer is plain HTTP).
-				up, err := net.Dial("tcp", upstream.Listener.Addr().String())
-				if err != nil {
-					return
-				}
-				// Bidirectional pipe. We must NOT defer
-				// Close on `up` because the deferred Close
-				// on `client` already covers the bridge
-				// teardown. We block on either copy
-				// completing (which means one side
-				// closed) and then return; the outer
-				// defer client.Close() then runs.
-				done := make(chan struct{}, 2)
-				go func() { _, _ = io.Copy(up, client); done <- struct{}{} }()
-				go func() { _, _ = io.Copy(client, up); done <- struct{}{} }()
-				<-done
-				up.Close()
-			}(c)
+			go socks5BridgeConn(c, upstreamAddr)
 		}
 	}()
+}
 
-	// 3. Dial the SOCKS5 bridge with the project's SOCKS5 client
-	// and send a chat-completions request.
+// socks5BridgeConn handles one SOCKS5 connection: handshake, dial
+// upstream, bidirectional copy, teardown.
+func socks5BridgeConn(client net.Conn, upstreamAddr string) {
+	defer client.Close()
+	if err := socks5AcceptNoAuth(client); err != nil {
+		return
+	}
+	up, err := net.Dial("tcp", upstreamAddr)
+	if err != nil {
+		return
+	}
+	// Bidirectional pipe. We must NOT defer Close on `up` because
+	// the deferred Close on `client` already covers the bridge
+	// teardown. We block on either copy completing (which means
+	// one side closed) and then return.
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(up, client); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(client, up); done <- struct{}{} }()
+	<-done
+	up.Close()
+}
+
+// dialSOCKS5AndChat dials the SOCKS5 bridge, sends a chat-completions
+// request, and asserts the upstream returned a non-empty choice
+// content matching the hermetic fixture. Returns the open conn for
+// the caller to defer-close.
+func dialSOCKS5AndChat(t *testing.T, socksAddr, upstreamAddr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := dialHermeticSOCKS5(ctx, socksLn.Addr().String(), "upstream.test:80")
+	conn, err := dialHermeticSOCKS5(ctx, socksAddr, "upstream.test:80")
 	if err != nil {
-		t.Fatalf("dialHermeticSOCKS5: %v", err)
+		return nil, fmt.Errorf("dialHermeticSOCKS5: %w", err)
 	}
-	defer conn.Close()
 	// 5s read deadline so the test fails fast if httptest
 	// misbehaves instead of hanging at ReadString.
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -771,27 +803,35 @@ func TestRealModelRoundTrip_HermeticSOCKS5_ChatCompletions(t *testing.T) {
 			"Authorization: Bearer v18735-1-redacted\r\n"+
 			"Connection: close\r\n"+
 			"\r\n%s",
-		upstream.Listener.Addr().String(), len(reqBody), reqBody,
+		upstreamAddr, len(reqBody), reqBody,
 	)
 	if _, err := conn.Write([]byte(req)); err != nil {
-		t.Fatalf("conn.Write: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("conn.Write: %w", err)
 	}
+	if err := readChatResponse(t, conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
 
-	// 4. Read the full HTTP response back through the SOCKS5
-	// bridge.
+// readChatResponse drains the HTTP/1.1 status, headers, and body
+// from conn and asserts the upstream returned the hermetic
+// v18735-1-pong-from-hermetic-upstream content.
+func readChatResponse(t *testing.T, conn net.Conn) error {
 	br := bufio.NewReader(conn)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read status: %v", err)
+		return fmt.Errorf("read status: %w", err)
 	}
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
-		t.Fatalf("status line = %q, want HTTP/1.1 200", statusLine)
+		return fmt.Errorf("status line = %q, want HTTP/1.1 200", statusLine)
 	}
-	// Drain headers.
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			t.Fatalf("read header: %v", err)
+			return fmt.Errorf("read header: %w", err)
 		}
 		if line == "\r\n" || line == "\n" {
 			break
@@ -799,7 +839,7 @@ func TestRealModelRoundTrip_HermeticSOCKS5_ChatCompletions(t *testing.T) {
 	}
 	body, err := io.ReadAll(br)
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		return fmt.Errorf("read body: %w", err)
 	}
 	var resp struct {
 		Choices []struct {
@@ -809,24 +849,16 @@ func TestRealModelRoundTrip_HermeticSOCKS5_ChatCompletions(t *testing.T) {
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		t.Fatalf("unmarshal body: %v", err)
+		return fmt.Errorf("unmarshal body: %w", err)
 	}
 	if len(resp.Choices) == 0 {
-		t.Fatalf("response had no choices; body=%s", body)
+		return fmt.Errorf("response had no choices; body=%s", body)
 	}
 	if resp.Choices[0].Message.Content != "v18735-1-pong-from-hermetic-upstream" {
-		t.Fatalf("response content = %q, want v18735-1-pong-from-hermetic-upstream",
+		return fmt.Errorf("response content = %q, want v18735-1-pong-from-hermetic-upstream",
 			resp.Choices[0].Message.Content)
 	}
-
-	// 5. Assert the upstream saw the model + messages we sent.
-	if got := gotModel.Load().(string); got != "v18735-1-real-model" {
-		t.Fatalf("upstream saw model = %q, want v18735-1-real-model", got)
-	}
-	gotMsgs := gotMessages.Load().([]chatCompletionsMessage)
-	if len(gotMsgs) != 1 || gotMsgs[0].Content != "v18735-1-ping-from-realconn-test" {
-		t.Fatalf("upstream saw messages = %+v, want 1 user ping", gotMsgs)
-	}
+	return nil
 }
 
 // dialHermeticSOCKS5 performs a SOCKS5 CONNECT to proxyAddr targeting
@@ -894,38 +926,34 @@ func dialHermeticSOCKS5(ctx context.Context, proxyAddr, hostport string) (net.Co
 		c.Close()
 		return nil, fmt.Errorf("socks5 connect reply REP=%d", reply[1])
 	}
-	switch reply[3] {
-	case 0x01:
-		// IPv4: 4 bytes addr + 2 bytes port
-		discard := make([]byte, 6)
-		if _, err := io.ReadFull(c, discard); err != nil {
-			c.Close()
-			return nil, err
-		}
-	case 0x03:
-		// Domain: 1 byte length + N bytes + 2 bytes port
-		var lbuf [1]byte
-		if _, err := io.ReadFull(c, lbuf[:]); err != nil {
-			c.Close()
-			return nil, err
-		}
-		discard := make([]byte, int(lbuf[0])+2)
-		if _, err := io.ReadFull(c, discard); err != nil {
-			c.Close()
-			return nil, err
-		}
-	case 0x04:
-		// IPv6: 16 bytes + 2 bytes
-		discard := make([]byte, 18)
-		if _, err := io.ReadFull(c, discard); err != nil {
-			c.Close()
-			return nil, err
-		}
-	default:
+	if err := discardSOCKS5Addr(c, reply[3]); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("socks5 connect reply ATYP=%d", reply[3])
+		return nil, err
 	}
 	return c, nil
+}
+
+// discardSOCKS5Addr reads and discards the variable-length bind
+// address that follows a SOCKS5 reply header. The number of bytes
+// depends on ATYP: 6 (IPv4), 1+N+2 (domain), 18 (IPv6).
+func discardSOCKS5Addr(c net.Conn, atyp byte) error {
+	switch atyp {
+	case 0x01:
+		_, err := io.ReadFull(c, make([]byte, 6))
+		return err
+	case 0x03:
+		var lbuf [1]byte
+		if _, err := io.ReadFull(c, lbuf[:]); err != nil {
+			return err
+		}
+		_, err := io.ReadFull(c, make([]byte, int(lbuf[0])+2))
+		return err
+	case 0x04:
+		_, err := io.ReadFull(c, make([]byte, 18))
+		return err
+	default:
+		return fmt.Errorf("socks5 connect reply ATYP=%d", atyp)
+	}
 }
 
 func parsePort(s string) (int, error) {
@@ -973,26 +1001,8 @@ func socks5AcceptNoAuth(c net.Conn) error {
 	if req[0] != 0x05 || req[1] != 0x01 {
 		return fmt.Errorf("socks5 server: bad request VER=%d CMD=%d", req[0], req[1])
 	}
-	switch req[3] {
-	case 0x01:
-		discard := make([]byte, 4+2)
-		if _, err := io.ReadFull(c, discard); err != nil {
-			return fmt.Errorf("socks5 server: read ipv4 bnd: %w", err)
-		}
-	case 0x03:
-		var l [1]byte
-		if _, err := io.ReadFull(c, l[:]); err != nil {
-			return fmt.Errorf("socks5 server: read domain len: %w", err)
-		}
-		if _, err := io.ReadFull(c, make([]byte, int(l[0])+2)); err != nil {
-			return fmt.Errorf("socks5 server: read domain bnd: %w", err)
-		}
-	case 0x04:
-		if _, err := io.ReadFull(c, make([]byte, 16+2)); err != nil {
-			return fmt.Errorf("socks5 server: read ipv6 bnd: %w", err)
-		}
-	default:
-		return fmt.Errorf("socks5 server: bad ATYP=%d", req[3])
+	if err := readSOCKS5ClientAddr(c, req[3]); err != nil {
+		return err
 	}
 	// Send a CONNECT success reply per RFC 1928 §6: VER=5, REP=0,
 	// RSV=0, ATYP=1 (IPv4), BND.ADDR=0.0.0.0, BND.PORT=0.
@@ -1000,4 +1010,27 @@ func socks5AcceptNoAuth(c net.Conn) error {
 		return fmt.Errorf("socks5 server: write connect reply: %w", err)
 	}
 	return nil
+}
+
+// readSOCKS5ClientAddr reads and discards the variable-length
+// destination address from a SOCKS5 CONNECT request. The number of
+// bytes depends on ATYP: 6 (IPv4), 1+N+2 (domain), 18 (IPv6).
+func readSOCKS5ClientAddr(c net.Conn, atyp byte) error {
+	switch atyp {
+	case 0x01:
+		_, err := io.ReadFull(c, make([]byte, 4+2))
+		return err
+	case 0x03:
+		var l [1]byte
+		if _, err := io.ReadFull(c, l[:]); err != nil {
+			return err
+		}
+		_, err := io.ReadFull(c, make([]byte, int(l[0])+2))
+		return err
+	case 0x04:
+		_, err := io.ReadFull(c, make([]byte, 16+2))
+		return err
+	default:
+		return fmt.Errorf("socks5 server: bad ATYP=%d", atyp)
+	}
 }
