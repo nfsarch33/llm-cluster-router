@@ -199,13 +199,16 @@ mistaken nginx config):
 
 1. **DNS rollback** (operator can run from any host):
    ```bash
-   KEY=$(op read op://HelixonSafe/<dreamhost-item-uuid>/<api-key-field-uuid> --out-file -f /tmp/.dh-key && cat /tmp/.dh-key && rm -f /tmp/.dh-key)
-   curl -sS --data-urlencode "key=$KEY" \
+   # Dreamhost API key via file-based op read (no argv substitution):
+   op read op://HelixonSafe/<dreamhost-item-uuid>/<api-key-field-uuid> \
+     --out-file -f /tmp/.dh-key
+   curl -sS --data-urlencode "key=$(cat /tmp/.dh-key)" \
      --data-urlencode "cmd=dns-remove_record" \
      --data-urlencode "record=helixchannel" \
      --data-urlencode "type=A" \
      --data-urlencode "value=52.64.8.153" \
      https://api.dreamhost.com/
+   rm -f /tmp/.dh-key
    ```
 2. **Nginx fallback** (Lightsail box): the binary clients keep the
    raw-IP fallback. Set `HELIXCHANNEL_BASE_URL=https://52.64.8.153`
