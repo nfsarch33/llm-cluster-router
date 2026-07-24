@@ -102,6 +102,10 @@ func main() {
 		if err := runTailnetAllowlist(os.Args[2:]); err != nil {
 			fail("tailnet-allowlist", err)
 		}
+	case "port-check":
+		if err := runPortCheck(os.Args[2:]); err != nil {
+			fail("port-check", err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -109,7 +113,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|cipher-list|cert-pin|tailnet-allowlist>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s <version|factory-probe|key-check|header-stamp|doctor|endpoint-check|cipher-list|cert-pin|tailnet-allowlist|port-check>\n", os.Args[0])
 }
 
 // fail prints a small JSON envelope to stderr describing the
@@ -1020,4 +1024,177 @@ func runTailnetAllowlist(args []string) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------
+// v18731-3: port-check (central service registry port-conflict probe)
+//
+// The HelixChannel production wire binds a small set of ports on the
+// operator host (443 TLS terminator, 22 legacy SSH SOCKS5, 14443
+// tunneld-internal on Lightsail). When the central service registry
+// `svcregistryd` (helixon-platform/internal/svcregistry) sees two
+// registrations on the same (host, port) pair it returns HTTP 409.
+//
+// The `port-check` subcommand is the operator-facing preflight
+// against the live registry. It lists currently-registered services
+// from `/api/v1/services`, queries `/api/v1/conflicts` for current
+// collisions, and — when `--probe` is supplied — POSTs a synthetic
+// `(host, port)` registration to confirm the daemon still returns
+// 409. This is the regression surface for the v18731-3 plan bullet.
+//
+// Flags:
+//
+//	--registry-url   svcregistryd HTTP base URL
+//	                 (default "http://127.0.0.1:7777"). On
+//	                 wsl1 the daemon lives on Tailscale IP
+//	                 100.84.108.92:7777.
+//	--host           host used for the --probe POST
+//	                 (default "127.0.0.1")
+//	--port           port used for the --probe POST
+//	                 (default "14443")
+//	--probe          when set, POST the synthetic (host, port)
+//	                 registration and assert 409
+//	--probe-timeout  dial+request timeout (default 5s, cap 30s)
+//
+// Exit codes:
+//
+//	0  - envelope emitted (registry reachable)
+//	1  - registry unreachable / transport error
+//	2  - probe expected 409 but got a different status
+//
+// Anti-shell-leak: this subcommand never prints credentials; the
+// `--registry-url` may include a bearer token in practice but this
+// binary does not exercise that path.
+// ---------------------------------------------------------------------
+
+// portCheckEnvelope is the JSON envelope emitted by `port-check`.
+type portCheckEnvelope struct {
+	RegistryURL    string         `json:"registry_url"`
+	Host           string         `json:"host"`
+	Port           int            `json:"port"`
+	Probe          bool           `json:"probe"`
+	ServicesCount  int            `json:"services_count"`
+	ConflictsCount int            `json:"conflicts_count"`
+	Conflicts      map[string]int `json:"conflicts,omitempty"`
+	ProbeStatus    int            `json:"probe_status,omitempty"`
+	ProbeBody      string         `json:"probe_body,omitempty"`
+	ProbeExpected  int            `json:"probe_expected,omitempty"`
+	ProbePassed    *bool          `json:"probe_passed,omitempty"`
+	ProbedAt       string         `json:"probed_at"`
+}
+
+// runPortCheck issues GET /api/v1/services, GET /api/v1/conflicts,
+// and — if --probe is set — POST /api/v1/services with a synthetic
+// (host, port) registration. The probe asserts HTTP 409 from the
+// live daemon; if the registry is reachable but the collision rule
+// regressed the subcommand exits 2.
+func runPortCheck(args []string) error {
+	fs := flag.NewFlagSet("port-check", flag.ContinueOnError)
+	registryURL := fs.String("registry-url", "http://127.0.0.1:7777", "svcregistryd HTTP base URL")
+	host := fs.String("host", "127.0.0.1", "host used for --probe POST")
+	port := fs.Int("port", 14443, "port used for --probe POST")
+	probe := fs.Bool("probe", false, "POST a synthetic (host, port) registration and assert 409")
+	probeTimeout := fs.Duration("probe-timeout", 5*time.Second, "dial+request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *probeTimeout <= 0 || *probeTimeout > 30*time.Second {
+		*probeTimeout = 5 * time.Second
+	}
+
+	httpClient := &http.Client{Timeout: *probeTimeout}
+	env := portCheckEnvelope{
+		RegistryURL: *registryURL,
+		Host:        *host,
+		Port:        *port,
+		Probe:       *probe,
+		ProbedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+	}
+
+	// Step 1: GET /api/v1/services
+	svcBody, status, err := httpGetJSON(httpClient, *registryURL+"/api/v1/services")
+	if err != nil {
+		return fmt.Errorf("GET /api/v1/services: %w", err)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("GET /api/v1/services: status=%d body=%s", status, svcBody)
+	}
+	var svcs []struct {
+		Name string `json:"name"`
+		Host string `json:"host"`
+		Port int    `json:"port"`
+	}
+	if err := json.Unmarshal([]byte(svcBody), &svcs); err != nil {
+		return fmt.Errorf("decode services JSON: %w", err)
+	}
+	env.ServicesCount = len(svcs)
+
+	// Step 2: GET /api/v1/conflicts
+	confBody, confStatus, err := httpGetJSON(httpClient, *registryURL+"/api/v1/conflicts")
+	if err != nil {
+		return fmt.Errorf("GET /api/v1/conflicts: %w", err)
+	}
+	if confStatus != http.StatusOK {
+		// The endpoint may return 200 with "null" or 200 with a JSON
+		// object; anything else is treated as an error.
+		return fmt.Errorf("GET /api/v1/conflicts: status=%d body=%s", confStatus, confBody)
+	}
+	var conflicts map[string]int
+	if err := json.Unmarshal([]byte(confBody), &conflicts); err != nil {
+		// "null" parses to an empty map; tolerate it.
+		conflicts = map[string]int{}
+	}
+	env.ConflictsCount = len(conflicts)
+	env.Conflicts = conflicts
+
+	// Step 3: optional --probe POST
+	if *probe {
+		body := fmt.Sprintf(`{"name":"port-check-probe-v18731","host":%q,"port":%d,"protocol":"tcp","owner":"cursor-v18731","status":"up"}`,
+			*host, *port)
+		req, err := http.NewRequest(http.MethodPost, *registryURL+"/api/v1/services", strings.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("build probe POST: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("probe POST: %w", err)
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(resp.Body)
+		env.ProbeStatus = resp.StatusCode
+		env.ProbeBody = strings.TrimSpace(string(rb))
+		env.ProbeExpected = http.StatusConflict
+		probePassed := resp.StatusCode == http.StatusConflict
+		env.ProbePassed = &probePassed
+	}
+
+	out, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, string(out))
+
+	if *probe && env.ProbeStatus != http.StatusConflict {
+		return fmt.Errorf("probe expected status=%d, got=%d",
+			http.StatusConflict, env.ProbeStatus)
+	}
+	return nil
+}
+
+// httpGetJSON wraps http.Get so the caller can read the body once and
+// inspect the status code without leaking the connection state. The
+// caller is responsible for closing resp.Body when this helper
+// returns an error (it does so internally before returning).
+func httpGetJSON(client *http.Client, url string) (string, int, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", resp.StatusCode, err
+	}
+	return string(body), resp.StatusCode, nil
 }
