@@ -2,3 +2,23 @@
 # Use the gitleaks fingerprint hash (NOT the rule ID), one per line.
 # Format: <fingerprint>  # <rationale - one sentence>
 # See: ~/.cursor/rules/00-p0-secrets-pre-push-hook.mdc
+
+# Rationale: synthetic test fixture for redaction_test.go; the literal
+# is a placeholder marker (not a real 1Password service-account JWT).
+# The test exercises the Redact() function's ability to scrub
+# 1Password-JWT-prefixed strings.
+f24f580867f266264e0e09b968d7cb13cee9e2cb:internal/proxy/observability/redaction_test.go:ops-ey-jwt:33
+
+# Rationale: duplicate of above (same fixture in second commit during
+# v18710-2 PR merge); both are placeholder test strings.
+74b6a712964eefcc64ae9da02a0155b246b8035f:internal/proxy/observability/redaction_test.go:ops-ey-jwt:33
+
+# Rationale: synthetic test fixture in fairshare_test.go line 152; the
+# literal sk-abc123secret is a placeholder, not a real API key. The
+# test exercises OpenAI-key handling code paths.
+ced3351626c1008a99a92b1dc1c541a4275fe5cd:internal/fairshare/fairshare_test.go:generic-api-key:152
+
+# Rationale: synthetic test fixture in main_test.go line 460; the
+# literal sk-expanded-123 is a placeholder env-var value used to
+# validate the agent env-var propagation test harness.
+d3815edcc3f930225c4a1a77afbaa08cb6e29122:main_test.go:generic-api-key:460
