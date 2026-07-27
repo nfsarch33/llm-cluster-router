@@ -105,6 +105,23 @@ type NodeConfig struct {
 	Models   []string `yaml:"models"`
 	APIKey   string   `yaml:"api_key"`
 	APIKeys  []string `yaml:"api_keys"`
+	// Vendor is the canonical upstream type. Empty (or "openai_compat") means the
+	// existing LocalOpenAICompatible path; values like "minimax" toggle the
+	// vendor-specific URL builder, auth header, and quota classifier.
+	//
+	// This field is additive and ignored by older router builds, so adding a
+	// `vendor:` line to an existing YAML never breaks existing peers.
+	Vendor string `yaml:"vendor"`
+	// EnabledVendor (string, not bool, matches the rest of this struct)
+	// toggles participation when Vendor is non-empty. Set to "true" to
+	// register the vendor peer in the active routing pool; "false" (or
+	// omitted) leaves the peer unreachable but parseable.
+	EnabledVendor string `yaml:"enabled_vendor"`
+	// QuotaDetectRegex, when non-empty, is the regular expression applied to
+	// 4xx/5xx response bodies to flag the response as a quota event. A quota
+	// event triggers the route's fallback chain and increments
+	// `quota_fallback_total` so an operator can alert on a flat line.
+	QuotaDetectRegex string `yaml:"quota_detect_regex"`
 	Priority int      `yaml:"priority"`
 	// Circuit optionally overrides the global Defaults.Circuit tuning for this
 	// single upstream. Unset (zero) fields inherit the global default.
