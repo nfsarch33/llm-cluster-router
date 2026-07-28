@@ -90,7 +90,7 @@ const helixChannelRealModelTimeout = 60 * time.Second
 func TestHelixChannelRealModel_M3StreamingE2E(t *testing.T) {
 	apiKey := strings.TrimSpace(os.Getenv(helixChannelRealModelAPIKeyEnv))
 	if apiKey == "" {
-		t.Skipf("%s env var not set — v18714-5 SKIP (operator: rotate 1Password item HelixonSafe/ripotpfq43jzlreor4zo2ay734)", helixChannelRealModelAPIKeyEnv)
+		t.Skipf("%s env var not set — v18714-5 SKIP (operator: rotate 1Password item HelixonSafe/<uuid>)", helixChannelRealModelAPIKeyEnv)
 	}
 
 	upstream := strings.TrimSpace(os.Getenv(helixChannelRealModelURLEnv))

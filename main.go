@@ -46,6 +46,7 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/gpuprobe"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
+	"github.com/nfsarch33/llm-cluster-router/internal/quota"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
 	"github.com/nfsarch33/llm-cluster-router/internal/tunnel"
@@ -1559,3 +1560,10 @@ func errorString(err error) string {
 }
 
 var _ = httputil.ReverseProxy{}
+
+// quotaDetectorForNode returns a quota.Detector for the given node, or nil
+// if the node has no quota pattern configured. The webhook URL/channel are
+// resolved from the global config. The helper is package-private so callers
+// can simply call quotaDetectorForNode(snap.cfg, node.cfg) before invoking
+// detector.Notify.
+var _ = quota.New

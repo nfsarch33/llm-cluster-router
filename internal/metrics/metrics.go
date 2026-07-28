@@ -18,6 +18,12 @@ var LLMRouterBuckets = []float64{
 var RouterTokenRateBuckets = []float64{1, 2, 5, 10, 20, 40, 80, 120, 200}
 
 var (
+	// QuotaFallbackTotal counts vendor responses that matched the per-node
+	// QuotaDetectRegex and triggered a failover off the vendor peer.
+	QuotaFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "llm_router_quota_fallback_total",
+		Help: "Vendor quota-exhaustion events that triggered failover off a vendor peer.",
+	}, []string{"model", "node", "vendor"})
 	RequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "llm_router_requests_total",
 		Help: "Total routed requests.",

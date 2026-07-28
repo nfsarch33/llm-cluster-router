@@ -13,8 +13,8 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 
 > **Production ingress (v18714+)** — The HelixChannel production wire
 > reaches operators and pilot consumers via `TCP/443` (TLS-terminating
-> nginx → `127.0.0.1:14443` on the Lightsail instance `helixon-tunnel`
-> at `52.64.8.153`), per
+> nginx → `127.0.0.1:14443` on the Lightsail instance `lightsail-tunnel`
+> at `203.0.113.10`), per
 > [ADR-086](../cursor-global-kb/adrs/ADR-086-helixchannel-port-443-migration.md).
 > The application-layer AES-256-GCM channel is unchanged; only the
 > transport moved from SSH-22 (pilot) to TLS/443 (production pilot).
@@ -23,9 +23,9 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 
 > **Public hostname (v18714-11)** — Pilots (Kilo Code, Peer, and any
 > IDE that refuses to pin an OpenAI-compatible endpoint to a raw IP)
-> target `https://helixchannel.cylrl.dev/v1`. The DNS A-record is
+> target `https://helixchannel.example.com/v1`. The DNS A-record is
 > managed via DreamHost and points at the Lightsail static IP
-> `52.64.8.153`; TLS is terminated by Let's Encrypt via `certbot` on
+> `203.0.113.10`; TLS is terminated by Let's Encrypt via `certbot` on
 > the Lightsail host. See
 > [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md)
 > for the full DNS + cert + nginx runbook.
@@ -34,15 +34,15 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 > # Probes both transports and recommends the better path.
 > ./helixchannel endpoint-check
 > # uses HELIXCHANNEL_BASE_URL env > --base-url flag > default
-> # https://helixchannel.cylrl.dev to derive the host.
+> # https://helixchannel.example.com to derive the host.
 > ```
 
 ### Per-tenant channel preference (v18714-7)
 
 Both encrypted channels are simultaneously live and operators / clients
 choose which one to dial. The default for new tenants is the AES-256-GCM
-channel on `helixchannel.cylrl.dev:443` (more secure); the SSH-22
-SOCKS5 channel on `helixon-tunnel:22` is the fallback when AES/mTLS
+channel on `helixchannel.example.com:443` (more secure); the SSH-22
+SOCKS5 channel on `lightsail-tunnel:22` is the fallback when AES/mTLS
 fails or when a consumer (e.g. the Kilo Code pilot, CI runners) prefers
 the lower-friction SSH path.
 
