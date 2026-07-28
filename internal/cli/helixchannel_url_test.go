@@ -1,12 +1,12 @@
 // Tests for the HelixChannel hostname resolution helper added in
-// v18714-11. The hostname `helixchannel.cylrl.dev` is the
+// v18714-11. The hostname `helixchannel.example.com` is the
 // canonical public identity of the production wire (DNS A-record
 // managed via DreamHost, TLS via Let's Encrypt on the Lightsail
 // host). The helper exposes a precedence chain:
 //
 //  1. HELIXCHANNEL_BASE_URL env var (always wins)
 //  2. --base-url flag (when fs.String is bound)
-//  3. Default fallback `https://helixchannel.cylrl.dev`
+//  3. Default fallback `https://helixchannel.example.com`
 //
 // Tests pin the chain so a future refactor cannot silently change
 // precedence or drop the default. The default is the binding contract
@@ -26,7 +26,7 @@ import (
 // the canonical fallback when neither the env var nor the flag is
 // set. This is the primary operator-facing path: `helixchannel
 // endpoint-check` should "just work" against
-// https://helixchannel.cylrl.dev without flags.
+// https://helixchannel.example.com without flags.
 func TestResolveHelixChannelBaseURL_DefaultWhenEnvAndFlagEmpty(t *testing.T) {
 	t.Setenv(EnvHelixChannelBaseURL, "")
 	got := ResolveHelixChannelBaseURL("")
@@ -39,12 +39,12 @@ func TestResolveHelixChannelBaseURL_DefaultWhenEnvAndFlagEmpty(t *testing.T) {
 // TestResolveHelixChannelBaseURL_FlagOverridesDefault asserts the
 // --base-url flag wins over the default. This is the per-call
 // override path:
-// `helixchannel endpoint-check --base-url https://52.64.8.153`
+// `helixchannel endpoint-check --base-url https://203.0.113.10`
 // for emergency raw-IP fallback.
 func TestResolveHelixChannelBaseURL_FlagOverridesDefault(t *testing.T) {
 	t.Setenv(EnvHelixChannelBaseURL, "")
-	got := ResolveHelixChannelBaseURL("https://52.64.8.153")
-	want := "https://52.64.8.153"
+	got := ResolveHelixChannelBaseURL("https://203.0.113.10")
+	want := "https://203.0.113.10"
 	if got != want {
 		t.Fatalf("flag override not honoured: got %q, want %q", got, want)
 	}
@@ -55,9 +55,9 @@ func TestResolveHelixChannelBaseURL_FlagOverridesDefault(t *testing.T) {
 // "always wins" rule that protects prod from a stray local flag
 // during a cutover.
 func TestResolveHelixChannelBaseURL_EnvOverridesFlag(t *testing.T) {
-	t.Setenv(EnvHelixChannelBaseURL, "https://helixchannel-staging.cylrl.dev")
-	got := ResolveHelixChannelBaseURL("https://52.64.8.153")
-	want := "https://helixchannel-staging.cylrl.dev"
+	t.Setenv(EnvHelixChannelBaseURL, "https://helixchannel-staging.example.com")
+	got := ResolveHelixChannelBaseURL("https://203.0.113.10")
+	want := "https://helixchannel-staging.example.com"
 	if got != want {
 		t.Fatalf("env did not override flag: got %q, want %q", got, want)
 	}
@@ -114,13 +114,13 @@ func TestHostFromBaseURL_ExtractsHost(t *testing.T) {
 	}{
 		{
 			name: "default canonical host",
-			in:   "https://helixchannel.cylrl.dev",
-			want: "helixchannel.cylrl.dev",
+			in:   "https://helixchannel.example.com",
+			want: "helixchannel.example.com",
 		},
 		{
 			name: "raw IP override",
-			in:   "https://52.64.8.153",
-			want: "52.64.8.153",
+			in:   "https://203.0.113.10",
+			want: "203.0.113.10",
 		},
 		{
 			name: "non-default port",
@@ -144,12 +144,12 @@ func TestHostFromBaseURL_ExtractsHost(t *testing.T) {
 // TestHostFromBaseURL_RejectsMalformed ensures the helper fails
 // loud on unparseable input rather than silently producing a
 // wrong host. This guards against an operator accidentally
-// setting HELIXCHANNEL_BASE_URL=cylrl.dev (no scheme) — the
+// setting HELIXCHANNEL_BASE_URL=example.com (no scheme) — the
 // binary should fail with a clear error message.
 func TestHostFromBaseURL_RejectsMalformed(t *testing.T) {
-	_, err := HostFromBaseURL("cylrl.dev")
+	_, err := HostFromBaseURL("example.com")
 	if err == nil {
-		t.Fatalf("HostFromBaseURL(\"cylrl.dev\") should error on missing scheme")
+		t.Fatalf("HostFromBaseURL(\"example.com\") should error on missing scheme")
 	}
 }
 

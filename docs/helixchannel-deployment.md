@@ -1,7 +1,7 @@
 # HelixChannel Production Deployment
 
 This document is the canonical runbook for exposing the HelixChannel
-production wire behind a stable public hostname (`helixchannel.cylrl.dev`).
+production wire behind a stable public hostname (`helixchannel.example.com`).
 It supersedes the per-IP quickstart shipped in earlier `feat/v18714-*`
 branches. The earlier story (`v18714-1`, ADR-086) moved the wire from
 TCP/22 (SSH SOCKS5) to TCP/443 (TLS-tunneled nginx); this story
@@ -14,14 +14,14 @@ hard-code a Lightsail IP.
 ```
 ┌────────────────────────┐      DNS A-record (DreamHost)
 │  Operator / IDE        │  ─────────────────────────────────────►
-│  curl https://helixchannel.cylrl.dev/v1/chat/completions
+│  curl https://helixchannel.example.com/v1/chat/completions
 │                        │
 └────────────────────────┘
             │
             ▼   TCP/443 (Let's Encrypt TLS)
 ┌────────────────────────┐
 │  Lightsail instance    │
-│  helixon-tunnel        │   52.64.8.153 (static IP, ap-southeast-2a)
+│  lightsail-tunnel        │   203.0.113.10 (static IP, ap-southeast-2a)
 │  ubuntu_22_04 / nano_3_2
 │                        │
 │  nginx :443            │   terminate TLS (certbot-managed)
@@ -36,7 +36,7 @@ hard-code a Lightsail IP.
 ```
 
 The Lightsail firewall (per `aws lightsail get-instance-port-states`)
-MUST allow `tcp:443` inbound. The rule is `helixon-tunnel` instance,
+MUST allow `tcp:443` inbound. The rule is `lightsail-tunnel` instance,
 `fromPort=443`, `toPort=443`, `protocol=tcp`, `state=open`. The
 `helixchannel doctor` `lightsail_tcp443` check enforces this in the
 release-gate JSON envelope.
@@ -45,9 +45,9 @@ release-gate JSON envelope.
 
 | Zone | Record | Type | Value | TTL |
 |---|---|---|---|---|
-| `cylrl.dev` | `helixchannel` | A | `52.64.8.153` | 300 |
+| `example.com` | `helixchannel` | A | `203.0.113.10` | 300 |
 
-The DreamHost API key is in 1Password `HelixonSafe` vault, item
+The DreamHost API key is in 1Password `<1password-vault>` vault, item
 `DreamHost` (UUID and field UUID per
 `cursor-global-kb/global-memories/credentials-index.md`).
 
@@ -57,7 +57,7 @@ The DreamHost API key is in 1Password `HelixonSafe` vault, item
 # 1. Resolve the DreamHost API key from 1Password (NEVER on argv).
 #    Look up the item + field UUID in
 #    cursor-global-kb/global-memories/credentials-index.md first.
-op read "op://HelixonSafe/<dreamhost-item-uuid>/<api-key-field-uuid>" \
+op read "op://<1password-vault>/<dreamhost-item-uuid>/<api-key-field-uuid>" \
   --out-file -f /tmp/.dh-key && KEY=$(cat /tmp/.dh-key) && rm -f /tmp/.dh-key
 
 # 2. POST a new A-record via DreamHost's dns-add_record command.
@@ -66,8 +66,8 @@ curl -sS --data-urlencode "key=$KEY" \
   --data-urlencode "cmd=dns-add_record" \
   --data-urlencode "record=helixchannel" \
   --data-urlencode "type=A" \
-  --data-urlencode "value=52.64.8.153" \
-  --data-urlencode "unique_id=helixchannel-cylrl-dev-2026-07" \
+  --data-urlencode "value=203.0.113.10" \
+  --data-urlencode "unique_id=helixchannel-example-com-2026-07" \
   https://api.dreamhost.com/
 ```
 
@@ -80,8 +80,8 @@ path.
 
 ```bash
 # Third-party resolver (NOT the Lightsail VPC).
-dig +short @8.8.8.8 helixchannel.cylrl.dev
-# Expected: 52.64.8.153
+dig +short @8.8.8.8 helixchannel.example.com
+# Expected: 203.0.113.10
 ```
 
 DreamHost API posts propagate within <60 s. If the third-party
@@ -93,7 +93,7 @@ resolver returns NXDOMAIN, wait 60 s and re-probe.
 # 1. SSH into the Lightsail host (operator-only path; the v18714
 #    SSH hop on wsl3 was disrupted for several hours — see
 #    session-handoffs/evidence/2026-07-22-lightsail-ssh-hop-down.md).
-ssh ubuntu@52.64.8.153
+ssh ubuntu@203.0.113.10
 
 # 2. Install certbot (one-time; nginx plugin pulls in the deps).
 sudo apt-get update
@@ -104,7 +104,7 @@ sudo apt-get install -y certbot python3-certbot-nginx
 #    redirects :80 -> :443. The Helmholtz systemd service
 #    upstream is unchanged.
 sudo certbot --nginx \
-  -d helixchannel.cylrl.dev \
+  -d helixchannel.example.com \
   --non-interactive --agree-tos -m ops@<host>
 
 # 4. certbot.timer auto-renews within 30 days of expiry.
@@ -116,21 +116,21 @@ sudo certbot renew --dry-run
 
 ```bash
 # From a third-party host (not the Lightsail box itself):
-curl -sfI https://helixchannel.cylrl.dev/v1/models | head -1
+curl -sfI https://helixchannel.example.com/v1/models | head -1
 # Expected: HTTP/2 200
 
-openssl s_client -connect helixchannel.cylrl.dev:443 \
-  -servername helixchannel.cylrl.dev < /dev/null 2>/dev/null \
+openssl s_client -connect helixchannel.example.com:443 \
+  -servername helixchannel.example.com < /dev/null 2>/dev/null \
   | openssl x509 -noout -issuer -dates -subject
 # Expected:
 #   issuer=O = Let's Encrypt, CN = R10 / R11
 #   notBefore=... notAfter=... (>=30 days remaining)
-#   subject=CN = helixchannel.cylrl.dev
+#   subject=CN = helixchannel.example.com
 ```
 
 A `self-signed` issuer or a `notAfter < now+30d` result means the
 certbot step did not complete; re-run `sudo certbot --nginx -d
-helixchannel.cylrl.dev` and re-verify.
+helixchannel.example.com` and re-verify.
 
 ## nginx reverse-proxy config
 
@@ -146,7 +146,7 @@ The Lightsail host serves a single nginx site at
 
 server {
     listen 80;
-    server_name helixchannel.cylrl.dev;
+    server_name helixchannel.example.com;
     # certbot http-01 challenge; do not redirect, certbot needs :80.
     location /.well-known/acme-challenge/ {
         root /var/www/html;
@@ -158,10 +158,10 @@ server {
 
 server {
     listen 443 ssl http2;
-    server_name helixchannel.cylrl.dev;
+    server_name helixchannel.example.com;
 
-    ssl_certificate     /etc/letsencrypt/live/helixchannel.cylrl.dev/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/helixchannel.cylrl.dev/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/helixchannel.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/helixchannel.example.com/privkey.pem;
 
     # AES-256-GCM cipher preference is enforced at the application
     # layer; nginx only does TLS 1.2+ with modern ciphers.
@@ -199,26 +199,26 @@ mistaken nginx config):
 
 1. **DNS rollback** (operator can run from any host):
    ```bash
-   KEY=$(op read op://HelixonSafe/<dreamhost-item-uuid>/<api-key-field-uuid> --out-file -f /tmp/.dh-key && cat /tmp/.dh-key && rm -f /tmp/.dh-key)
+   KEY=$(op read op://<1password-vault>/<dreamhost-item-uuid>/<api-key-field-uuid> --out-file -f /tmp/.dh-key && cat /tmp/.dh-key && rm -f /tmp/.dh-key)
    curl -sS --data-urlencode "key=$KEY" \
      --data-urlencode "cmd=dns-remove_record" \
      --data-urlencode "record=helixchannel" \
      --data-urlencode "type=A" \
-     --data-urlencode "value=52.64.8.153" \
+     --data-urlencode "value=203.0.113.10" \
      https://api.dreamhost.com/
    ```
 2. **Nginx fallback** (Lightsail box): the binary clients keep the
-   raw-IP fallback. Set `HELIXCHANNEL_BASE_URL=https://52.64.8.153`
+   raw-IP fallback. Set `HELIXCHANNEL_BASE_URL=https://203.0.113.10`
    on each consumer; the hostname is dropped without code change.
 3. **Certbot cleanup**: `sudo certbot delete --cert-name
-   helixchannel.cylrl.dev` (non-destructive; nginx is left with a
+   helixchannel.example.com` (non-destructive; nginx is left with a
    config that references the missing cert path; reload will fail
    until the site is disabled with `sudo rm
    /etc/nginx/sites-enabled/helixchannel && sudo systemctl reload
    nginx`).
 
 The rollback is **non-destructive**: the raw-IP ingress on `:443`
-remains valid throughout, and the DNS zone is `cylrl.dev` (no other
+remains valid throughout, and the DNS zone is `example.com` (no other
 A-records are affected).
 
 ## Pilot consumer wiring
@@ -227,18 +227,18 @@ Kilo Code (or any OpenAI-compatible client) configures:
 
 | Field | Value |
 |---|---|
-| `OPENAI_BASE_URL` | `https://helixchannel.cylrl.dev/v1` |
-| Bearer token | (existing API key from `op item list --vault HelixonSafe`) |
+| `OPENAI_BASE_URL` | `https://helixchannel.example.com/v1` |
+| Bearer token | (existing API key from `op item list --vault <1password-vault>`) |
 
 `curl` smoke from the operator host:
 
 ```bash
 # 200 + MiniMax-M3 model list confirms the wire is up.
-curl -sS https://helixchannel.cylrl.dev/v1/models \
+curl -sS https://helixchannel.example.com/v1/models \
   -H "Authorization: Bearer $TOKEN" | jq '.data[].id'
 
 # Streaming chat-completion:
-curl -sS https://helixchannel.cylrl.dev/v1/chat/completions \
+curl -sS https://helixchannel.example.com/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -250,7 +250,7 @@ curl -sS https://helixchannel.cylrl.dev/v1/chat/completions \
 
 ## Known constraints
 
-- **Lightsail static IP**: `52.64.8.153`. If the operator swaps
+- **Lightsail static IP**: `203.0.113.10`. If the operator swaps
   the static IP, the DreamHost A-record MUST be re-pushed.
 - **TLS provider**: Let's Encrypt R10/R11 only (the default
   `certbot --nginx` flow). Self-signed fallback is for offline CI
@@ -267,10 +267,10 @@ curl -sS https://helixchannel.cylrl.dev/v1/chat/completions \
 
 This runbook assumes operator-level access to:
 
-1. The DreamHost item in 1Password `HelixonSafe` (UUID + field
+1. The DreamHost item in 1Password `<1password-vault>` (UUID + field
    UUID per `cursor-global-kb/global-memories/credentials-index.md`).
-2. SSH access to the Lightsail instance `helixon-tunnel` at
-   `52.64.8.153` (per fleet-path-registry; restored via RustDesk
+2. SSH access to the Lightsail instance `lightsail-tunnel` at
+   `203.0.113.10` (per fleet-path-registry; restored via RustDesk
    CLI or direct LAN/Tailscale when the operator-side hop is
    available).
 3. `sudo` on the Lightsail host for `apt-get`, `certbot`,

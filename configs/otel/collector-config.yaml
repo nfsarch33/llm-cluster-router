@@ -14,7 +14,7 @@
 #                     against the global registry.
 #
 # v18720-4 verifier calls:
-#   - runx ssh exec --target helixon-tunnel --raw 'curl -s http://127.0.0.1:8889/metrics | grep llm_cluster_router_decrypt_failed_total'
+#   - ssh <operator-jump> --raw 'curl -s http://127.0.0.1:8889/metrics | grep llm_cluster_router_decrypt_failed_total'
 #   - tail -3 ~/logs/runx/agentrace-mcp.ndjson
 #   - tail /tmp/otel-collector.jsonl
 #
@@ -54,7 +54,7 @@ service:
 # Lightsail production deployment note:
 #
 # The OTel collector runs as a systemd unit on the Lightsail tunnel
-# host (helixon-tunnel). The unit file lives at:
+# host (lightsail-tunnel). The unit file lives at:
 #
 #   /etc/systemd/system/otelcol-contrib.service
 #
@@ -66,4 +66,4 @@ service:
 # /etc/otelcol-contrib/config.yaml on the Lightsail host. The
 # production collector publishes its own metrics on :8889 inside
 # the Lightsail firewall; the Lightsail tunnel exposes that endpoint
-# to the operator via `runx ssh exec --target helixon-tunnel`.
+# to the operator via `ssh <operator-jump>`.

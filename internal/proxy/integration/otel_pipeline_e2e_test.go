@@ -22,7 +22,7 @@
 //
 // Production verification on Lightsail runs the same flow via
 //
-//	runx ssh exec --target helixon-tunnel --raw 'curl -s http://127.0.0.1:8889/metrics | grep llm_cluster_router_decrypt_failed_total'
+//	ssh <operator-jump> --raw 'curl -s http://127.0.0.1:8889/metrics | grep llm_cluster_router_decrypt_failed_total'
 //	tail -3 ~/logs/runx/agentrace-mcp.ndjson
 //
 // and looks for the same family of metrics. The local E2E substitutes

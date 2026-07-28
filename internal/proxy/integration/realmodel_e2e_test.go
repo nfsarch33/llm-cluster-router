@@ -66,7 +66,7 @@ func TestRealModelE2E_LightsailSmoke(t *testing.T) {
 		// TLS → real Aliyun endpoint) is the durable deliverable here.
 		errStr := err.Error()
 		if strings.Contains(errStr, "non-200 response") && (strings.Contains(errStr, "401") || strings.Contains(errStr, "403")) {
-			t.Skipf("upstream rejected the credentials (key revoked / model retired). v18710-3 architecture verified; key refresh required — operator action: rotate 1Password item HelixonSafe/4qt774avrbzabdscc6ezygl5hi (Aliyun Team Qwen Token Plan Key). err=%v", err)
+			t.Skipf("upstream rejected the credentials (key revoked / model retired). v18710-3 architecture verified; key refresh required — operator action: rotate 1Password item HelixonSafe/<uuid> (Aliyun Team Qwen Token Plan Key). err=%v", err)
 		}
 		t.Fatalf("callChatCompletions: %v", err)
 	}

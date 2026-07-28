@@ -1,0 +1,15 @@
+name: leak-scan
+
+on:
+  push:
+    branches: [main, master, feat/**]
+  pull_request:
+
+jobs:
+  leak-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: BurntSushi/ripgrep@v0.1.0
+      - name: leak-scan
+        run: bash tools/leak-scan.sh

@@ -4,14 +4,14 @@
 // the canonical implementation while cmd/helixchannel picks up
 // parity without dragging in the full proxy/router symbols.
 //
-// v18714-11 / helixchannel.cylrl.dev: ResolveHelixChannelBaseURL
+// v18714-11 / helixchannel.example.com: ResolveHelixChannelBaseURL
 // is the single source of truth for "what hostname should the
 // HelixChannel tooling probe by default?" The precedence chain is:
 //
 //  1. HELIXCHANNEL_BASE_URL env var (always wins; protects prod
 //     from a stray local flag during a cutover).
 //  2. The flag value (per-call override; default empty).
-//  3. The hardcoded fallback `https://helixchannel.cylrl.dev`
+//  3. The hardcoded fallback `https://helixchannel.example.com`
 //     (the canonical Lightsail-backed public hostname managed via
 //     DreamHost DNS).
 //
@@ -29,14 +29,14 @@ import (
 
 // DefaultHelixChannelBaseURL is the canonical public hostname of the
 // HelixChannel production wire. It MUST resolve to the Lightsail
-// instance behind `52.64.8.153` (DreamHost A-record `helixchannel`
-// in the `cylrl.dev` zone, terminated by Let's Encrypt via certbot
+// instance behind `203.0.113.10` (DreamHost A-record `helixchannel`
+// in the `example.com` zone, terminated by Let's Encrypt via certbot
 // on the Lightsail host, nginx reverse-proxying to 127.0.0.1:8742).
 //
 // Replacing this constant requires the corresponding DreamHost
 // A-record update + Let's Encrypt cert rollover documented in
 // docs/helixchannel-deployment.md.
-const DefaultHelixChannelBaseURL = "https://helixchannel.cylrl.dev"
+const DefaultHelixChannelBaseURL = "https://helixchannel.example.com"
 
 // EnvHelixChannelBaseURL is the env-var name operators may set to
 // override the canonical base URL during a cutover. Set to a
@@ -66,7 +66,7 @@ func ResolveHelixChannelBaseURL(flagBaseURL string) string {
 // for use with TCP-reachability probes (e.g. `endpoint-check --host`).
 // Returns an error if the input does not parse as an absolute URL with
 // a host component; this guards against operators setting
-// HELIXCHANNEL_BASE_URL=cylrl.dev (no scheme) — the CLI must fail
+// HELIXCHANNEL_BASE_URL=example.com (no scheme) — the CLI must fail
 // loud rather than silently derive an empty host.
 func HostFromBaseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)

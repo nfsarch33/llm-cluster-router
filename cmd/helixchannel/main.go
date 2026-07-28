@@ -324,7 +324,7 @@ func runDoctor() error {
 	// with nginx reverse-proxy). Offline / CI environments (no
 	// LIGHTSAIL_API_BASE) report "skipped" so the check does not
 	// false-positive. Production deploys where LIGHTSAIL_API_BASE
-	// is set (via 1Password HelixonSafe/AWS Lightsail API access
+	// is set (via 1Password <1password-vault>/AWS Lightsail API access
 	// token) report "pass" only when the Lightsail
 	// GetInstancePortStates API returns port=443 + protocol=tcp +
 	// state=open for the helixon-tunnel instance.
@@ -513,7 +513,7 @@ type endpointCheckEnvelope struct {
 func runEndpointCheck(args []string) error {
 	fs := flag.NewFlagSet("endpoint-check", flag.ContinueOnError)
 	host := fs.String("host", "", "target host to probe (overrides --base-url)")
-	baseURL := fs.String("base-url", "", "HelixChannel base URL; host extracted from it when --host is empty. Precedence: HELIXCHANNEL_BASE_URL env > --base-url > https://helixchannel.cylrl.dev")
+	baseURL := fs.String("base-url", "", "HelixChannel base URL; host extracted from it when --host is empty. Precedence: HELIXCHANNEL_BASE_URL env > --base-url > https://helixchannel.example.com")
 	tcp22Port := fs.String("tcp22-port", "22", "TCP/22 candidate port")
 	tcp443Port := fs.String("tcp443-port", "443", "TCP/443 candidate port")
 	probeTimeout := fs.Duration("probe-timeout", 2*time.Second, "per-port dial timeout (max 30s)")
@@ -522,7 +522,7 @@ func runEndpointCheck(args []string) error {
 	}
 	// v18714-11: derive --host from the canonical base URL when the
 	// operator omits --host. Precedence: explicit --host > --base-url >
-	// HELIXCHANNEL_BASE_URL env > default https://helixchannel.cylrl.dev.
+	// HELIXCHANNEL_BASE_URL env > default https://helixchannel.example.com.
 	if *host == "" {
 		resolved, err := clihelper.HostFromBaseURL(clihelper.ResolveHelixChannelBaseURL(*baseURL))
 		if err != nil {

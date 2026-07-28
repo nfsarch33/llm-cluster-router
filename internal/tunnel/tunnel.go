@@ -42,7 +42,7 @@ var (
 // here only when a new flag is actually needed; do not turn this into a
 // generic ssh-options struct.
 type SSHTunnelConfig struct {
-	// Host is the remote jump host, e.g. "52.64.8.153".
+	// Host is the remote jump host, e.g. "203.0.113.10".
 	Host string
 	// User is the remote SSH user, e.g. "ubuntu".
 	User string

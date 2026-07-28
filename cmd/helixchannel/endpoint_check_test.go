@@ -326,7 +326,7 @@ func TestEndpointCheck_HostFlagOverridesBaseURL(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	cmd := exec.Command(bin, "endpoint-check",
 		"--host", "127.0.0.1",
-		"--base-url", "https://helixchannel.cylrl.dev",
+		"--base-url", "https://helixchannel.example.com",
 		"--tcp22-port", "1",
 		"--tcp443-port", "1",
 		"--probe-timeout", "200ms")
@@ -348,7 +348,7 @@ func TestEndpointCheck_HostFlagOverridesBaseURL(t *testing.T) {
 // --base-url is given, the binary uses HELIXCHANNEL_BASE_URL env.
 // Setting HELIXCHANNEL_BASE_URL to a sentinel host lets the test
 // observe the derivation without depending on the canonical
-// helixchannel.cylrl.dev being resolvable from CI.
+// helixchannel.example.com being resolvable from CI.
 func TestEndpointCheck_EnvBaseURLDerivesHostDefault(t *testing.T) {
 	t.Parallel()
 	root := repoRoot(t)
