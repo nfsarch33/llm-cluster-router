@@ -21,6 +21,14 @@ type Config struct {
 	DebugAddr   string          `yaml:"debug_addr"`
 	LogLevel    string          `yaml:"log_level"`
 	AuthToken   string          `yaml:"auth_token"`
+	// SlackWebhookURL, when non-empty, is the Slack Incoming Webhook URL the
+	// router posts quota-fallback alerts to. The webhook URL is loaded from
+	// the LLM_ROUTER_SLACK_WEBHOOK_URL env var at startup; the YAML field is
+	// reserved for future first-class config support.
+	SlackWebhookURL string `yaml:"slack_webhook_url"`
+	// SlackChannel, when non-empty, overrides the Slack Incoming Webhook's
+	// default channel. Empty means use the webhook's default.
+	SlackChannel string `yaml:"slack_channel"`
 	Defaults    Defaults        `yaml:"defaults"`
 	HealthCheck HealthConfig    `yaml:"health_check"`
 	FairShare   FairShareConfig `yaml:"fair_share"`
@@ -112,6 +120,12 @@ type NodeConfig struct {
 	// This field is additive and ignored by older router builds, so adding a
 	// `vendor:` line to an existing YAML never breaks existing peers.
 	Vendor string `yaml:"vendor"`
+	// APIKeyEnv, when non-empty, is the env var the router reads at request
+	// time to construct the Authorization header for this peer. This avoids
+	// embedding raw API keys in the YAML config. The env var should be set
+	// via 1Password op-secret or a secrets manager; the router process
+	// inherits the env at startup.
+	APIKeyEnv string `yaml:"api_key_env"`
 	// EnabledVendor (string, not bool, matches the rest of this struct)
 	// toggles participation when Vendor is non-empty. Set to "true" to
 	// register the vendor peer in the active routing pool; "false" (or
