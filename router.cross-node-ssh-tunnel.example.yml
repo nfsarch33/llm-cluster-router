@@ -1,0 +1,103 @@
+# llm-cluster-router — cross-node SSH-tunnel example (B1, v18750-Q3)
+#
+# This config demonstrates how to route LLM traffic to a remote fleet node
+# (e.g. <remote-host>:8001) that binds llama-server to loopback only. The router
+# opens an SSH -L local-port-forward on demand and tunnels HTTP through
+# to the remote loopback.
+#
+# Use case: cf-v18750-Q2-O7 — cross-node LLM access without Tailscale
+# ACL or bind-0.0.0.0 changes.
+#
+# Security:
+# - identity_file path is operator-controlled; not embedded.
+# - Each tunnel is per-node so failures are isolated.
+# - The circuit breaker treats tunnel errors as "upstream offline" via
+#   tunnel.IsSSHUnavailable.
+#
+# How to use:
+# 1. Pick the remote fleet node (e.g. <remote-host> at <tailscale-ip>).
+# 2. Verify the remote llama-server is on loopback:8001
+#    (e.g. `runx ssh exec --target <remote-host> -- curl localhost:8001/health`).
+# 3. Set `tunnel.identity_file` to your SA private key path.
+# 4. Run the router with this config: `./helixon-router router.cross-node-ssh-tunnel.example.yml`
+# 5. Probe: `curl http://127.0.0.1:8080/v1/chat/completions \
+#       -H "Content-Type: application/json" \
+#       -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"hi"}]}'`
+
+listen: ":8080"
+metrics_addr: ":9091"
+debug_addr: ":6060"
+log_level: info
+
+defaults:
+  max_queue_depth: 8
+  max_concurrency: 2
+  request_timeout: 180s
+  max_body_size: 4194304
+  circuit:
+    threshold: 5
+    cooldown: 30s
+
+health_check:
+  interval: 15s
+  timeout: 5s
+  path: /health
+  unhealthy_threshold: 3
+  healthy_threshold: 1
+
+fair_share:
+  enabled: false
+
+# --- Local same-node Ollama lane (no tunnel) ---
+nodes:
+  - name: local-ollama-fast
+    url: http://127.0.0.1:11434
+    tier: fast
+    priority: 0
+    weight: 2
+    models:
+      - qwen3.5-9b
+    circuit:
+      threshold: 3
+      cooldown: 20s
+
+  # --- Cross-node llama-server via SSH tunnel ---
+  # <remote-host> llama-server binds 127.0.0.1:8001 on the remote-host host.
+  # Tailscale routing cannot reach loopback from the router host. The tunnel
+  # lets us SSH to <remote-host> and open a local-forward that brings
+  # <remote-host>:8001 onto 127.0.0.1:18001 (or any free loopback port)
+  # on the router host.
+  - name: remote-qwen36-27b-ssh-tunnel
+    url: http://127.0.0.1:18001    # local-forward endpoint; router dials this
+    tier: reasoning
+    priority: 1
+    weight: 4
+    models:
+      - qwen3.6-27b
+      - Qwen3.6-27B-Q4_K_M
+    circuit:
+      threshold: 5
+      cooldown: 60s
+    health_check:
+      interval: 30s
+      timeout: 10s
+      unhealthy_threshold: 3
+      healthy_threshold: 1
+    # Tunnel block — this is the v18750-Q3 B1 addition.
+    # The router's main.go sees `tunnel.enabled: true` and:
+    #   1. Calls tunnel.New() at boot to validate the config.
+    #   2. For each request, calls tunnel.DialContext(ctx, which
+    #      spawns an `ssh -L 0:localhost:8001 -i <key>
+    #      <user>@<host>` child per request, returning a bridged
+    #      net.Conn. On conn.Close() the child is reaped so we
+    #      never leak ssh processes.
+    #   3. tunnel.IsSSHUnavailable() integrates with the circuit
+    #      breaker so a tunnel drop marks the node offline.
+    tunnel:
+      enabled: true
+      host: <tailscale-ip>        # <remote-host> Tailscale IP
+      port: 22                    # SSH port on <remote-host>
+      user: <ssh-user>            # operator user
+      identity_file: <path-to-fleet-sa-key>  # SA key
+      local_port: 8001            # <remote-host> llama-server loopback port
+      connect_timeout: 10s
