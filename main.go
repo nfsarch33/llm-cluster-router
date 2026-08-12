@@ -517,19 +517,43 @@ func newRouter(cfg config) (*router, error) {
 
 var limitBody = proxy.LimitBody
 
-func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 	type nodeStatus struct {
 		Name    string   `json:"name"`
 		Tier    string   `json:"tier"`
 		URL     string   `json:"url"`
 		Models  []string `json:"models"`
 		Healthy bool     `json:"healthy"`
+		ProbeMs int64    `json:"probe_ms,omitempty"`
 	}
+	// q4-c-lcr-stale-health (Q5 Phase 6): allow caller to force a live
+	// probe so /healthz reports fresh upstream state, not the cached
+	// `node.healthy` flag updated only every hc.Interval (default 30s).
+	//   ?live=1            -> probe each node now
+	//   ?timeout=500ms     -> per-node probe timeout (default 2s)
+	live := req.URL.Query().Get("live") == "1"
+	probeTimeout := 2 * time.Second
+	if v := req.URL.Query().Get("timeout"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= 10*time.Second {
+			probeTimeout = d
+		}
+	}
+	hc := r.snap().cfg.HealthCheck
 	snap := r.snap()
 	nodes := make([]nodeStatus, 0, len(snap.nodes))
 	healthy := 0
 	for _, node := range snap.nodes {
-		ok := node.healthy.Load()
+		var ok bool
+		var probeMs int64
+		if live && !node.cfg.HealthCheckDisabled {
+			probeCtx, cancel := context.WithTimeout(req.Context(), probeTimeout)
+			startProbe := time.Now()
+			ok = probeNode(probeCtx, hc, node)
+			cancel()
+			probeMs = time.Since(startProbe).Milliseconds()
+		} else {
+			ok = node.healthy.Load()
+		}
 		if ok {
 			healthy++
 		}
@@ -539,10 +563,11 @@ func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			URL:     node.cfg.URL,
 			Models:  node.cfg.Models,
 			Healthy: ok,
+			ProbeMs: probeMs,
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok":                healthy > 0,
 		"healthy_nodes":     healthy,
 		"total_nodes":       len(snap.nodes),
@@ -551,7 +576,12 @@ func (r *router) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"max_queue_depth":   snap.cfg.Defaults.MaxQueueDepth,
 		"max_concurrency":   snap.cfg.Defaults.MaxConcurrency,
 		"nodes":             nodes,
-	})
+	}
+	if live {
+		resp["live_probe"] = true
+		resp["probe_timeout"] = probeTimeout.String()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
