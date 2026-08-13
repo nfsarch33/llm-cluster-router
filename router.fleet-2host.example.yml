@@ -1,7 +1,8 @@
-# llm-cluster-router fleet config — v14888
-# Primary GPU host + secondary GPU host peer pool, no cloud fallbacks.
+# llm-cluster-router fleet config — multi-host reference example.
 #
-# Live endpoints verified via Tailscale DERP (primary <-> secondary RTT ~250ms).
+# Replace `<your-host-1>` and `<your-host-2>` with your fleet's hostnames
+# or IPs. Replace `<tier>`, `<model-name>`, and bearer auth as needed.
+#
 # Health probes every 15s; threshold 3; cooldown 30s.
 
 listen: ":8080"
@@ -25,75 +26,68 @@ health_check:
   unhealthy_threshold: 3
   healthy_threshold: 1
 
-# No fair-share: cluster is private, single user (jaslian).
+# Per-tenant fair-share rate limiting. When enabled, each tenant
+# (identified by the X-Tenant header, or a hash of the bearer token)
+# gets an independent sliding-window token bucket.
 fair_share:
   enabled: false
 
-# Per-user fair-share rate limiting. When enabled, each user (identified
-# by the X-User header, or a hash of the bearer token) gets an independent
-# sliding-window token bucket.
-# Disabled: solo fleet, no contention yet.
 nodes:
-  # ----- Local fast lane: primary-host Ollama (qwen3.5-9b) -----
-  - name: primary-ollama-fast
-    url: http://127.0.0.1:11434
+  # ----- Local fast lane: GPU host 1 (small/fast model) -----
+  - name: gpu-host-1-fast
+    url: http://<your-host-1>:11434
     tier: fast
     priority: 0
     weight: 2
     models:
-      - qwen3.5-9b
-      - qwen3.5-9b-instruct
+      - <fast-model-name>
     circuit:
       threshold: 3
       cooldown: 20s
 
-  # ----- Local reasoning lane: primary-host Qwen 3.6 27B (RTX 3090 #0) -----
-  - name: primary-llama-coder-27b
-    url: http://127.0.0.1:11435
+  # ----- Local reasoning lane: GPU host 1 (large/reasoning model) -----
+  - name: gpu-host-1-reasoning
+    url: http://<your-host-1>:11435
     tier: reasoning
     priority: 0
     weight: 4
     models:
-      - qwen3.6-27b
-      - Qwen3.6-27B-Q4_K_M
+      - <reasoning-model-name>
     circuit:
       threshold: 5
       cooldown: 30s
 
-  # ----- Secondary: secondary-host llama.cpp CUDA server (Qwen 3.6 27B) -----
-  # Reachable via Tailscale DERP from primary; 250-400ms RTT through relay.
-  # Marked priority 5 so primary lane is preferred (no relay), but
-  # secondary picks up overflow automatically when primary is saturated
+  # ----- Secondary: GPU host 2 (reasoning lane failover) -----
+  # Marked priority 5 so GPU host 1 lane is preferred (lower latency), but
+  # host 2 picks up overflow automatically when host 1 is saturated
   # (queue depth >= max_queue_depth).
-  - name: secondary-llama-coder-27b
-    url: http://<tailscale-host>:11435
+  - name: gpu-host-2-reasoning
+    url: http://<your-host-2>:11435
     tier: reasoning
     priority: 5
     weight: 4
     models:
-      - qwen3.6-27b
-      - Qwen3.6-27B-Q4_K_M
+      - <reasoning-model-name>
     circuit:
       threshold: 5
-      cooldown: 60s       # tolerate 30-60s relay latency blips
+      cooldown: 60s       # tolerate 30-60s WAN latency blips
     health_check:
-      interval: 30s       # probe less frequently (DERP relay)
+      interval: 30s       # probe less frequently (WAN/relay)
       timeout: 10s
       unhealthy_threshold: 3
       healthy_threshold: 1
 
-  # ----- Embedding lane (for sprintboard / engram / helixon-evolver) -----
-  - name: primary-engram-embedder
-    url: http://127.0.0.1:8281
+  # ----- Embedding lane (for memory / RAG / agent harnesses) -----
+  - name: gpu-host-1-embedder
+    url: http://<your-host-1>:8281
     tier: embed
     priority: 0
     weight: 2
     models:
-      - nomic-embed-text:v1.5
-      - text-embedding-nomic-embed-text-v1.5
+      - <embedding-model-name>
     circuit:
       threshold: 3
       cooldown: 20s
 
-# Default model selection: agents query "qwen3.6-27b" for code, fast/9b for chat.
-# This explicit mapping prevents accidental Ollama fall-through.
+# Default model selection: agents query the reasoning model for code,
+# fast model for chat. This explicit mapping prevents accidental fall-through.

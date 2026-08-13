@@ -1,9 +1,12 @@
-# llm-cluster-router — minimax live pilot wire-up (v18688-1).
+# llm-cluster-router — vendor live pilot wire-up template.
 #
-# Per plan: route `minimax-chat` to api.minimaxi.com/v1 (NOT api.minimax.io).
-# The `MINIMAX_API_KEY` env var is resolved from a 1Password item at startup;
-# see $HOME/.config/runx/owners.yaml for the canonical vault/item mapping.
-# This yaml does NOT embed the key.
+# Per plan: route `<vendor>` to its vendor endpoint (NOT the international
+# alias). The `<VENDOR>_API_KEY` env var is resolved from a 1Password
+# item at startup; this yaml does NOT embed the key.
+#
+# This file is a template — replace `<vendor>`, `<model-id>`, and the
+# 1Password item reference with your vendor's values before use.
+# See `docs/operator-internal.md` for the secure provisioning flow.
 #
 # Verification:
 #   curl -sS -X POST -H "Authorization: Bearer $MINIMAX_API_KEY" \

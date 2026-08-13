@@ -91,11 +91,11 @@ func TestMinChat_ModelWhitelist(t *testing.T) {
 // Live API round-trip tests (gated on MINIMAX_LIVE_TEST=1)
 // =====================================================================
 
-// TestMinimaxRoute_200OnHello exercises the live `api.minimaxi.com`
-// endpoint via the bearer flow. Skipped unless MINIMAX_LIVE_TEST=1
-// AND MINIMAX_API_KEY is set (resolved from a 1Password item in
-// production per $HOME/.config/runx/owners.yaml; tests read directly
-// from env).
+// TestMinimaxRoute_200OnHello exercises the live vendor endpoint via
+// the bearer flow. Skipped unless <VENDOR>_LIVE_TEST=1 AND <VENDOR>_API_KEY
+// is set (resolved from a 1Password item in production; tests read
+// directly from env). See `docs/operator-internal.md` for the
+// secure provisioning flow.
 func TestMinimaxRoute_200OnHello(t *testing.T) {
 	if os.Getenv("MINIMAX_LIVE_TEST") != "1" {
 		t.Skip("MINIMAX_LIVE_TEST!=1; skipping live round-trip")

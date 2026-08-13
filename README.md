@@ -1,149 +1,62 @@
 # llm-cluster-router
 
-OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with global concurrency limiting and priority-based routing.
+> **MQ-style router + load balancer for multi-cloud, multi-cluster, multi-vendor LLM fleets.**
+> OpenAI-compatible HTTP reverse-proxy with tiered routing, fair-share queuing, and optional
+> end-to-end encrypted transport. Production-tested in single-tenant private clusters and
+> multi-tenant pilot fleets.
 
-> **HelixChannel quickstart** — Build the doctor probe and validate
-> release-readiness before deploying:
-> ```bash
-> go build -o helixchannel ./cmd/helixchannel
-> ./helixchannel doctor   # JSON envelope: release-gate + ADR-085 + AES key + observability
-> ```
-> See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
-> `key-check`, `header-stamp`, and `endpoint-check` subcommands.
+[![CI](https://github.com/nfsarch33/llm-cluster-router/actions/workflows/ci.yml/badge.svg)](https://github.com/nfsarch33/llm-cluster-router/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/nfsarch33/llm-cluster-router)](https://goreportcard.com/report/github.com/nfsarch33/llm-cluster-router)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Production ingress (v18714+)** — The HelixChannel production wire
-> reaches operators and pilot consumers via `TCP/443` (TLS-terminating
-> nginx → `127.0.0.1:14443` on the Lightsail instance `lightsail-tunnel`
-> at `203.0.113.10`), per
-> [ADR-086](../cursor-global-kb/adrs/ADR-086-helixchannel-port-443-migration.md).
-> The application-layer AES-256-GCM channel is unchanged; only the
-> transport moved from SSH-22 (pilot) to TLS/443 (production pilot).
-> Canonical reverse-proxy runbook:
-> [`cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md`](../cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md).
+## Why
 
-> **Public hostname (v18714-11)** — Pilots (Kilo Code, Peer, and any
-> IDE that refuses to pin an OpenAI-compatible endpoint to a raw IP)
-> target `https://helixchannel.example.com/v1`. The DNS A-record is
-> managed via DreamHost and points at the Lightsail static IP
-> `203.0.113.10`; TLS is terminated by Let's Encrypt via `certbot` on
-> the Lightsail host. See
-> [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md)
-> for the full DNS + cert + nginx runbook.
->
-> ```bash
-> # Probes both transports and recommends the better path.
-> ./helixchannel endpoint-check
-> # uses HELIXCHANNEL_BASE_URL env > --base-url flag > default
-> # https://helixchannel.example.com to derive the host.
-> ```
+When you run multiple LLM inference backends (vLLM, Ollama, llama.cpp, hosted OpenAI
+compatible APIs) across one or more clouds, regions, or vendors, you need:
 
-### Per-tenant channel preference (v18714-7)
+- **One URL** for every client (Cursor, Claude Code, Codex CLI, Kilo Code, custom agents).
+- **Fair-share queuing** so a single tenant cannot starve the cluster.
+- **Tiered routing** (reasoning vs fast vs embed) with per-tier priority and weight.
+- **Health-aware failover** so flapping nodes drop out of rotation faster than the
+  health-check loop can react.
+- **Per-upstream circuit breakers** to prevent cascading failures.
+- **Vendor portability** — same config works against self-hosted GPU pools and
+  hosted inference APIs.
 
-Both encrypted channels are simultaneously live and operators / clients
-choose which one to dial. The default for new tenants is the AES-256-GCM
-channel on `helixchannel.example.com:443` (more secure); the SSH-22
-SOCKS5 channel on `lightsail-tunnel:22` is the fallback when AES/mTLS
-fails or when a consumer (e.g. the Kilo Code pilot, CI runners) prefers
-the lower-friction SSH path.
-
-| Preference | Behaviour |
-|---|---|
-| `--channel prefer-aes-mtls` (default) | Try AES-256-GCM first; fall back to SOCKS5 on transport failure. |
-| `--channel prefer-socks5` | Try SSH-22 SOCKS5 first; fall back to AES-256-GCM on transport failure. |
-| `--channel aes-mtls` | Force AES-256-GCM. Hard fail if unreachable. |
-| `--channel socks5` | Force SOCKS5. Hard fail if unreachable. |
-| `--channel auto` | Probe both, pick the faster path per session. |
-
-Equivalent env var: `LLMROUTER_CHANNEL_PREFERENCE` (one of
-`prefer-aes-mtls|prefer-socks5|aes-mtls|socks5|auto`). The default
-when unset is `prefer-aes-mtls`.
-
-The canonical observability signal is
-`helixchannel_session_total{channel="...",outcome="..."}` (per
-v18714-3), and the Grafana dashboard
-`observability/grafana/helixchannel-sessions-dashboard.json`
-visualises the channel mix. Per-tenant routing decisions are
-recorded under the `channel` label so operators can audit which
-tenants lean on which transport.
-
-Decision rationale (full Bayesian analysis): see
-[`cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md`](../cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md)
-(posterior P(both, configurable per-tenant) = 0.86; second-place
-SOCKS5-only at 0.09; acceptance threshold 0.70).
-
-## HelixChannel (encrypted dual-listener)
-
-HelixChannel is the operator-facing name for the AES-256-GCM
-application-layer encrypted HTTP channel that fronts every router
-deployment. It is the brand name for the dual-listener design
-introduced incrementally across v18704-v18710 and standardised by
-ADR-085 (`adrs/ADR-085-helixchannel-prod-wire.md` in the
-`cursor-global-kb` repo).
-
-### Threat model
-
-- Wire captures on the path between the router and the upstreams
-  see ciphertext only; plaintext LLM prompts, completions, and
-  bearer tokens never appear on the wire.
-- An attacker who can R/W to the TCP socket cannot silently tamper
-  with a request because every frame is AES-GCM authenticated.
-  Tampering events are counted in
-  `llm_cluster_router_decrypt_failed_total{listener="aes-mtls"}`
-  and surface as an incident in Grafana.
-
-### ListenerFactory contract
-
-The router owns a `proxy.ListenerFactory` per channel. The
-factory's `Channel()` returns a stable identifier (currently
-`"aes-mtls"`) used for metrics, logging, and config keys. The
-factory's `Listen(ctx, addr)` returns a bound `net.Listener` plus
-the `ServeLoop` that should be run for it. The production
-`main.go` constructs the AES/mTLS factory by default; the
-`HELIXCHANNEL_ENABLED=false` env override keeps the legacy plain
-HTTP listener for back-compat.
-
-### Operator-facing config
-
-| Key | Default | Notes |
-| --- | --- | --- |
-| `HELIXCHANNEL_ENABLED` | `true` | Toggle the AES/mTLS factory. `false` keeps the legacy plain HTTP listener for back-compat. |
-| `HELIXCHANNEL_KEY` | demo placeholder | 32-byte AES-256 key. Production callers load this from a secret store (see `internal/proxy/listener.go`). |
-| `HELIXCHANNEL_LISTEN` | `cfg.Listen` | Override the bind address (host:port). Falls back to the legacy `listen:` YAML key. |
-
-The response header `HelixChannel-Version: <version>` is stamped
-on every reply; `curl -I https://host/` is the canonical proof-of-name
-artifact.
-
-### Additive metric families (v18712-1)
-
-Both legacy and new label keys are populated by the dual-listener
-ServeLoop, so existing Grafana panels keep working:
-
-- `llm_cluster_router_connections_total{listener="aes-mtls",direction="in"}`
-  — legacy channel label
-- `llm_cluster_router_helixchannel_connections_total{direction="in"}`
-  — operator-facing alias
+`llm-cluster-router` is a single Go binary that fronts any mix of OpenAI-compatible
+upstreams behind a single `/v1/chat/completions` and `/v1/models` endpoint.
 
 ## Features
 
-- **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
-- **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload
-- **Per-user fair-share queuing** — sliding-window token bucket per user (keyed by `X-User` header or bearer token hash) prevents any single user from monopolising the cluster (v0.2.0)
-- **Multi-upstream** — route to multiple vLLM, Ollama, or any OpenAI-compatible backend
-- **SSE streaming** — full Server-Sent Events pass-through for streaming completions
-- **Tier-based routing** — assign nodes to tiers (agent, fast, reasoning) with priority and weight
-- **Health checking** — automatic health probing with configurable thresholds; supports both vLLM (`/health`) and Ollama (`/v1/models`) backends
-- **Per-upstream circuit breaker** — flapping nodes are dropped from rotation faster than the health-check loop notices; 5-failure threshold, 30s cooldown, exposed via `llm_router_circuit_state` gauge
-- **Prometheus `/metrics`** — request latency + TTFT histograms (LLM-tuned 50ms..120s buckets), queue depth gauges, per-node health status, upstream error counters
-- **Benchmark harness** — built-in `bench` subcommand with TTFT p50/p95, generation tokens/sec, and cancellation probes
-- **GPU probing** — `probe-gpu` subcommand for NVIDIA GPU inventory, VRAM usage, and compute process bindings
-- **Bearer auth** — optional bearer token authentication for `/v1/*` endpoints
-- **Env var expansion** — `${ENV_VAR}` syntax in config YAML for secrets
-- **SIGHUP reload** — atomic config reload (nodes, auth token, timeouts, health-check tuning) without dropping inflight requests; `listen`, `metrics_addr`, `debug_addr`, and `max_body_size` still require restart
+- **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy.
+- **Multi-cloud / multi-vendor** — route to self-hosted vLLM/Ollama plus hosted
+  OpenAI-compatible APIs in a single config.
+- **Tier-based routing** — assign nodes to tiers (reasoning, fast, embed, agent) with
+  per-tier priority and weight.
+- **Global queue + concurrency control** — configurable max queue depth and max
+  concurrency protect upstreams from overload.
+- **Per-tenant fair-share queuing** — sliding-window token bucket per tenant
+  (keyed by `X-Tenant` header or bearer-token hash) prevents any single tenant
+  from monopolising the cluster.
+- **Health checking** — automatic probing with configurable thresholds; supports
+  vLLM (`/health`), Ollama (`/v1/models`), and any HTTP 200-returning endpoint.
+- **Per-upstream circuit breaker** — flapping nodes are dropped from rotation;
+  5-failure threshold, 30s cooldown, exposed via `llm_router_circuit_state` gauge.
+- **SSE streaming** — full Server-Sent Events pass-through for streaming completions.
+- **Prometheus `/metrics`** — request latency + TTFT histograms (50ms..120s buckets),
+  queue depth gauges, per-node health status, upstream error counters.
+- **Bearer auth** — optional bearer token authentication for `/v1/*` endpoints.
+- **Env var expansion** — `${ENV_VAR}` syntax in config YAML for secrets.
+- **SIGHUP reload** — atomic config reload (nodes, auth token, timeouts,
+  health-check tuning) without dropping inflight requests.
+- **Optional encrypted transport** — AES-256-GCM application-layer channel
+  (`HelixChannel`) for end-to-end encrypted HTTP between client and router.
+  See [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md).
 
 ## Quickstart
 
 ```bash
+# Install
 go install github.com/nfsarch33/llm-cluster-router@latest
 
 # Or build from source
@@ -157,7 +70,7 @@ go build -o llm-cluster-router .
 
 ## Configuration
 
-Copy `router.sample.yml` and customise:
+Copy `router.sample.yml` and customise for your fleet:
 
 ```yaml
 listen: ":8080"
@@ -179,27 +92,39 @@ health_check:
   unhealthy_threshold: 3
   healthy_threshold: 1
 
-# Per-user fair-share (disabled by default)
+# Per-tenant fair-share (disabled by default)
 fair_share:
   enabled: false
-  max_requests_per_user: 10
+  max_requests_per_tenant: 10
   window: 60s
   burst: 3
 
+# Mix self-hosted and hosted upstreams behind the same /v1 endpoint
 nodes:
-  - name: gpu-0-agent
-    url: http://127.0.0.1:8001
-    tier: agent
+  - name: selfhost-reasoning-27b
+    url: http://<your-gpu-host>:8001
+    tier: reasoning
     priority: 0
     weight: 4
-    models: ["qwen3.5-27b"]
-  - name: gpu-1-fast
-    url: http://127.0.0.1:8002
+    models: ["qwen3-27b"]
+  - name: hosted-fast-api
+    url: https://<your-vendor-host>/v1
     tier: fast
-    priority: 0
+    priority: 1
     weight: 2
-    models: ["qwen3.5-9b"]
+    models: ["<vendor-model-id>"]
+    auth:
+      env: VENDOR_API_KEY
+      scheme: bearer
 ```
+
+The router ships several reference configs in `configs/`:
+
+- `router.sample.yml` — minimal local-only starting point.
+- `router.fleet-2host.example.yml` — multi-host reference (use `your-host-1`,
+  `your-host-2` placeholders for your fleet topology).
+- `configs/router.minimax.live.yml` — operator-internal; **not for public mirroring**
+  (see `docs/operator-internal.md`).
 
 ## Endpoints
 
@@ -213,10 +138,10 @@ nodes:
 
 ## Grafana dashboard
 
-Import `dashboards/llm-cluster-router.json` into Grafana 11+. The
-dashboard exposes a `$datasource` template variable so it works in
-any Grafana org without per-panel edits, plus `$model` and `$node`
-filters wired to the metrics the router exports.
+Import `dashboards/llm-cluster-router.json` into Grafana 11+. The dashboard
+exposes a `$datasource` template variable so it works in any Grafana org without
+per-panel edits, plus `$model` and `$node` filters wired to the metrics the
+router exports.
 
 Panels:
 
@@ -228,51 +153,44 @@ Panels:
 - Per-node health (1 = healthy, 0 = unhealthy)
 - Upstream health-probe p95 latency
 
-A test in `dashboards/dashboard_test.go` enforces the dashboard
-references every metric the router exports, so any future metric
-additions must update both the router and the dashboard JSON in
-the same commit.
+A test in `dashboards/dashboard_test.go` enforces the dashboard references every
+metric the router exports, so any future metric additions must update both the
+router and the dashboard JSON in the same commit.
 
 ## Reload
 
-Send `SIGHUP` to the router process to atomically swap config without
-dropping inflight requests:
+Send `SIGHUP` to the router process to atomically swap config without dropping
+inflight requests:
 
 ```bash
 kill -HUP $(pgrep -f 'llm-cluster-router serve')
 ```
 
-What reloads:
+**What reloads:** `nodes`, `auth_token`, `defaults.request_timeout`,
+`defaults.max_queue_depth`, `defaults.max_concurrency`, `health_check.*`.
 
-- `nodes` (add, remove, change models, weights, priority, API keys)
-- `auth_token` (rotate bearer token)
-- `defaults.request_timeout`, `defaults.max_queue_depth`,
-  `defaults.max_concurrency`
-- `health_check.*` (interval, timeout, path, thresholds)
+**What still requires a process restart:** `listen`, `metrics_addr`, `debug_addr`
+(listener sockets), `defaults.max_body_size` (bound at server boot).
 
-What still requires a process restart:
-
-- `listen`, `metrics_addr`, `debug_addr` (listener sockets)
-- `defaults.max_body_size` (bound at server boot)
-
-A failed reload (file not found, YAML parse error, missing required
-node fields) is rejected and the previous config stays in effect.
-Inflight requests continue using the previous concurrency budget;
-new requests use the new one. Both budgets coexist briefly during
-the swap and resolve naturally as the old requests drain.
+A failed reload (file not found, YAML parse error, missing required node fields)
+is rejected and the previous config stays in effect. Inflight requests continue
+using the previous concurrency budget; new requests use the new one. Both
+budgets coexist briefly during the swap and resolve naturally as the old
+requests drain.
 
 ## Benchmark
 
 ```bash
 ./llm-cluster-router bench \
   -url http://127.0.0.1:8080 \
-  -model qwen3.5-27b \
+  -model <your-model> \
   -requests 8 \
   -concurrency 2 \
   -output benchmark-report.json
 ```
 
-Reports include TTFT p50/p95, latency p50/p95, prompt and generation tokens/sec, queue depth, and cancellation probe results.
+Reports include TTFT p50/p95, latency p50/p95, prompt and generation tokens/sec,
+queue depth, and cancellation probe results.
 
 ## Tests
 
@@ -286,42 +204,40 @@ go test -race ./...
 go test -tags=integration -timeout=2m -count=1 -race -v -run TestIT_ ./...
 ```
 
-The integration suite (`it_test.go`, `//go:build integration`) starts the
-router in-process with mock OpenAI-compatible upstream servers
+The integration suite (`it_test.go`, `//go:build integration`) starts the router
+in-process with mock OpenAI-compatible upstream servers
 (`net/http/httptest.NewServer`) and exercises:
 
-- `TestIT_NoStarvationUnderConcurrentLoad` — burst load from multiple
-  X-User producers; asserts every producer completes within ±20% of
-  equal share (no header-based bias).
-- `TestIT_StreamingSSEPassthrough` — Server-Sent Events from upstream
-  reach the client unchanged with a `[DONE]` terminator.
-- `TestIT_FailoverWhenUpstreamReturns502` — when the primary upstream
-  starts returning HTTP 502, traffic continues to flow via the fallback
-  upstream advertising the same model.
-- `TestIT_ModelsAggregation` — `/v1/models` aggregates inventory from
-  every healthy upstream.
+- `TestIT_NoStarvationUnderConcurrentLoad` — burst load from multiple X-Tenant
+  producers; asserts every producer completes within ±20% of equal share.
+- `TestIT_StreamingSSEPassthrough` — Server-Sent Events from upstream reach
+  the client unchanged with a `[DONE]` terminator.
+- `TestIT_FailoverWhenUpstreamReturns502` — when the primary upstream starts
+  returning HTTP 502, traffic continues to flow via the fallback upstream.
+- `TestIT_ModelsAggregation` — `/v1/models` aggregates inventory from every
+  healthy upstream.
 - `TestIT_PrometheusExpositionFormat` — `/metrics` exposes
-  `llm_router_requests_total`, `_request_duration_seconds`,
-  `_queue_depth`, `_inflight_requests`, and `_node_healthy` with the
-  expected types and labels.
+  `llm_router_requests_total`, `_request_duration_seconds`, `_queue_depth`,
+  `_inflight_requests`, and `_node_healthy` with the expected types and labels.
 
 CI runs both suites on every push and PR — see `.github/workflows/ci.yml`.
 
 ## Security
 
-> **Do not** point this router at corporate or managed AI gateways.
-> This tool is designed for self-hosted local GPU clusters only.
+- API keys in config support `${ENV_VAR}` expansion — **never hardcode secrets in YAML files**.
+- The optional `HelixChannel` encrypted transport (`docs/helixchannel-deployment.md`)
+  is recommended when the router sits between an untrusted network and your
+  inference backends.
+- Do not point this router at corporate or managed AI gateways you do not control.
 
-API keys in config support `${ENV_VAR}` expansion — never hardcode secrets in YAML files.
+## Documentation
 
-## Lightsail release readiness
-
-See [`docs/release-readiness.md`](docs/release-readiness.md) for the full
-release gate (`scripts/release-gate.sh`), ADR-083 / ADR-085 cross-links, and
-Lightsail port-443 reverse-proxy procedure.
-
-Quick validation: build `cmd/helixchannel` and run `./helixchannel doctor`
-to confirm release-readiness checks before deploying.
+- [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md) — encrypted
+  transport deployment, threat model, and operator config.
+- [`docs/release-readiness.md`](docs/release-readiness.md) — release gate, ADR
+  cross-links, and pre-deploy validation steps.
+- [`CHANGELOG.md`](CHANGELOG.md) — version history.
+- [`RELEASE-NOTES.md`](RELEASE-NOTES.md) — highlights per release.
 
 ## License
 
