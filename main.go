@@ -424,6 +424,7 @@ func runServe(args []string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", r.handleHealth)
 	mux.HandleFunc("/health", r.handleHealth)
+	mux.HandleFunc("/readyz", r.handleReadyz) // q10b-8: readiness gate (kubelet/sentrux)
 	mux.HandleFunc("/v1/models", authWrap(r.handleModels))
 	mux.HandleFunc("/v1/chat/completions", authWrap(r.handleProxy))
 	mux.HandleFunc("/v1/completions", authWrap(r.handleProxy))
@@ -1597,3 +1598,64 @@ var _ = httputil.ReverseProxy{}
 // can simply call quotaDetectorForNode(snap.cfg, node.cfg) before invoking
 // detector.Notify.
 var _ = quota.New
+
+
+// Ready evaluates the canonical readiness contract for the router.
+//
+//   - At least one upstream must be healthy (healthy_nodes >= 1).
+//   - The current queue depth must be at or below the configured
+//     ceiling (queue_depth <= Defaults.MaxQueueDepth).
+//   - No breaker on any upstream may currently be Open
+//     (otherwise the router would return errors to callers even
+//     though /healthz might still claim "ok").
+//
+// Returns (ready bool, reason string). When ready=true the reason
+// is empty; otherwise the reason explains which gate failed so
+// /readyz callers (kubelet, sentrux, load balancers) can render a
+// useful operator message.
+//
+// Added by q10b-8 to GREEN the Ginkgo spec in readyz_ginkgo_test.go.
+// Pure function: takes only r.snap() and atomic counters, no mutex
+// promotion; safe for concurrent invocation from many probe goroutines.
+func (r *router) Ready() (bool, string) {
+	snap := r.snap()
+	healthy := 0
+	for _, node := range snap.nodes {
+			if node.healthy.Load() {
+					healthy++
+			}
+	}
+	if healthy == 0 {
+			return false, "no healthy upstream nodes"
+	}
+
+	maxQD := int64(snap.cfg.Defaults.MaxQueueDepth)
+	if cur := r.queueDepth.Load(); cur > maxQD {
+			return false, fmt.Sprintf("queue depth %d exceeds ceiling %d", cur, maxQD)
+	}
+
+	for _, node := range snap.nodes {
+			if node.breaker != nil && node.breaker.Stats().State == circuitOpen {
+					return false, fmt.Sprintf("upstream %q breaker is open", node.cfg.Name)
+			}
+	}
+
+	return true, ""
+}
+
+// handleReadyz exposes the readiness gate over /readyz. Returns 200
+// when Ready() reports true, 503 otherwise. JSON body always carries
+// {ready, reason} so probes can log without parsing free-text.
+//
+// Added by q10b-8.
+func (r *router) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	ready, reason := r.Ready()
+	status := http.StatusOK
+	if !ready {
+			status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]any{
+			"ready":  ready,
+			"reason": reason,
+	})
+}

@@ -48,6 +48,39 @@ test:
     expire_in: 7 days
   coverage: "/total:\\s+\\(statements\\)\\s+(\\d+\\.\\d+)%/"
 
+# Ginkgo integration-test gate per L0 rule 42 (integration-test-gating).
+# This is the Helixon central-server core-service gate: every PR that
+# touches a handler, gRPC method, CLI command, or persisted schema in
+# a gated service MUST ship a failing Ginkgo integration spec in the
+# same PR; the full integration suite is a hard merge gate.
+integration:ginkgo:
+  extends: .go_base
+  stage: test
+  tags:
+    - helixon-runner
+    - wsl
+  script:
+    - go install github.com/onsi/ginkgo/v2/ginkgo@latest
+    - ginkgo -r --tags=integration --trace --cover --coverprofile=integration.coverprofile
+    - go tool cover -func=integration.coverprofile | tee coverage.txt
+    - go test -race -tags=integration -count=1 ./...
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: integration.coverprofile
+    paths:
+      - integration.coverprofile
+      - coverage.txt
+    expire_in: 7 days
+  coverage: "/total:\\s+\\(statements\\)\\s+(\\d+\\.\\d+)%/"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs: []
+
 build:
   extends: .go_base
   stage: build
