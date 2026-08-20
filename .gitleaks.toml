@@ -28,6 +28,21 @@ regexes = [
     # cannot drift if someone refactors the test and forgets the
     # inline annotation.
     "sk-expanded-123",
+
+    # 'sk-abc123secret' was a synthetic token in fairshare_test.go used only
+    # as input to a SHA-256 hash assertion — it was never a credential for
+    # anything. The working tree now uses the documented 'dummy-' prefix, but
+    # the string survives in commit history, which we do not rewrite on a
+    # public repo. Allowlisted so the history scan stays meaningful instead of
+    # being permanently red on a known-synthetic fixture.
+    "sk-abc123secret",
+
+    # 'placeholder' is the literal word used as the bearer value in a docs
+    # example, demonstrating that clients send a placeholder while the gateway
+    # supplies the real key. The working tree now uses a shell variable; this
+    # entry covers the historical commits. Anchored so it matches ONLY the
+    # exact literal word and cannot swallow a longer real secret.
+    "^placeholder$",
 ]
 
 # Stop signals (entries that MUST NOT be allowlisted, even by accident).
