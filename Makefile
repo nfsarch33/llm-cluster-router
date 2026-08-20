@@ -3,6 +3,13 @@
 
 GO ?= go
 
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.buildVersion=$(VERSION)
+
+build: ## Build the router with a stamped version (relcheck warns on stale binaries)
+	go build -ldflags "$(LDFLAGS)" -o llm-router .
+
+.PHONY: build
 .PHONY: all vet test integration live-e2e lint security tidy help
 
 help: ## List targets

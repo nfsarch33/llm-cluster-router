@@ -1,0 +1,60 @@
+# Three-token-plan MiniMax node with quota-aware key rotation + fallback.
+#
+# This is the reference config for the "3 paid token plans, 3 keys" setup:
+#   - api_keys rotate round-robin per request
+#   - a 429, or a body matching quota_detect_regex, cools ONLY the key that
+#     hit the wall (defaults.key_cooldown); the surviving keys carry traffic
+#   - the node's circuit breaker is scored only when ALL keys are cooling,
+#     so one exhausted plan never evicts a node with healthy plans
+#   - when the whole node is quota-limited, requests fail over down the
+#     tier order to the next healthy node (local model, other vendor, ...)
+#   - each quota match increments llm_router_quota_fallback_total (Prometheus)
+#     and posts to Slack when LLM_ROUTER_SLACK_WEBHOOK_URL is set
+#
+# Keys come from the environment (1Password op run / secrets-bootstrap):
+# never put raw keys in this file.
+
+listen: ":8787"
+metrics_addr: "127.0.0.1:9091"
+
+defaults:
+  max_concurrency: 4
+  max_queue_depth: 8
+  request_timeout: 120s
+  # How long an exhausted key sits out of rotation. Tune to the plan's
+  # quota-reset cadence; 5m is a safe floor for per-minute token buckets.
+  key_cooldown: 5m
+
+health_check:
+  interval: 15s
+  timeout: 3s
+  unhealthy_threshold: 3
+  healthy_threshold: 1
+
+smart_route:
+  enabled: true
+  policy_file: configs/smartroute.example.yml
+
+nodes:
+  # Tier 0: local Qwen3.8-27B (2x RTX 3090, 200k ctx) — free tokens first.
+  - name: qwen-local
+    url: "http://127.0.0.1:8010"
+    tier: "0"
+    models:
+      - "qwen3.8-27b-local"
+
+  # Tier 1: MiniMax with three token plans. One logical node, three keys.
+  - name: minimax-m3
+    url: "https://api.minimaxi.com/v1"
+    tier: "1"
+    vendor: "minimax"
+    models:
+      - "MiniMax-M3"
+      - "MiniMax-Text-01"
+    api_keys:
+      - "${MINIMAX_API_KEY_PLAN1}"
+      - "${MINIMAX_API_KEY_PLAN2}"
+      - "${MINIMAX_API_KEY_PLAN3}"
+    # MiniMax quota/balance exhaustion signatures (matched against error
+    # bodies on failover statuses; bounded 64KB peek, body preserved).
+    quota_detect_regex: "insufficient.?balance|quota.?exceeded|1008"

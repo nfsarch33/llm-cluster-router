@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -45,9 +46,11 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/fairshare"
 	"github.com/nfsarch33/llm-cluster-router/internal/gpuprobe"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
+	"github.com/nfsarch33/llm-cluster-router/internal/keypool"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"github.com/nfsarch33/llm-cluster-router/internal/quota"
+	"github.com/nfsarch33/llm-cluster-router/internal/relcheck"
 	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
 	"github.com/nfsarch33/llm-cluster-router/internal/smartroute"
 	"github.com/nfsarch33/llm-cluster-router/internal/tunnel"
@@ -267,6 +270,9 @@ func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, 
 		}
 		node := &upstreamNode{cfg: nc, baseURL: parsed}
 		node.healthy.Store(true)
+		node.keys = keypool.New(nc.APIKeys, cfg.Defaults.KeyCooldown.Duration)
+		node.quotaDet = quota.New(nc.QuotaDetectRegex,
+			os.Getenv("LLM_ROUTER_SLACK_WEBHOOK_URL"), cfg.SlackChannel, slog.Default())
 		ctThreshold, ctCooldown := nc.ResolvedCircuit(cfg.Defaults)
 		node.breaker = newCircuitBreaker(ctThreshold, ctCooldown).WithName(nc.Name)
 		nodeHealthyGauge.WithLabelValues(nc.Name, nc.Tier).Set(1)
@@ -323,6 +329,13 @@ type upstreamNode struct {
 	consecutiveFail atomic.Int64
 	keyIdx          atomic.Uint64
 
+	// keys rotates api_keys with per-key quota cooldowns (nil-safe; empty
+	// pool falls back to the single api_key path).
+	keys *keypool.Pool
+	// quotaDet matches vendor quota-exhaustion bodies (quota_detect_regex);
+	// nil when the node has no pattern configured.
+	quotaDet *quota.Detector
+
 	// breaker is the per-upstream circuit breaker. It is
 	// consulted by selectNodeFromSnap so an upstream that is
 	// returning errors faster than the slower health-check loop
@@ -349,11 +362,21 @@ type sshtunnelRuntime = cfg.SSHTunnelRuntime
 // keys are configured (api_keys), falls back to the single api_key,
 // or returns "" when no key is set.
 func (n *upstreamNode) nextAPIKey() string {
-	if len(n.cfg.APIKeys) > 0 {
-		idx := n.keyIdx.Add(1) - 1
-		return n.cfg.APIKeys[idx%uint64(len(n.cfg.APIKeys))]
+	k, _ := n.nextAPIKeyIdx()
+	return k
+}
+
+// nextAPIKeyIdx returns the key plus its pool index (-1 for the single-key
+// path) so quota handling can cool exactly the key that hit the wall.
+func (n *upstreamNode) nextAPIKeyIdx() (string, int) {
+	if n.keys != nil && n.keys.Size() > 0 {
+		return n.keys.Next()
 	}
-	return n.cfg.APIKey
+	if len(n.cfg.APIKeys) > 0 { // node built outside buildReloadable (tests)
+		idx := n.keyIdx.Add(1) - 1
+		return n.cfg.APIKeys[idx%uint64(len(n.cfg.APIKeys))], int(idx % uint64(len(n.cfg.APIKeys)))
+	}
+	return n.cfg.APIKey, -1
 }
 
 type (
@@ -368,6 +391,7 @@ var (
 	llmRouterBuckets          = metrics.LLMRouterBuckets
 	routerTokenRateBuckets    = metrics.RouterTokenRateBuckets
 	requestsTotal             = metrics.RequestsTotal
+	quotaFallbackTotal        = metrics.QuotaFallbackTotal
 	requestRetries            = metrics.RequestRetries
 	requestDuration           = metrics.RequestDuration
 	requestTTFT               = metrics.RequestTTFT
@@ -388,6 +412,12 @@ var (
 	_ = forbiddenUpstreamHostSuffixes
 	_ = validateUpstreamURL
 )
+
+// buildVersion is stamped by the Makefile via
+// -ldflags "-X main.buildVersion=$(git describe --tags --always --dirty)".
+// "dev" (unstamped local builds) exempts the binary from release-check
+// warnings and from any network probe.
+var buildVersion = "dev"
 
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -484,6 +514,9 @@ func runServe(args []string) error {
 	}
 	defer ln.Close()
 
+	// Fleet rule: every distributed tool self-checks its version and WARNS
+	// (never blocks) when a newer tag exists. Async + cached + 6s budget.
+	go relcheck.WarnIfOutdated(slog.Default(), "nfsarch33", "llm-cluster-router", buildVersion)
 	log.Printf("router listening on %s", cfg.Listen)
 	return server.Serve(ln)
 }
@@ -661,26 +694,28 @@ func isFailoverStatus(code int) bool {
 // the existing one-shot transparent retry for idle-connection resets so a
 // stale keep-alive conn does not look like a node failure. The per-node API
 // key (single or round-robin) is attached here.
-func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstreamNode, method, reqPath, rawQuery string, srcHeader http.Header, body []byte, model string) (*http.Response, error) {
+func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstreamNode, method, reqPath, rawQuery string, srcHeader http.Header, body []byte, model string) (*http.Response, int, error) {
 	upstreamURL := *node.baseURL
 	upstreamURL.Path = strings.TrimRight(node.baseURL.Path, "/") + reqPath
 	upstreamURL.RawQuery = rawQuery
 
+	usedKeyIdx := -1
 	build := func() (*http.Request, error) {
 		ureq, err := http.NewRequestWithContext(ctx, method, upstreamURL.String(), bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		copyHeaders(ureq.Header, srcHeader)
-		if key := node.nextAPIKey(); key != "" {
+		if key, kidx := node.nextAPIKeyIdx(); key != "" {
 			ureq.Header.Set("Authorization", "Bearer "+key)
+			usedKeyIdx = kidx
 		}
 		return ureq, nil
 	}
 
 	ureq, err := build()
 	if err != nil {
-		return nil, err
+		return nil, usedKeyIdx, err
 	}
 	// Per-node tunnel client (configured via node.tunnel.enabled)
 	// carries the node-specific SSH identity; when set, route through
@@ -699,7 +734,7 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 			resp, err = client.Do(retryReq)
 		}
 	}
-	return resp, err
+	return resp, usedKeyIdx, err
 }
 
 func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
@@ -830,7 +865,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	for ; candidate != nil && attemptIdx < maxFailoverAttempts; attemptIdx++ {
 		tried[candidate.cfg.Name] = struct{}{}
 		attemptCtx, attemptCancel := context.WithTimeout(req.Context(), snap.cfg.Defaults.RequestTimeout.Duration)
-		resp, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, body, model)
+		resp, usedKeyIdx, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, body, model)
 		if err != nil {
 			attemptCancel()
 			// Self-heal: only the health loop can flip `healthy` back to true.
@@ -856,6 +891,47 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			continue
 		}
 		if isFailoverStatus(resp.StatusCode) {
+			// Key-level quota isolation: a 429 (or a vendor body matching
+			// quota_detect_regex) cools only the key that served the attempt.
+			// The response body is peeked with a bounded read and restored,
+			// so a held response can still be relayed if the chain exhausts.
+			quotaHit := resp.StatusCode == http.StatusTooManyRequests
+			if candidate.quotaDet != nil {
+				peek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+				resp.Body = struct {
+					io.Reader
+					io.Closer
+				}{io.MultiReader(bytes.NewReader(peek), resp.Body), resp.Body}
+				if candidate.quotaDet.Matches(peek) {
+					quotaHit = true
+					quotaFallbackTotal.WithLabelValues(model, candidate.cfg.Name, candidate.cfg.Vendor).Inc()
+					candidate.quotaDet.Notify(model, candidate.cfg.Name, candidate.cfg.Vendor, peek)
+				}
+			}
+			if quotaHit && usedKeyIdx >= 0 && candidate.keys != nil {
+				candidate.keys.MarkExhausted(usedKeyIdx)
+				// Only score the NODE breaker when every key is cooling —
+				// one dead plan must not evict a node with healthy plans.
+				if !candidate.keys.AllCooling() {
+					requestsTotal.WithLabelValues(model, candidate.cfg.Name, "key_cooled_"+strconv.Itoa(resp.StatusCode)).Inc()
+					if heldResp != nil {
+						heldResp.Body.Close()
+						heldCancel()
+					}
+					heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
+					lastErr = nil
+					// Retry the SAME node once more on the next healthy key
+					// by not adding it to the exclude set this pass.
+					delete(tried, candidate.cfg.Name)
+					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+					tried[candidate.cfg.Name] = struct{}{}
+					if next != nil && next.cfg.Name == candidate.cfg.Name {
+						requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
+						candidate = next
+						continue
+					}
+				}
+			}
 			if candidate.breaker != nil {
 				candidate.breaker.RecordFailure()
 			}

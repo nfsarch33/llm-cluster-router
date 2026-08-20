@@ -13,6 +13,11 @@ enabled: true
 #   scripts/agent-route.sh <agent> on|off
 # Only an explicit false blocks (403 at the router); unknown or absent
 # agents always pass, so adding a tool later needs no config change.
+# An agent entry is either a plain boolean (on/off) or the extended form:
+#   cursor:
+#     enabled: true
+#     force_class: code   # ALL cursor traffic routes as class "code", even
+#                         # when its UI sends a concrete model id (gpt-*).
 agents:
   cursor: true
   claude-code: true

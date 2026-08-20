@@ -144,3 +144,11 @@ nodes:
   #   weight: 1
   #   models: ["minimax-m3", "MiniMax-M3", "qwen3.5-27b"]
   #   health_check_disabled: false
+
+# Task-aware routing + per-agent gates (see configs/smartroute.example.yml).
+# model:"auto" resolves via policy classes; X-Helixon-Agent identifies the
+# caller; an agent flagged false gets 403; force_class pins ALL of one
+# agent's traffic to a class regardless of the model id it sends.
+smart_route:
+  enabled: false
+  policy_file: configs/smartroute.example.yml
