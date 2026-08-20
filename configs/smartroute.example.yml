@@ -1,0 +1,59 @@
+# Smart routing policy.
+#
+# Decides which model and tier serves a request, so a client can send
+# model:"auto" and get the right upstream for the task. A client that names a
+# concrete model is left alone.
+#
+# Adding a provider or a task class is an edit to this file — no code change.
+# Turning one off is one boolean.
+
+enabled: true
+
+# Used when nothing else matches.
+default_class: chat
+
+classes:
+  # Very large prompts first: size is a stronger signal than an incidental
+  # code fence somewhere inside a long document.
+  - name: long_context
+    description: refactors and whole-repo reviews
+    match:
+      min_prompt_chars: 100000
+    route:
+      model: qwen3.8-27b-local
+      tier: large
+      params:
+        temperature: 0.3
+
+  - name: code
+    description: coding assistance (Kilo Code, Cursor, Codex)
+    match:
+      any_of_markers: ["```", "func ", "def ", "class ", "import "]
+    route:
+      model: qwen3.8-27b-local
+      tier: large
+      params:
+        temperature: 0.2
+        top_p: 0.9
+
+  - name: chat
+    description: default conversational traffic
+    route:
+      model: qwen3.8-27b-local
+      tier: small
+      params:
+        temperature: 0.7
+
+  # Worked example of adding a provider by configuration alone: mount its key,
+  # flip enabled to true, and callers sending model:"auto" with a matching
+  # request start landing here. No rebuild.
+  - name: cheap
+    description: short, low-stakes prompts routed to a cheaper hosted model
+    enabled: false
+    match:
+      any_of_markers: ["tl;dr", "summarise", "summarize"]
+    route:
+      model: minimax-m3
+      tier: hosted
+      params:
+        temperature: 0.5
