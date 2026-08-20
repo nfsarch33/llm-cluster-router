@@ -226,10 +226,7 @@ func IsSSHUnavailable(err error) bool {
 		return true
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &netErr)
 }
 
 // isExecNotFound is a small duck-type for *exec.Error (PathError
@@ -237,8 +234,5 @@ func IsSSHUnavailable(err error) bool {
 // stays focused.
 func isExecNotFound(err error) bool {
 	var ee *exec.Error
-	if errors.As(err, &ee) {
-		return true
-	}
-	return false
+	return errors.As(err, &ee)
 }

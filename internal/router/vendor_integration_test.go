@@ -23,7 +23,6 @@ import (
 // the local default. Tests skip when the file does not exist.
 const liveConfigPath = "/home/jaslian/Code/cursor-global-kb/configs/llm-cluster-router.yml"
 
-
 func TestLiveConfig_Loads(t *testing.T) {
 	cfg, err := config.LoadConfig(liveConfigPath)
 	if err != nil {

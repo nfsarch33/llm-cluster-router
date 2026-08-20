@@ -37,8 +37,8 @@ func pipePair(t *testing.T) (client, server *WrapConn) {
 
 func TestWrap_RoundTrip(t *testing.T) {
 	client, server := pipePair(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	const plaintext = "hello, AES-256-GCM! this is the v18710-4 round-trip test."
 
@@ -84,8 +84,8 @@ func TestWrap_NoPlaintextOnWire(t *testing.T) {
 	// "what the server wrote to its socket" without disturbing
 	// the wrapper's view.
 	clientRaw, serverRaw := net.Pipe()
-	defer clientRaw.Close()
-	defer serverRaw.Close()
+	defer func() { _ = clientRaw.Close() }()
+	defer func() { _ = serverRaw.Close() }()
 
 	// Capture pipe: tee the bytes the wrapper writes to serverRaw
 	// into a side buffer.
@@ -150,7 +150,7 @@ func TestWrap_NoPlaintextOnWire(t *testing.T) {
 	// Decrypt on the other side succeeds, proving the frame is
 	// valid.
 	client := Wrap(clientRaw, key)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	readBuf := make([]byte, 4096)
 	n, err := client.Read(readBuf)
 	if err != nil {
@@ -163,8 +163,8 @@ func TestWrap_NoPlaintextOnWire(t *testing.T) {
 
 func TestWrap_TamperingRejected(t *testing.T) {
 	client, server := pipePair(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	plaintext := []byte("payload that should fail authentication after a single bit flip")
 
@@ -207,18 +207,18 @@ func TestWrap_TamperingRejected(t *testing.T) {
 	// Build a tampered client whose underlying conn is the raw
 	// pipe plus the tampered frame. Use a separate raw pipe.
 	clientRaw, serverRaw := net.Pipe()
-	defer clientRaw.Close()
-	defer serverRaw.Close()
+	defer func() { _ = clientRaw.Close() }()
+	defer func() { _ = serverRaw.Close() }()
 
 	// Drive the tampered bytes into serverRaw in a goroutine so
 	// the server can read them and reject.
 	go func() {
 		_, _ = serverRaw.Write(wireBytes)
-		serverRaw.Close()
+		_ = serverRaw.Close()
 	}()
 
 	tamperedClient := Wrap(clientRaw, testKey())
-	defer tamperedClient.Close()
+	defer func() { _ = tamperedClient.Close() }()
 	_, err = tamperedClient.Read(buf)
 	if err == nil {
 		t.Fatal("expected tampered Read to return error, got nil")
@@ -252,11 +252,11 @@ func TestWrap_TapConcurrent(t *testing.T) {
 	// SetTap and Write can race; ensure the wrapper handles
 	// concurrent tap installation without panic.
 	clientRaw, serverRaw := net.Pipe()
-	defer clientRaw.Close()
-	defer serverRaw.Close()
+	defer func() { _ = clientRaw.Close() }()
+	defer func() { _ = serverRaw.Close() }()
 
 	wc := Wrap(serverRaw, testKey())
-	defer wc.Close()
+	defer func() { _ = wc.Close() }()
 
 	var counter int
 	var mu sync.Mutex

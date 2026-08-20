@@ -10,11 +10,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 )
 
-// propagationType is a tiny type-alias for the OTel Propagators
-// type so other files in the package don't need to import the OTel
-// propagation package directly.
-type propagationType = propagation.TextMapPropagator
-
 // otelPropagator is the package-level propagator instance. We
 // initialise it once at package init so a fresh ConfigMap in
 // production does not need to know about OTel internals.

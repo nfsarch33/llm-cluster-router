@@ -88,7 +88,7 @@ func (d *Detector) postSlack(model, node, vendor string, body []byte) {
 		d.logger.Warn("quota: slack webhook post failed", "err", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		d.logger.Warn("quota: slack webhook non-2xx", "status", resp.StatusCode)
 	}

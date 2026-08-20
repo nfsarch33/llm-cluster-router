@@ -486,7 +486,7 @@ func checkLightsailTCP443() string {
 	if err != nil {
 		return "error"
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "error"
 	}
@@ -564,7 +564,7 @@ func checkCDPReachable() string {
 	if err != nil {
 		return "error"
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusOK {
 		return "pass"
 	}
@@ -661,7 +661,7 @@ func runEndpointCheck(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-// v18716.3: --config is accepted for symmetry with kilo-verify;
+	// v18716.3: --config is accepted for symmetry with kilo-verify;
 	// it does not change the host (host must come from the CLI). The
 	// file is loaded so we can fail fast on a broken config rather
 	// than letting the probe run with a partial schema.
@@ -945,14 +945,14 @@ func runKiloVerify(args []string) error {
 		_ = json.NewEncoder(os.Stdout).Encode(envelope)
 		return kiloVerifySkipErr
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	envelope.LatencyMs = time.Since(startedAt).Milliseconds()
 
 	const maxBody = 64 * 1024
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 
-	switch {
-	case resp.StatusCode == http.StatusOK:
+	switch resp.StatusCode {
+	case http.StatusOK:
 		var parsed struct {
 			ID      string `json:"id"`
 			Model   string `json:"model"`
@@ -983,9 +983,7 @@ func runKiloVerify(args []string) error {
 		_ = json.NewEncoder(os.Stdout).Encode(envelope)
 		return nil
 
-	case resp.StatusCode == http.StatusUnauthorized,
-		resp.StatusCode == http.StatusForbidden,
-		resp.StatusCode == http.StatusTooManyRequests:
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
 		envelope.Verdict = "skip"
 		envelope.ErrorClass = "upstream_4xx"
 		envelope.OperatorHint = fmt.Sprintf("upstream rejected call (HTTP %d); rotate 1Password item <vault-name>/<item-name> per carry-forward CF-v18716-MiniMax-Key", resp.StatusCode)

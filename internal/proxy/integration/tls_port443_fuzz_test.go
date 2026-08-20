@@ -144,7 +144,7 @@ func newFuzzListener(t testing.TB) (net.Listener, error) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				// Bound the drain on the listenerCtx so a stuck
 				// mid-handshake connection cannot leak this
 				// goroutine past the listener lifetime. crypto/tls
@@ -199,7 +199,7 @@ func FuzzPort443TLS(f *testing.F) {
 		if err != nil {
 			t.Fatalf("bind listener: %v", err)
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 
 		// Open a plain TCP connection to the listener and feed the
 		// fuzz input as raw bytes. We use a tight context so a
@@ -212,7 +212,7 @@ func FuzzPort443TLS(f *testing.F) {
 		if err != nil {
 			t.Skipf("dial fuzz server: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Cap the write to a sane size even though the seed corpus
 		// stays under 4 KiB -- production fuzzing may grow large.
@@ -305,7 +305,7 @@ func TestPenTestPort443(t *testing.T) {
 			if err != nil {
 				t.Fatalf("bind listener: %v", err)
 			}
-			defer ln.Close()
+			defer func() { _ = ln.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -314,7 +314,7 @@ func TestPenTestPort443(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 			if _, err := conn.Write(sc.payload); err != nil {

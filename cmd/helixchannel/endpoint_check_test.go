@@ -98,7 +98,7 @@ func TestEndpointCheck_TCP22Only_RecommendsTCP22(t *testing.T) {
 	t.Parallel()
 
 	port22 := listenFreeTCP(t)
-	defer port22.Close()
+	defer func() { _ = port22.Close() }()
 	port443 := nothingListening(t)
 
 	root := repoRoot(t)
@@ -143,7 +143,7 @@ func TestEndpointCheck_TCP443Only_RecommendsTCP443(t *testing.T) {
 
 	port22 := nothingListening(t)
 	port443 := listenFreeTCP(t)
-	defer port443.Close()
+	defer func() { _ = port443.Close() }()
 
 	root := repoRoot(t)
 	bin := buildHelixchannelBinary(t, root)
@@ -187,9 +187,9 @@ func TestEndpointCheck_BothReachable_RecommendsTCP443(t *testing.T) {
 	t.Parallel()
 
 	port22 := listenFreeTCP(t)
-	defer port22.Close()
+	defer func() { _ = port22.Close() }()
 	port443 := listenFreeTCP(t)
-	defer port443.Close()
+	defer func() { _ = port443.Close() }()
 
 	root := repoRoot(t)
 	bin := buildHelixchannelBinary(t, root)

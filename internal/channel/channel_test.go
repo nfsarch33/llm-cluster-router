@@ -99,11 +99,11 @@ func TestConfigValidate_RejectsMisconfiguration(t *testing.T) {
 			want: "auth must be",
 		},
 		"connect enabled without allowlist": {
-			cfg: Config{Listen: ":1", Connect: ConnectConfig{Enabled: true, TokenEnv: "T"}},
+			cfg:  Config{Listen: ":1", Connect: ConnectConfig{Enabled: true, TokenEnv: "T"}},
 			want: "allowed_hosts is required",
 		},
 		"connect enabled without token": {
-			cfg: Config{Listen: ":1", Connect: ConnectConfig{Enabled: true, AllowedHosts: []string{"h:443"}}},
+			cfg:  Config{Listen: ":1", Connect: ConnectConfig{Enabled: true, AllowedHosts: []string{"h:443"}}},
 			want: "token_env or token_file is required",
 		},
 	}
@@ -303,13 +303,13 @@ func TestConnectTunnel_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen target: %v", err)
 	}
-	defer target.Close()
+	defer func() { _ = target.Close() }()
 	go func() {
 		conn, err := target.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_, _ = io.Copy(conn, conn)
 	}()
 
@@ -341,7 +341,7 @@ func TestConnectTunnel_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
-	defer proxyLn.Close()
+	defer func() { _ = proxyLn.Close() }()
 	go func() { _ = http.Serve(proxyLn, http.HandlerFunc(proxy.handle)) }()
 
 	// Drive the proxy exactly as an agent would: HTTPS_PROXY semantics.
@@ -352,8 +352,8 @@ func TestConnectTunnel_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Addr().String(), target.Addr().String())
+	defer func() { _ = conn.Close() }()
+	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Addr().String(), target.Addr().String())
 
 	buf := make([]byte, 39)
 	if _, err := io.ReadFull(conn, buf); err != nil {

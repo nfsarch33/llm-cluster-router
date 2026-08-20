@@ -108,7 +108,7 @@ func TestRunCheckKeys_NoArgsEmitsSkipWhenOpMissing(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	err := runCheckKeys([]string{})
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 	if err == nil {
 		t.Fatalf("expected non-nil error from runCheckKeys with no op")
@@ -140,7 +140,7 @@ func TestRunCheckKeys_SubsetFilter(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	err := runCheckKeys([]string{"--keys", "minimax"})
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 	if err == nil {
 		t.Fatalf("expected skip error")
@@ -168,7 +168,7 @@ func TestRunCheckKeys_UnknownSubsetReturnsSkipEmpty(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	err := runCheckKeys([]string{"--keys", "nope,also-not-here"})
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 	if err == nil {
 		t.Fatalf("expected skip error (no rows)")

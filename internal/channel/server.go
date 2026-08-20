@@ -191,7 +191,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	n, _ := copyResponse(w, resp)
 	s.audit.Log(AuditEvent{
@@ -257,7 +257,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusBadGateway, "dial_failed")
 		return
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -269,7 +269,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusInternalServerError, "hijack_failed")
 		return
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
