@@ -16,11 +16,11 @@ import (
 
 // Config is the top-level router configuration loaded from YAML.
 type Config struct {
-	Listen      string          `yaml:"listen"`
-	MetricsAddr string          `yaml:"metrics_addr"`
-	DebugAddr   string          `yaml:"debug_addr"`
-	LogLevel    string          `yaml:"log_level"`
-	AuthToken   string          `yaml:"auth_token"`
+	Listen      string `yaml:"listen"`
+	MetricsAddr string `yaml:"metrics_addr"`
+	DebugAddr   string `yaml:"debug_addr"`
+	LogLevel    string `yaml:"log_level"`
+	AuthToken   string `yaml:"auth_token"`
 	// SlackWebhookURL, when non-empty, is the Slack Incoming Webhook URL the
 	// router posts quota-fallback alerts to. The webhook URL is loaded from
 	// the LLM_ROUTER_SLACK_WEBHOOK_URL env var at startup; the YAML field is
@@ -28,11 +28,21 @@ type Config struct {
 	SlackWebhookURL string `yaml:"slack_webhook_url"`
 	// SlackChannel, when non-empty, overrides the Slack Incoming Webhook's
 	// default channel. Empty means use the webhook's default.
-	SlackChannel string `yaml:"slack_channel"`
-	Defaults    Defaults        `yaml:"defaults"`
-	HealthCheck HealthConfig    `yaml:"health_check"`
-	FairShare   FairShareConfig `yaml:"fair_share"`
-	Nodes       []NodeConfig    `yaml:"nodes"`
+	SlackChannel string          `yaml:"slack_channel"`
+	Defaults     Defaults        `yaml:"defaults"`
+	HealthCheck  HealthConfig    `yaml:"health_check"`
+	FairShare    FairShareConfig `yaml:"fair_share"`
+	Nodes        []NodeConfig    `yaml:"nodes"`
+	// SmartRoute enables task-aware model/parameter routing and per-agent
+	// route gates. Both fields must be set for the feature to activate;
+	// absent or disabled means the router behaves exactly as before.
+	SmartRoute SmartRouteConfig `yaml:"smart_route"`
+}
+
+// SmartRouteConfig points the router at a smartroute policy file.
+type SmartRouteConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	PolicyFile string `yaml:"policy_file"`
 }
 
 // FairShareConfig controls per-user rate limiting. When Enabled is
@@ -105,14 +115,14 @@ func (d *DurationValue) UnmarshalYAML(node *yaml.Node) error {
 
 // NodeConfig describes a single upstream LLM node.
 type NodeConfig struct {
-	Name     string   `yaml:"name"`
-	URL      string   `yaml:"url"`
-	Tier     string   `yaml:"tier"`
-	Enabled  string   `yaml:"enabled"`
-	Weight   int      `yaml:"weight"`
-	Models   []string `yaml:"models"`
-	APIKey   string   `yaml:"api_key"`
-	APIKeys  []string `yaml:"api_keys"`
+	Name    string   `yaml:"name"`
+	URL     string   `yaml:"url"`
+	Tier    string   `yaml:"tier"`
+	Enabled string   `yaml:"enabled"`
+	Weight  int      `yaml:"weight"`
+	Models  []string `yaml:"models"`
+	APIKey  string   `yaml:"api_key"`
+	APIKeys []string `yaml:"api_keys"`
 	// Vendor is the canonical upstream type. Empty (or "openai_compat") means the
 	// existing LocalOpenAICompatible path; values like "minimax" toggle the
 	// vendor-specific URL builder, auth header, and quota classifier.
@@ -136,7 +146,7 @@ type NodeConfig struct {
 	// event triggers the route's fallback chain and increments
 	// `quota_fallback_total` so an operator can alert on a flat line.
 	QuotaDetectRegex string `yaml:"quota_detect_regex"`
-	Priority int      `yaml:"priority"`
+	Priority         int    `yaml:"priority"`
 	// Circuit optionally overrides the global Defaults.Circuit tuning for this
 	// single upstream. Unset (zero) fields inherit the global default.
 	Circuit CircuitConfig `yaml:"circuit"`
