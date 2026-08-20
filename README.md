@@ -6,10 +6,11 @@ OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters wit
 > release-readiness before deploying:
 > ```bash
 > go build -o helixchannel ./cmd/helixchannel
-> ./helixchannel doctor   # JSON envelope: release-gate + ADR-085 + AES key + observability
+> ./helixchannel doctor         # JSON envelope: release-gate + ADR-085 + AES key + observability + Lightsail TCP/443
+> ./helixchannel kilo-verify    # Round-trip an OpenAI-compatible chat call against your HelixChannel base URL (v18716.1)
 > ```
 > See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
-> `key-check`, `header-stamp`, and `endpoint-check` subcommands.
+> `key-check`, `header-stamp`, `endpoint-check`, and `kilo-verify` subcommands.
 
 > **Production ingress (v18714+)** — The HelixChannel production wire
 > reaches operators and pilot consumers via `TCP/443` (TLS-terminating
@@ -124,9 +125,72 @@ ServeLoop, so existing Grafana panels keep working:
 - `llm_cluster_router_helixchannel_connections_total{direction="in"}`
   — operator-facing alias
 
+## Kilo Code (VS Code extension)
+
+Kilo Code is the operator-facing VS Code extension that consumes any
+OpenAI-compatible HTTP endpoint. When pointed at the HelixChannel
+production wire, Kilo Code reaches upstream LLM providers through the
+AES-256-GCM application-layer encrypted channel — no extension-side
+modification required.
+
+### Wire (v18716.1, operator-facing)
+
+```
+┌─────────────────┐     HTTPS/443       ┌──────────────────┐
+│  VS Code        │ ──────────────────▶ │  Lightsail nginx │
+│  Kilo Code ext. │  /minimax/v1/...    │  (52.64.8.153)   │
+└─────────────────┘                     └─────────┬────────┘
+                                                   │  AES-256-GCM
+                                                   ▼
+                                         ┌──────────────────┐
+                                         │  tunnel listener │
+                                         │  → MiniMax-M3    │
+                                         └──────────────────┘
+```
+
+### Setup
+
+1. **Install the Kilo Code extension** in VS Code (Marketplace → "Kilo Code").
+2. **Open VS Code Settings** (JSON) and add:
+   ```json
+   {
+     "kilocode.openAiBaseUrl": "https://52.64.8.153/minimax/v1",
+     "kilocode.openAiApiKey":  "<from 1Password HelixonSafe/MiniMax Token Plan Key>",
+     "kilocode.openAiModel":   "MiniMax-M3"
+   }
+   ```
+3. **Launch VS Code with TLS skip-verify** (until Lightsail ships a hostname + ACME cert; see `CF-v18716-KiloCode-TLSCert`):
+   ```bash
+   HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1 code ~/Code/cursor-global-kb
+   ```
+4. **Validate the wire** before opening VS Code:
+   ```bash
+   # Build the operator-facing CLI:
+   go build -o helixchannel ./cmd/helixchannel
+   ./helixchannel kilo-verify    # expect: {"verdict":"pass", ...}, exit 0
+   ```
+5. **Open the Kilo Code panel** in VS Code and send a prompt. Latency
+   should be ~1-2 s round-trip against `MiniMax-M3`.
+
+### Operator smoke
+
+The full E2E pipeline (operator host → nginx → AES/mTLS tunnel →
+MiniMax-M3 → response) is wired in three places:
+
+| Surface | Command | Purpose |
+| --- | --- | --- |
+| Go integration test | `go test -tags=realmodel -run TestKiloCodeE2E ./internal/tunnel/integration/...` | CI gate; verifies the wire end-to-end with the same headers Kilo Code sends. |
+| Shell smoke | `OPENAI_API_KEY=... ./scripts/kilo-code-smoke.sh` | Drives the Go test under a shell context; prints a clear PASS/FAIL/SKIP verdict + operator hint. |
+| CLI subcommand | `./helixchannel kilo-verify [--base-url ...] [--model ...]` | Stand-alone operator binary; no Go toolchain required. Exits 0 (pass) / 1 (fail) / 2 (skip). |
+
+See [`docs/kilo-code-setup.md`](docs/kilo-code-setup.md) for the
+detailed setup walkthrough, including the TLS SAN workaround and the
+swap test for Qwen (`KILO_CODE_MODEL=qwen3.5-plus`).
+
 ## Features
 
 - **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
+- **Kilo Code (VS Code) wire-compatible** — point the extension at `https://<host>/<path>/v1`; the AES/mTLS channel is transparent (v18716.1)
 - **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload
 - **Per-user fair-share queuing** — sliding-window token bucket per user (keyed by `X-User` header or bearer token hash) prevents any single user from monopolising the cluster (v0.2.0)
 - **Multi-upstream** — route to multiple vLLM, Ollama, or any OpenAI-compatible backend
