@@ -351,13 +351,6 @@ type upstreamNode struct {
 	tunnelClient *http.Client
 }
 
-// sshtunnelRuntime is the runtime mirror of config.TunnelConfig,
-// constructed only when the operator sets tunnel.enabled:true on a
-// node. Keeping the alias here avoids exporting the runtime type from
-// the config package for callers that only need to pass it to the
-// tunnel package.
-type sshtunnelRuntime = cfg.SSHTunnelRuntime
-
 // nextAPIKey returns the next API key via round-robin when multiple
 // keys are configured (api_keys), falls back to the single api_key,
 // or returns "" when no key is set.
@@ -512,7 +505,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return fmt.Errorf("listener bind: %w", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Fleet rule: every distributed tool self-checks its version and WARNS
 	// (never blocks) when a newer tag exists. Async + cached + 6s budget.
@@ -915,7 +908,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 				if !candidate.keys.AllCooling() {
 					requestsTotal.WithLabelValues(model, candidate.cfg.Name, "key_cooled_"+strconv.Itoa(resp.StatusCode)).Inc()
 					if heldResp != nil {
-						heldResp.Body.Close()
+						_ = heldResp.Body.Close()
 						heldCancel()
 					}
 					heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
@@ -937,7 +930,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 			requestsTotal.WithLabelValues(model, candidate.cfg.Name, "failover_"+strconv.Itoa(resp.StatusCode)).Inc()
 			if heldResp != nil {
-				heldResp.Body.Close()
+				_ = heldResp.Body.Close()
 				heldCancel()
 			}
 			heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
@@ -962,7 +955,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		node, resp = okNode, okResp
 		defer okCancel()
 		if heldResp != nil {
-			heldResp.Body.Close()
+			_ = heldResp.Body.Close()
 			heldCancel()
 		}
 	case heldResp != nil:

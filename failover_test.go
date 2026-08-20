@@ -45,7 +45,7 @@ func newProgrammableUpstream(t *testing.T, name, model string, fault func(hit in
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model"}]}`, model)
+		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model"}]}`, model)
 	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
 		hit := pu.hits.Add(1)
@@ -63,9 +63,9 @@ func newProgrammableUpstream(t *testing.T, name, model string, fault func(hit in
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		if b.body != "" {
-			fmt.Fprint(w, b.body)
+			_, _ = fmt.Fprint(w, b.body)
 		} else {
-			fmt.Fprintf(w, `{"id":"x","model":%q,"choices":[{"message":{"role":"assistant","content":%q}}]}`, model, "ok-from-"+name)
+			_, _ = fmt.Fprintf(w, `{"id":"x","model":%q,"choices":[{"message":{"role":"assistant","content":%q}}]}`, model, "ok-from-"+name)
 		}
 	})
 	pu.Server = httptest.NewServer(mux)

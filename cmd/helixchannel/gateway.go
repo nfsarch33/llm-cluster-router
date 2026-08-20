@@ -46,7 +46,7 @@ func runGateway(args []string) error {
 		if err != nil {
 			return fmt.Errorf("open audit log: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		auditWriter = f
 	}
 

@@ -100,8 +100,8 @@ func Fuzz2_NonceReuse(f *testing.F) {
 		var captures [][12]byte
 		var mu sync.Mutex
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		// Drain server side in a goroutine so net.Pipe doesn't
 		// block Write when the pipe buffer fills (which is every
 		// write past the first small one).
@@ -277,8 +277,8 @@ func Fuzz6_HeaderInjection(f *testing.F) {
 		}
 		var captured []byte
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 
 		wrapped := Wrap(client, fuzzKey)
 		wrapped.SetTap(func(frame []byte) {
@@ -325,8 +325,8 @@ func Fuzz7_OversizedFrame(f *testing.F) {
 		}
 		payload := make([]byte, payloadLen)
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 
 		// Drain the server side so Write does not block on the
 		// unbuffered net.Pipe when payloadLen is large.
@@ -355,8 +355,8 @@ func Fuzz8_TapObserver(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, seed uint16) {
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		drainPipe(server)
 
 		var (
@@ -505,8 +505,8 @@ func TestPenTestPort443(t *testing.T) {
 		plaintext := []byte("Authorization: Bearer sk-secret-token-do-not-leak")
 		var captured []byte
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		drainPipe(server)
 		wrapped := Wrap(client, fuzzKey)
 		wrapped.SetTap(func(frame []byte) {
@@ -544,8 +544,8 @@ func TestPenTestPort443(t *testing.T) {
 		// (crypto/rand) is broken — which is what this
 		// scenario would catch.
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		drainPipe(server)
 		var nonces [][12]byte
 		var mu sync.Mutex
@@ -584,8 +584,8 @@ func TestPenTestPort443(t *testing.T) {
 		// its own length + nonce), not a single concatenated
 		// blob.
 		client, server := net.Pipe()
-		defer client.Close()
-		defer server.Close()
+		defer func() { _ = client.Close() }()
+		defer func() { _ = server.Close() }()
 		drainPipe(server)
 		var captures [][]byte
 		var mu sync.Mutex

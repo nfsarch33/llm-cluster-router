@@ -87,8 +87,9 @@ func (l *listenerFactory) Listen(ctx context.Context, addr string) (net.Listener
 		// armon/go-socks5's Serve does not expose Accept directly,
 		// so we run its Serve loop on the listener we just bound.
 		// This blocks until ln is closed (caller or ctx cancel).
+		// go-socks5's Serve never returns nil, so only classify it.
 		err := server.Serve(ln)
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		if !errors.Is(err, net.ErrClosed) {
 			if ctx.Err() != nil {
 				return nil
 			}

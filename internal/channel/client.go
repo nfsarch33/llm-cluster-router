@@ -112,7 +112,7 @@ func (c *ClientProxy) handle(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer tunnel.Close()
+	defer func() { _ = tunnel.Close() }()
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -123,7 +123,7 @@ func (c *ClientProxy) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
@@ -168,18 +168,18 @@ func (c *ClientProxy) dialGateway(target string) (net.Conn, error) {
 		Header: http.Header{"Proxy-Authorization": {"Bearer " + c.Token}},
 	}
 	if err := req.Write(conn); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("write CONNECT: %w", err)
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("read CONNECT response: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("gateway refused CONNECT: %s", resp.Status)
 	}
 	// Any bytes the gateway already buffered belong to the tunnel and must
@@ -187,7 +187,7 @@ func (c *ClientProxy) dialGateway(target string) (net.Conn, error) {
 	if br.Buffered() > 0 {
 		pending := make([]byte, br.Buffered())
 		if _, err := io.ReadFull(br, pending); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("drain buffered bytes: %w", err)
 		}
 		return &prefixedConn{Conn: conn, pending: pending}, nil

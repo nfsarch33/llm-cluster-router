@@ -68,7 +68,7 @@ func TestRunVersion_DefaultJSON(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	err := runVersion([]string{})
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 	if err != nil {
 		t.Fatalf("runVersion: %v", err)
@@ -94,7 +94,7 @@ func TestRunVersion_TextFlag(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	err := runVersion([]string{"--text"})
-	w.Close()
+	_ = w.Close()
 	os.Stdout = old
 	if err != nil {
 		t.Fatalf("runVersion --text: %v", err)

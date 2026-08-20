@@ -57,7 +57,7 @@ func TestPlainHTTPListenerFactory_ListenBindsAndCancels(t *testing.T) {
 	if ln == nil || serve == nil {
 		t.Fatalf("Listen returned nil: ln=%v serve=%v", ln, serve)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Confirm the listener bound to the requested address.
 	if got := ln.Addr().String(); got != addr {

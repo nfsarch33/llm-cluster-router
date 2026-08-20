@@ -98,7 +98,7 @@ func TestListenerFactory_Listen_BindsAndAccepts(t *testing.T) {
 	if serve == nil {
 		t.Fatal("Listen returned nil ServeLoop")
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Drive the ServeLoop in a goroutine and cancel after a short
 	// connection so the loop exits cleanly.
@@ -149,7 +149,7 @@ func TestListenerFactory_Listen_ContextCancelledStopsServeLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, ln) }()
@@ -191,5 +191,5 @@ func TestAESMTLSListenerFactory_ChannelAndServeContract(t *testing.T) {
 	if ln == nil || serve == nil {
 		t.Fatalf("Listen returned nil listener or serve: ln=%v serve=%v", ln, serve)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 }

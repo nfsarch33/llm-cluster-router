@@ -39,7 +39,7 @@ func TestDemoMockUpstream_HandlesHTTPRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	// Send a minimal HTTP/1.1 GET request.
@@ -233,7 +233,7 @@ func TestDualListenerDemo_ExposesMetricsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}

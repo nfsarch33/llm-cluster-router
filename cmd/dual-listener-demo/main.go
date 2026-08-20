@@ -431,7 +431,7 @@ func newLoopbackProxyHandler(upstream string) http.Handler {
 			http.Error(w, "proxy: upstream error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		for k, vs := range resp.Header {
 			for _, v := range vs {
 				w.Header().Add(k, v)

@@ -166,21 +166,18 @@ func startTamperForwarder(wc *crypto.WrapConn) {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		var last uint64
-		for {
-			select {
-			case <-ticker.C:
-				now := wc.TamperCount()
-				if now > last {
-					observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
-					// Per-session counter: one increment per
-					// tamper delta so the rate() query is
-					// meaningful even when one connection
-					// accumulates many tampered frames.
-					for i := uint64(0); i < now-last; i++ {
-						observability.HelixChannelSessionTotal.WithLabelValues("tampering").Inc()
-					}
-					last = now
+		for range ticker.C {
+			now := wc.TamperCount()
+			if now > last {
+				observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
+				// Per-session counter: one increment per
+				// tamper delta so the rate() query is
+				// meaningful even when one connection
+				// accumulates many tampered frames.
+				for i := uint64(0); i < now-last; i++ {
+					observability.HelixChannelSessionTotal.WithLabelValues("tampering").Inc()
 				}
+				last = now
 			}
 		}
 	}()

@@ -163,7 +163,7 @@ func TestOTelPipelineE2E(t *testing.T) {
 		t.Fatalf("POST demo: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	t.Logf("demo response: status=%d body=%s", resp.StatusCode, string(body))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 from demo, got %d", resp.StatusCode)
@@ -249,7 +249,7 @@ func waitForHTTP(url string, timeout time.Duration) bool {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return true
 			}
@@ -266,7 +266,7 @@ func getURL(t *testing.T, url string) string {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read %s: %v", url, err)

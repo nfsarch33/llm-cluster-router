@@ -29,7 +29,7 @@ func echoServer(t *testing.T, addrCh chan<- string) (net.Listener, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				_, _ = io.Copy(c, c)
 			}(c)
 		}
@@ -57,7 +57,7 @@ func TestDialContext_NoAuthThroughLocalServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	payload := []byte("hello-over-socks5")
 	if _, err := conn.Write(payload); err != nil {

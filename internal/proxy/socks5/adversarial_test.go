@@ -44,7 +44,7 @@ func TestSOCKS5NoRecursion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hold listener: %v", err)
 	}
-	defer hold.Close()
+	defer func() { _ = hold.Close() }()
 	selfAddr := hold.Addr().String()
 
 	// Build a socks5.Server with a resolver that always returns the
@@ -63,7 +63,7 @@ func TestSOCKS5NoRecursion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("factory.Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

@@ -100,7 +100,7 @@ var _ = ginkgo.Describe("router.handleReadyz", func() {
 			}
 			node.healthy.Store(true)
 			r := &router{
-				cfg: config{Defaults: defaults{MaxQueueDepth: 4}},
+				cfg:   config{Defaults: defaults{MaxQueueDepth: 4}},
 				nodes: []*upstreamNode{node},
 			}
 			w := httptest.NewRecorder()
