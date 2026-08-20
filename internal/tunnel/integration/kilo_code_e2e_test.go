@@ -5,8 +5,8 @@
 // (scripts/kilo-code-smoke.sh) drives this test under the operator
 // prefix:
 //
-//	OPENAI_BASE_URL=https://52.64.8.153/minimax/v1 \
-//	  OPENAI_API_KEY=op://HelixonSafe/<uuid>/<field> \
+//	OPENAI_BASE_URL=https://helixchannel.example.com/minimax/v1 \
+//	  OPENAI_API_KEY=op://<vault-name>/<uuid>/<field> \
 //	  timeout 120 go test -tags=realmodel \
 //	    -run TestKiloCodeE2E ./internal/tunnel/integration/...
 //
@@ -48,8 +48,8 @@ import (
 // Kilo Code is the VS Code extension that consumes an OpenAI-compatible
 // endpoint. Operators wire it via VS Code settings:
 //
-//	"kilocode.openAiBaseUrl":   "https://52.64.8.153/minimax/v1"
-//	"kilocode.openAiApiKey":    "<from 1Password HelixonSafe>"
+//	"kilocode.openAiBaseUrl":   "https://helixchannel.example.com/minimax/v1"
+//	"kilocode.openAiApiKey":    "<from 1Password <vault-name>>"
 //
 // The base URL is the only surface Kilo Code touches; the wire
 // underneath (nginx → AES/mTLS tunnel → MiniMax-M3 upstream) is opaque
@@ -60,7 +60,7 @@ const (
 	// exposed in v18716.1 for the Kilo Code extension. The path
 	// /minimax/v1 is the nginx location block that ADR-086 path A2
 	// reverse-proxies to the AES/mTLS tunnel listener.
-	kiloCodeDefaultBaseURL = "https://52.64.8.153/minimax/v1"
+	kiloCodeDefaultBaseURL = "https://helixchannel.example.com/minimax/v1"
 
 	// kiloCodeDefaultModel is the operator's preferred model for
 	// the v18716 pilot; matches the canonical model name on the
@@ -162,7 +162,7 @@ type chatCompletionsResponse struct {
 
 // TestKiloCodeE2E_MiniMaxRoundTrip is the canonical v18716.1 smoke.
 // It proves the end-to-end wire from the operator host → nginx
-// reverse-proxy (52.64.8.153:443) → AES/mTLS tunnel listener →
+// reverse-proxy (helixchannel.example.com:443) → AES/mTLS tunnel listener →
 // MiniMax-M3 upstream (api.minimaxi.com) → response, round-trips
 // intact and within the 30s budget.
 //
@@ -203,7 +203,7 @@ func TestKiloCodeE2E_MiniMaxRoundTrip(t *testing.T) {
 	dialer := &net.Dialer{}
 	probeConn, err := dialer.DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
-		t.Fatalf("dial %s: %v (operator: verify TCP/443 ingress on Lightsail is open via `helixchannel endpoint-check --host 52.64.8.153`)", dialAddr, err)
+		t.Fatalf("dial %s: %v (operator: verify TCP/443 ingress on Lightsail is open via `helixchannel endpoint-check --host helixchannel.example.com`)", dialAddr, err)
 	}
 	_ = probeConn.Close()
 

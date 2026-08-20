@@ -13,7 +13,7 @@ import (
 // built-in defaults.
 func TestDefaultConfig_PopulatesCanonicalFields(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.Target != "https://52.64.8.153/minimax/v1" {
+	if cfg.Target != "https://helixchannel.example.com/minimax/v1" {
 		t.Errorf("Target mismatch: got %q want canonical", cfg.Target)
 	}
 	if cfg.Model != "MiniMax-M3" {
@@ -64,11 +64,11 @@ tls_insecure: true
 timeout_seconds: 12
 keys:
   - name: minimax
-    vault: HelixonSafe
-    item: ripotpfq43jzlreor4zo2ay734
+    vault: <vault-name>
+    item: <item-uuid>
     field: tagc4supdfgjj3rujdpb67ygm
   - name: grafana
-    vault: HelixonSafe
+    vault: <vault-name>
     item: deadbeefcafebabe1234567890
     field: 1234567890abcdef1234567890
 `
@@ -95,8 +95,8 @@ keys:
 	if len(cfg.Keys) != 2 {
 		t.Fatalf("len(Keys): got %d want 2", len(cfg.Keys))
 	}
-	if cfg.Keys[0].Name != "minimax" || cfg.Keys[0].Vault != "HelixonSafe" ||
-		cfg.Keys[0].Item != "ripotpfq43jzlreor4zo2ay734" ||
+	if cfg.Keys[0].Name != "minimax" || cfg.Keys[0].Vault != "<vault-name>" ||
+		cfg.Keys[0].Item != "<item-uuid>" ||
 		cfg.Keys[0].Field != "tagc4supdfgjj3rujdpb67ygm" {
 		t.Errorf("Keys[0]: %+v", cfg.Keys[0])
 	}

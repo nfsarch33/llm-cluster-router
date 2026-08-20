@@ -5,14 +5,14 @@
 //
 // Schema (canonical, see docs/kilo-code-setup.md):
 //
-//	target: https://52.64.8.153/minimax/v1     # Kilo Code base URL
+//	target: https://helixchannel.example.com/minimax/v1     # Kilo Code base URL
 //	model: MiniMax-M3                          # upstream model id
 //	tls_insecure: false                        # mirror --insecure flag
 //	timeout_seconds: 30                        # per-request budget
 //	keys:
 //	  - name: minimax
-//	    vault: HelixonSafe
-//	    item: ripotpfq43jzlreor4zo2ay734
+//	    vault: <vault-name>
+//	    item: <item-uuid>
 //	    field: tagc4supdfgjj3rujdpb67ygm
 //
 // Field semantics:
@@ -76,7 +76,7 @@ type ConfigKeyRef struct {
 // config file schema.
 func DefaultConfig() HelixChannelConfig {
 	return HelixChannelConfig{
-		Target:         "https://52.64.8.153/minimax/v1",
+		Target:         "https://helixchannel.example.com/minimax/v1",
 		Model:          "MiniMax-M3",
 		TLSInsecure:    false,
 		TimeoutSeconds: 30,

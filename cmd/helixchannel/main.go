@@ -30,7 +30,7 @@
 //	kilo-verify      - Kilo Code end-to-end smoke (v18716.1). POSTs
 //	                   an OpenAI-compatible chat completions request
 //	                   to the operator's base URL (default
-//	                   https://52.64.8.153/minimax/v1) and verifies
+//	                   https://helixchannel.example.com/minimax/v1) and verifies
 //	                   the upstream returns a MiniMax-M3 response.
 //	                   Exits 0 on PASS, 1 on FAIL, 2 on SKIP
 //	                   (quota / network flake). Mirrors the G2 gate
@@ -749,13 +749,13 @@ func probeHostPort(host, port string, timeout time.Duration) (bool, time.Duratio
 //
 //	{
 //	  "verdict":       "pass|fail|skip",
-//	  "base_url":      "https://52.64.8.153/minimax/v1",
+//	  "base_url":      "https://helixchannel.example.com/minimax/v1",
 //	  "model":         "MiniMax-M3",
 //	  "latency_ms":    712,
 //	  "response_id":   "abc...",
 //	  "content_preview":"pong",
 //	  "error_class":   "tls|timeout|refused|4xx|5xx|parse|none",
-//	  "operator_hint": "rotate 1Password HelixonSafe/<uuid>",
+//	  "operator_hint": "rotate 1Password <vault-name>/<uuid>",
 //	  "probed_at":     "2026-07-22T..."
 //	}
 //
@@ -778,7 +778,7 @@ type kiloVerifyEnvelope struct {
 
 // kiloVerifyDefaultBaseURL is the v18716.1 canonical operator-facing
 // URL for the Kilo Code extension (ADR-086 path A2 nginx reverse-proxy).
-const kiloVerifyDefaultBaseURL = "https://52.64.8.153/minimax/v1"
+const kiloVerifyDefaultBaseURL = "https://helixchannel.example.com/minimax/v1"
 
 // kiloVerifyDefaultModel is the operator-preferred MiniMax model id
 // on the China mainland platform (api.minimaxi.com).
@@ -863,7 +863,7 @@ func runKiloVerify(args []string) error {
 	if apiKey == "" {
 		envelope.Verdict = "skip"
 		envelope.ErrorClass = "missing_key"
-		envelope.OperatorHint = "export KILO_CODE_API_KEY (or OPENAI_API_KEY) from 1Password HelixonSafe before re-running"
+		envelope.OperatorHint = "export KILO_CODE_API_KEY (or OPENAI_API_KEY) from 1Password <vault-name> before re-running"
 		_ = json.NewEncoder(os.Stdout).Encode(envelope)
 		return kiloVerifySkipErr
 	}
@@ -988,7 +988,7 @@ func runKiloVerify(args []string) error {
 		resp.StatusCode == http.StatusTooManyRequests:
 		envelope.Verdict = "skip"
 		envelope.ErrorClass = "upstream_4xx"
-		envelope.OperatorHint = fmt.Sprintf("upstream rejected call (HTTP %d); rotate 1Password item HelixonSafe/MiniMax Token Plan Key per carry-forward CF-v18716-MiniMax-Key", resp.StatusCode)
+		envelope.OperatorHint = fmt.Sprintf("upstream rejected call (HTTP %d); rotate 1Password item <vault-name>/<item-name> per carry-forward CF-v18716-MiniMax-Key", resp.StatusCode)
 		_ = json.NewEncoder(os.Stdout).Encode(envelope)
 		return kiloVerifySkipErr
 

@@ -68,7 +68,7 @@ const helixChannelRealModelUpstream = "api.minimaxi.com:443"
 
 // helixChannelRealModelAPIKeyEnv is the env var the operator sets
 // to point the test at a working MiniMax-M3 key. The value is
-// obtained via `op read op://HelixonSafe/<uuid>/api-key` and
+// obtained via `op read op://<vault-name>/<uuid>/api-key` and
 // passed via os.Setenv from the test harness or via
 // `make test-realmodel` (which the v18714-9 KPI gate will
 // reference). The string is NEVER logged.
@@ -90,7 +90,7 @@ const helixChannelRealModelTimeout = 60 * time.Second
 func TestHelixChannelRealModel_M3StreamingE2E(t *testing.T) {
 	apiKey := strings.TrimSpace(os.Getenv(helixChannelRealModelAPIKeyEnv))
 	if apiKey == "" {
-		t.Skipf("%s env var not set — v18714-5 SKIP (operator: rotate 1Password item HelixonSafe/<uuid>)", helixChannelRealModelAPIKeyEnv)
+		t.Skipf("%s env var not set — v18714-5 SKIP (operator: rotate 1Password item <vault-name>/<uuid>)", helixChannelRealModelAPIKeyEnv)
 	}
 
 	upstream := strings.TrimSpace(os.Getenv(helixChannelRealModelURLEnv))

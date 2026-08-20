@@ -8,8 +8,8 @@
 #
 # Usage (operator):
 #
-#     OPENAI_BASE_URL=https://52.64.8.153/minimax/v1 \
-#     OPENAI_API_KEY="<1Password HelixonSafe/MiniMax Token Plan key>" \
+#     OPENAI_BASE_URL=https://helixchannel.example.com/minimax/v1 \
+#     OPENAI_API_KEY="<1Password <vault-name>/MiniMax Token Plan key>" \
 #       timeout 120 scripts/kilo-code-smoke.sh
 #
 # Usage (CI, all gates pre-wired via env):
@@ -20,7 +20,7 @@
 #
 # Required env:
 #
-#   OPENAI_BASE_URL  (default: https://52.64.8.153/minimax/v1)
+#   OPENAI_BASE_URL  (default: https://helixchannel.example.com/minimax/v1)
 #   OPENAI_API_KEY   (required; no default)
 #
 # Optional env:
@@ -37,14 +37,14 @@
 set -u
 
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
-BASE_URL="${KILO_CODE_BASE_URL:-${OPENAI_BASE_URL:-https://52.64.8.153/minimax/v1}}"
+BASE_URL="${KILO_CODE_BASE_URL:-${OPENAI_BASE_URL:-https://helixchannel.example.com/minimax/v1}}"
 MODEL="${KILO_CODE_MODEL:-MiniMax-M3}"
 API_KEY="${KILO_CODE_API_KEY:-${OPENAI_API_KEY:-}}"
 
 if [ -z "$API_KEY" ]; then
   echo "SKIP: OPENAI_API_KEY (or KILO_CODE_API_KEY) not set — v18716.1 G2 SKIP per ADR-083 C4" >&2
-  echo "Operator action: rotate 1Password item HelixonSafe/MiniMax Token Plan Key, then re-run with:" >&2
-  echo "    OPENAI_API_KEY=\$(op read 'op://HelixonSafe/<uuid>/<field>' --out-file -f /tmp/.kilo && cat /tmp/.kilo && rm /tmp/.kilo) \\" >&2
+  echo "Operator action: rotate 1Password item <vault-name>/<item-name>, then re-run with:" >&2
+  echo "    OPENAI_API_KEY=\$(op read 'op://<vault-name>/<uuid>/<field>' --out-file -f /tmp/.kilo && cat /tmp/.kilo && rm /tmp/.kilo) \\" >&2
   echo "      timeout 120 $0" >&2
   exit 2
 fi
@@ -105,7 +105,7 @@ if [ $rc -eq 0 ]; then
     echo "VERDICT: PASS — v18716.1 Kilo Code E2E round-trip succeeded."
     echo "Operator action: open VS Code → Kilo Code extension, set:"
     echo "    kilocode.openAiBaseUrl: $BASE_URL"
-    echo "    kilocode.openAiApiKey:  <from 1Password HelixonSafe>"
+    echo "    kilocode.openAiApiKey:  <from 1Password <vault-name>>"
     echo "    kilocode.openAiModel:   $MODEL"
     exit 0
   fi
