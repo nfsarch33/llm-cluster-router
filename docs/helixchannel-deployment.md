@@ -1,5 +1,14 @@
 # HelixChannel Production Deployment
 
+> **Historical document.** This describes the v186xx pilot wiring (router
+> :8742 AES wire, prefix-less `/v1` base URL). The CURRENT deployment is the
+> `helixchannel gateway` on 127.0.0.1:14443 behind nginx with route-prefixed
+> base URLs (`/<route>/v1`) and server-side key injection — see
+> [helixchannel.md](helixchannel.md) and the setup guides
+> ([kilo-code-setup.md](kilo-code-setup.md), [claude-code-setup.md](claude-code-setup.md)).
+> Kept for the operational history only; do not wire new clients from this page.
+
+
 This document is the canonical runbook for exposing the HelixChannel
 production wire behind a stable public hostname (`helixchannel.example.com`).
 It supersedes the per-IP quickstart shipped in earlier `feat/v18714-*`
@@ -101,7 +110,7 @@ sudo apt-get install -y certbot python3-certbot-nginx
 
 # 3. Issue the cert. certbot's nginx plugin auto-edits
 #    /etc/nginx/sites-enabled/helixchannel to listen :443 and
-#    redirects :80 -> :443. The Helmholtz systemd service
+#    redirects :80 -> :443. The HelixChannel systemd service
 #    upstream is unchanged.
 sudo certbot --nginx \
   -d helixchannel.example.com \

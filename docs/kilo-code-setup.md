@@ -113,3 +113,28 @@ Clients switch by changing base URL to `https://gateway.example.com/codex/v1`. T
 | `502` with `error_class: dns` or `refused` | Gateway cannot reach the upstream | Check egress from the gateway host |
 | `502` with `error_class: timeout` | Upstream slow | Raise `timeout` on the route |
 | TLS errors in the extension | Self-signed certificate | Issue a proper certificate, or enable TLS-skip while piloting |
+
+## Local models through the router
+
+To use the local Qwen3.8-27B (200k context, `qwen-local.service` on the GPU
+host) instead of a hosted provider, point Kilo Code at the router:
+
+- **Base URL:** `http://127.0.0.1:8787/v1`
+- **Model:** `qwen3.8-27b-local` — or `auto` to let the smart-route policy
+  pick per task (code / long-context / chat).
+- **API key:** the router's `auth_token` (fetch via 1Password `op` CLI; the
+  router accepts it as a Bearer token). Never a provider key — provider keys
+  stay server-side.
+- Optionally set the `X-Helixon-Agent: kilo-code` header so the per-agent
+  gate and metrics identify the caller precisely (User-Agent sniffing covers
+  the default Kilo Code UA otherwise).
+
+### Troubleshooting additions
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `403 route disabled for agent "kilo-code"` | The agent's boolean is off in the smart-route policy | `scripts/agent-route.sh kilo-code on` |
+| `model "auto" not found` | `smart_route` disabled in router config | set `smart_route.enabled: true` + `policy_file` |
+
+> Note: the same steps apply to Codex CLI, but the shipped policy gates
+> `codex` **off** by default — flip it with `scripts/agent-route.sh codex on`.

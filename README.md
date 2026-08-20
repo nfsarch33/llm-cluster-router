@@ -33,6 +33,9 @@ A homelab or small cluster ends up with several inference endpoints: a couple of
 - **Circuit breaking** — repeated failures trip a breaker with a cooldown, and `/readyz` reflects it.
 - **Fair-share scheduling** — optional per-user weighting so one caller cannot starve the others.
 - **Tiered routing** — route by an `X-Tier` header to steer heavy jobs at bigger nodes.
+- **Smart routing (`smart_route`)** — send `model: "auto"` and a policy file picks the model, tier and sampling parameters per task class (code / long-context / chat). Callers are identified via the `X-Helixon-Agent` header (or User-Agent sniffing) with one boolean per agent to turn its route on or off (`scripts/agent-route.sh <agent> on|off`; a gated-off agent gets `403`). An agent entry may also set `force_class` to pin ALL of that agent's traffic to one class even when its UI insists on its own model ids.
+- **Quota-aware key rotation** — a node may carry several `api_keys` (e.g. three paid token plans). A `429` or a body matching `quota_detect_regex` cools only the key that hit the wall (`defaults.key_cooldown`); the node's breaker is scored only when every key is cooling, and each event increments `llm_router_quota_fallback_total` and posts to Slack when `LLM_ROUTER_SLACK_WEBHOOK_URL` is set. See `configs/router.minimax.example.yml` for the reference three-plan setup.
+- **Version self-check** — release builds (`make build`) compare themselves against the newest upstream tag at startup and log a warning when outdated. Never blocks; dev builds are exempt.
 - **Hot reload** — `SIGHUP` re-reads the config; nodes can be added or drained without dropping traffic.
 - **Prometheus metrics and Grafana dashboards** — request rates, latencies, queue depth, breaker state.
 - **[HelixChannel](#helixchannel)** — an optional encrypted egress path that keeps provider API keys off client machines and off the wire.
@@ -59,7 +62,7 @@ podman build -t llm-cluster-router:local -f Containerfile .
 
 ```bash
 # Start with a config file
-./llm-router serve -c router.sample.yml
+./llm-router serve -config router.sample.yml
 
 # Then use it like any OpenAI endpoint
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -111,7 +114,7 @@ health_check:
   healthy_threshold: 2
 ```
 
-See [`router.sample.yml`](router.sample.yml) for the full annotated schema, including fair-share and per-tenant options. Secrets are referenced as `${ENV_VAR}` and resolved at load time; the router never stores credentials in its own config.
+Smart routing and per-agent gates are configured via `smart_route: {enabled, policy_file}` with the policy documented in [`configs/smartroute.example.yml`](configs/smartroute.example.yml). See [`router.sample.yml`](router.sample.yml) for the full annotated schema, including fair-share and per-tenant options. Secrets are referenced as `${ENV_VAR}` and resolved at load time; the router never stores credentials in its own config.
 
 Send `SIGHUP` to reload after an edit:
 
@@ -124,7 +127,7 @@ kill -HUP "$(pgrep -f 'llm-router serve')"
 | Path | Purpose |
 |---|---|
 | `/v1/chat/completions`, `/v1/models`, `/v1/embeddings` | OpenAI-compatible API |
-| `/healthz` | Liveness plus healthy-node count |
+| `/healthz` (alias `/health`) | Rich per-node health JSON: ok, healthy/total nodes, queue depth, inflight, and a per-node `{name, tier, url, models, healthy, probe_ms}` array. `?live=1` forces a live probe (`&timeout=500ms` optional). |
 | `/readyz` | Readiness; fails while every node is unhealthy or breakers are open |
 | `/metrics` | Prometheus exposition (on `metrics_addr`) |
 
@@ -175,6 +178,12 @@ golangci-lint run                   # lint
 ```
 
 Integration and end-to-end tests are behind build tags so the default lane stays fast. Tests that need a live upstream skip rather than fail when credentials are absent, so a fresh clone is green without any secrets.
+
+### CI and enforcement
+
+Required status checks on `main` (admins included): `leak-scan`, `gitleaks`, `test`, `security` — a PR cannot merge until all four pass on the self-hosted runner. Two E2E lanes run every 6 hours and on push: `live-e2e` (the deployed edge: routing, credential injection, CONNECT boundary) and `local-e2e` (the local serving topology: router health, model health, a real chat round-trip, the agent gate, policy validation). Mirror CI locally with `make vet test integration lint security`, and `make live-e2e` for the live lane.
+
+Release readiness criteria live in [docs/release-readiness.md](docs/release-readiness.md).
 
 ## Security
 

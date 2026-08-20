@@ -1,0 +1,79 @@
+# Weekly quality + performance eval of the local serving stack.
+#
+# Two lanes, both against the live topology on the self-hosted runner:
+#   perf   — `llm-router bench`: streaming TTFT, tok/s, p50/p95 latency at
+#            concurrency 1 and 4 (the measured slot sweet spot).
+#   quality— fleet-bench matrix mode over the locked v300-baseline corpus
+#            (50 prompts with per-prompt pass predicates), giving a score
+#            directly comparable to the Qwen3.6 baseline.
+# Reports upload as artifacts; regressions are judged against
+# docs/benchmarks.md numbers. SKIP-safe on runners without the stack.
+name: local-eval
+
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: local-model-eval
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Stack present?
+        run: |
+          if ! curl -sf --max-time 5 http://127.0.0.1:8010/health; then
+            echo "::notice::local model not present on this runner — skipping eval"
+            echo "SKIP_STACK=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Perf bench (concurrency 1 and 4)
+        if: env.SKIP_STACK != '1'
+        run: |
+          mkdir -p eval-out
+          go run . bench -url http://127.0.0.1:8010 -model qwen3.8-27b-local \
+            -requests 8 -concurrency 1 -max-tokens 192 -output eval-out/bench-c1.json
+          go run . bench -url http://127.0.0.1:8010 -model qwen3.8-27b-local \
+            -requests 8 -concurrency 4 -max-tokens 192 -output eval-out/bench-c4.json
+
+      - name: Quality matrix (v300-baseline corpus via fleet-bench)
+        if: env.SKIP_STACK != '1'
+        run: |
+          if [ -x "$HOME/runs/fleet-bench" ]; then
+            "$HOME/runs/fleet-bench" -mode matrix -corpus v300-baseline \
+              -endpoint http://127.0.0.1:8787/v1 -model qwen3.8-27b-local \
+              -out eval-out/matrix.json
+          else
+            echo "::notice::fleet-bench binary not installed on this runner — perf lane only"
+          fi
+
+      - name: Summarise
+        if: env.SKIP_STACK != '1'
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          out = pathlib.Path("eval-out")
+          for f in sorted(out.glob("*.json")):
+              d = json.loads(f.read_text())
+              keys = [k for k in d if any(x in k for x in
+                      ("tok", "ttft", "latency", "pass", "success", "total"))]
+              print(f.name, {k: d[k] for k in keys[:8]})
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: env.SKIP_STACK != '1'
+        with:
+          name: local-eval-${{ github.run_id }}
+          path: eval-out/
+          retention-days: 90
