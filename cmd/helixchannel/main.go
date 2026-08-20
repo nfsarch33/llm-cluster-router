@@ -121,6 +121,14 @@ func main() {
 		if err := runCheckKeys(os.Args[2:]); err != nil {
 			fail("check-keys", err)
 		}
+	case "gateway":
+		if err := runGateway(os.Args[2:]); err != nil {
+			fail("gateway", err)
+		}
+	case "proxy":
+		if err := runProxy(os.Args[2:]); err != nil {
+			fail("proxy", err)
+		}
 	default:
 		usage()
 		os.Exit(2)

@@ -1,215 +1,115 @@
-# Kilo Code (VS Code) — HelixChannel Setup
+# Kilo Code through HelixChannel
 
-End-to-end setup walkthrough for the Kilo Code VS Code extension
-against the HelixChannel production wire (v18716.1 / ADR-085 /
-ADR-086). Operator-facing only; this doc does NOT cover upstream
-LLM deployment.
+End-to-end setup for the [Kilo Code](https://marketplace.visualstudio.com/items?itemName=kilocode.Kilo-Code) VS Code extension against a HelixChannel gateway. Kilo speaks the OpenAI-compatible API, so it uses the reverse-proxy routes: you change one base URL and never put a provider key in the editor.
 
-## What this gives you
+The same steps work for any OpenAI-compatible client — Cursor, Continue, Codex CLI, `curl`.
 
-Kilo Code in VS Code sends every prompt over an OpenAI-compatible
-HTTP wire. When the extension is pointed at the HelixChannel
-production base URL, every prompt flows:
+## 1. Gateway side
 
+A route per provider, each with its own feature flag:
+
+```yaml
+listen: "127.0.0.1:14445"
+audit_log: /var/log/helixchannel/gateway.ndjson
+
+routes:
+  - name: minimax
+    prefix: /minimax/
+    upstream: https://api.minimaxi.com
+    auth: inject
+    key_file: /run/secrets/minimax.key
+    enabled: true
 ```
-VS Code Kilo Code
-  → HTTPS POST https://helixchannel.cylrl.dev/minimax/v1/chat/completions
-  → Lightsail nginx (TLS termination on :443)
-  → AES-256-GCM application-layer encrypted tunnel
-  → upstream LLM (MiniMax-M3 / Qwen / etc.)
-  → response back to Kilo Code in the same pipe
-```
 
-The AES-256-GCM encryption is application-layer; the nginx
-TLS termination at :443 is the transport envelope. Both are
-transparent to Kilo Code — it sees an ordinary OpenAI-compatible
-HTTPS endpoint.
-
-## Prerequisites
-
-| Prereq | Where | Status (v18716) |
-| --- | --- | --- |
-| Lightsail `helixon-tunnel` reachable on TCP/443 | `aws lightsail get-instance --instance-name helixon-tunnel` | GREEN (see `helixchannel endpoint-check --host helixchannel.cylrl.dev`) |
-| nginx reverse-proxy installed + reloaded on the instance | `ssh ubuntu@helixchannel.cylrl.dev sudo systemctl status nginx` | GREEN (v18714-1) |
-| MiniMax Token Plan key in 1Password | `<vault-name> / <item-name>` (see ~/.config/runx/config.yaml owners map) | LIVE |
-| Go 1.25+ on the operator host | `go version` | Optional — needed only for the Go integration test |
-
-## Quick path (operator checklist)
-
-### 1. Validate the wire end-to-end (5 min)
+Keys stay in root-owned files that only the gateway can read:
 
 ```bash
-# Build the operator-facing CLI binary
-cd ~/Code/llm-cluster-router
-go build -o helixchannel ./cmd/helixchannel
-
-# Smoke 1: doctor (Lightsail TCP/443 reachability)
-./helixchannel doctor            # expect all checks "pass"
-
-# Smoke 2: kilo-verify (live MiniMax-M3 round-trip)
-KILO_CODE_API_KEY="$(op read op://<item-uuid>/tagc4supdfgjj3rujdpb67ygm -o /tmp/.kilo && cat /tmp/.kilo && rm /tmp/.kilo)"
-HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1 ./helixchannel kilo-verify
-# expect: {"verdict":"pass","base_url":"https://helixchannel.cylrl.dev/minimax/v1","model":"MiniMax-M3",...}, exit 0
+sudo install -d -m 0750 /run/secrets
+printf '%s' "$PROVIDER_KEY" | sudo tee /run/secrets/minimax.key >/dev/null
+sudo chmod 640 /run/secrets/minimax.key
 ```
 
-If `helixchannel kilo-verify` exits 2 (SKIP), the wire is intact but
-a 1Password item is stale; rotate `<vault-name>/<item-name> (see ~/.config/runx/config.yaml owners map)` and retry.
+Start it (container or systemd — see [HelixChannel](helixchannel.md#running-it)) and confirm the route is live:
 
-If it exits 1 (FAIL), inspect `error_class`:
+```bash
+curl -s https://gateway.example.com/healthz
+# {"status":"ok","service":"helixchannel-gateway","routes":["minimax"],"connect":false}
+```
 
-| `error_class` | Meaning | Fix |
-| --- | --- | --- |
-| `tls` | Lightsail cert lacks IP SAN for `helixchannel.cylrl.dev` | Use `--insecure` or set `HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1` (see TLS note below) |
-| `timeout` | Upstream MiniMax quota exhausted | Wait for quota refresh, then retry |
-| `refused` | nginx down on Lightsail | `ssh ubuntu@helixchannel.cylrl.dev sudo systemctl restart nginx` |
-| `upstream_4xx` | API key rejected | Rotate `<vault-name>/<item-name> (see ~/.config/runx/config.yaml owners map)` |
+`routes` reflects what is actually enabled. If a provider is missing here, its `enabled` flag is off.
 
-### 2. Install Kilo Code in VS Code
+## 2. Verify the wire before touching the editor
 
-VS Code Marketplace → search "Kilo Code" → install.
-
-### 3. Configure Kilo Code to use HelixChannel
-
-Open VS Code Settings (JSON) — `Ctrl+Shift+P` → "Preferences: Open
-User Settings (JSON)" — and add:
+```bash
+helixchannel kilo-verify \
+  -base-url https://gateway.example.com/minimax/v1 \
+  -model MiniMax-M3
+```
 
 ```json
-{
-  "kilocode.openAiBaseUrl": "https://helixchannel.cylrl.dev/minimax/v1",
-  "kilocode.openAiApiKey":  "<paste value from 1Password MiniMax Token Plan Key>",
-  "kilocode.openAiModel":   "MiniMax-M3"
-}
+{"verdict":"pass","base_url":"https://gateway.example.com/minimax/v1","model":"MiniMax-M3","latency_ms":1884,"error_class":"none"}
 ```
 
-> **Do not** commit `settings.json` to git. Add
-> `.vscode/settings.json` to `.gitignore` for any repo you want to
-> keep clean.
+Exit codes: `0` pass, `1` fail (wire broken — read `error_class`), `2` skip (no client key configured). Add `-insecure` if the gateway still serves a self-signed certificate.
 
-### 4. Launch VS Code with TLS skip-verify (temporary)
+Doing this first means that if the extension misbehaves later, you already know whether the wire is good.
 
-The Lightsail nginx cert is valid for a hostname but NOT for the
-IP `helixchannel.cylrl.dev`. Browsers and VS Code reject IP-only certs by
-default. Until the operator attaches a domain + ACME cert
-(see `CF-v18716-KiloCode-TLSCert`), launch VS Code with the
-bypass:
+## 3. Configure the extension
+
+Extensions panel → search "Kilo Code" → Install. Open the Kilo Code panel, then the settings gear:
+
+| Field | Value |
+|---|---|
+| API Provider | `OpenAI Compatible` |
+| Base URL | `https://gateway.example.com/minimax/v1` |
+| API Key | any non-empty placeholder, e.g. `helixchannel-client` |
+| Model | `MiniMax-M3` |
+| Max Tokens | `2048` |
+| Temperature | `0.7` |
+
+Two details that cause most failures:
+
+- **The route prefix is part of the base URL.** `https://gateway.example.com/v1` will 404 — the gateway needs `/minimax/v1` to know which upstream you mean. The 404 body lists the routes that are available.
+- **The API key is a placeholder.** The gateway replaces it with the real key. That is the entire point: the editor never holds a provider credential. If the gateway is running in `passthrough` mode instead, then the key you enter *is* the one used.
+
+If the gateway serves a self-signed certificate, enable the extension's TLS-skip option. Prefer a CA-issued certificate and leave verification on.
+
+## 4. Confirm end to end
+
+Send a message in the Kilo Code panel, then check the gateway:
 
 ```bash
-HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1 code ~/Code/cursor-global-kb
+tail -2 /var/log/helixchannel/gateway.ndjson
 ```
-
-For dev only — never ship this to a customer fleet.
-
-### 5. Send a test prompt
-
-Open the Kilo Code panel (left sidebar icon) and send a prompt.
-Expected: response in ~1-2 s with content from `MiniMax-M3`.
-
-## Swap to Qwen (same wire)
-
-The HelixChannel wire is upstream-agnostic; you can swap MiniMax for
-Qwen by changing two settings:
 
 ```json
-{
-  "kilocode.openAiBaseUrl": "https://helixchannel.cylrl.dev/qwen/v1",
-  "kilocode.openAiModel":   "qwen3.5-plus"
-}
+{"ts":"2026-08-20T01:20:11Z","event":"proxy_request","route":"minimax","auth_mode":"inject","method":"POST","path":"/minimax/v1/chat/completions","status":200,"latency_ms":1435}
 ```
 
-Then validate with:
+`auth_mode: inject` confirms the server-side key was applied, and no credential appears in the log.
 
-```bash
-KILO_CODE_BASE_URL=https://helixchannel.cylrl.dev/qwen/v1 \
-KILO_CODE_MODEL=qwen3.5-plus \
-  HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1 \
-  ./helixchannel kilo-verify
+## Adding another provider
+
+Append a route and restart the gateway:
+
+```yaml
+  - name: codex
+    prefix: /codex/
+    upstream: https://api.openai.com
+    auth: inject
+    key_file: /run/secrets/openai.key
+    enabled: true
 ```
 
-## Production TLS fix (operator decision)
+Clients switch by changing base URL to `https://gateway.example.com/codex/v1`. Turning a provider off again is `enabled: false` — its prefix then returns 404 and the key is no longer read.
 
-The TLS skip-verify workaround is acceptable for internal dev only.
-For production, attach a hostname + ACME cert to the Lightsail
-instance:
+## Troubleshooting
 
-**Option A (preferred) — Domain + Let's Encrypt via Cloudflare proxy:**
-
-1. Register a cheap domain (e.g. `helix.helixon.dev`) on Cloudflare.
-2. Create a Cloudflare Tunnel or DNS-only A record pointing at
-   `helixchannel.cylrl.dev`.
-3. Cloudflare terminates TLS at the edge with a managed cert
-   (no IP-SAN issue; cert is for the hostname).
-4. Operator trusts the Cloudflare root CA in the system trust store.
-
-**Option B — Lightsail load balancer with managed TLS:**
-
-1. Provision a Lightsail load balancer in front of `helixon-tunnel`.
-2. Attach the load balancer's auto-managed ACM cert (Lightsail
-   provisions via ACME if you supply a domain you own).
-3. Update Kilo Code `openAiBaseUrl` to `https://<domain>/minimax/v1`.
-
-**Option C — Self-managed ACME on Lightsail:**
-
-1. `ssh ubuntu@helixchannel.cylrl.dev sudo apt install certbot`.
-2. `sudo certbot certonly --nginx -d <your-domain>` (DNS must point
-   at helixchannel.cylrl.dev already).
-3. Update nginx `ssl_certificate` directives to point at the new
-   `/etc/letsencrypt/live/<domain>/fullchain.pem`.
-4. Update Kilo Code `openAiBaseUrl` to `https://<domain>/minimax/v1`.
-
-Pick one before exposing the wire outside the operator host.
-
-## Verification matrix
-
-After every setup change, run the full E2E pipeline:
-
-```bash
-# 1. Doctor (Lightsail TCP/443 + Lightsail cert)
-./helixchannel doctor
-# Expect: all checks "pass" or "skipped" (skip is OK in offline/CI)
-
-# 2. Kilo-verify (live MiniMax-M3)
-KILO_CODE_API_KEY="$(op read op://<item-uuid>/tagc4supdfgjj3rujdpb67ygm -o /tmp/.kilo && cat /tmp/.kilo && rm /tmp/.kilo)" \
-  HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1 \
-  ./helixchannel kilo-verify
-# Expect: exit 0, verdict=pass, latency_ms in single-digit ms × 1000
-
-# 3. Go integration test (CI gate)
-go test -tags=realmodel -count=1 -v -run TestKiloCodeE2E ./internal/tunnel/integration/...
-# Expect: PASS TestKiloCodeE2E_MiniMaxRoundTrip + TestKiloCodeE2E_SkipsWhenKeyMissing
-```
-
-## Anti-patterns
-
-- ❌ Do NOT commit the API key to git (use 1Password via `op read`).
-- ❌ Do NOT use `--insecure` (CLI) or `HELIXCHANNEL_TLS_INSECURE_SKIP_VERIFY=1`
-   in production fleet / customer-facing deployments.
-- ❌ Do NOT point Kilo Code at `minimax.io` (wrong platform).
-   Canonical host: `helixchannel.cylrl.dev` (Lightsail reverse-proxy).
-- ❌ Do NOT paste the API key into VS Code settings.json if the file
-   is tracked in git. Use a workspace settings file under `.vscode/`
-   and add it to `.gitignore`, OR pipe via the VS Code launch env.
-- ❌ Do NOT disable the AES/mTLS tunnel thinking it is a bug. The
-   encryption is intentional and standard-compliant (ADR-085).
-
-## Cross-references
-
-- HelixChannel architecture: `adrs/ADR-085-helixchannel-prod-wire.md`
-  in `cursor-global-kb`.
-- Production ingress (TCP/443): `adrs/ADR-086-helixchannel-port-443-migration.md`
-  in `cursor-global-kb`.
-- Release readiness gate: `docs/release-readiness.md` + `scripts/release-gate.sh`.
-- Lightsail reverse-proxy SOP: `cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md`.
-- Operator CLI subcommands: `cmd/helixchannel/main.go` (`version`,
-  `factory-probe`, `key-check`, `header-stamp`, `doctor`,
-  `endpoint-check`, `kilo-verify`).
-- Kilo Code E2E Go integration test: `internal/tunnel/integration/kilo_code_e2e_test.go`.
-- Kilo Code shell smoke: `scripts/kilo-code-smoke.sh`.
-
-## Carry-forwards
-
-- `CF-v18716-KiloCode-TLSCert` — Lightsail cert has no IP SAN;
-  TLS skip-verify used during dev. Production fix is operator-attached
-  domain + ACME cert.
-- `CF-v18716-KiloCode-Operator` — VS Code extension install + Kilo Code
-  panel configuration is operator UI action; this doc provides the
-  checklist.
+| Symptom | Cause | Fix |
+|---|---|---|
+| `404` with a `routes` list | Missing or wrong route prefix in the base URL | Use `/<route>/v1`; compare against the list in the response |
+| `404` and your route is absent from the list | Route disabled | Set `enabled: true` and restart |
+| `401`/`403` from the provider | Server-side key rejected | Check the key file contents and provider quota; `error_class` in the audit log narrows it |
+| `502` with `error_class: dns` or `refused` | Gateway cannot reach the upstream | Check egress from the gateway host |
+| `502` with `error_class: timeout` | Upstream slow | Raise `timeout` on the route |
+| TLS errors in the extension | Self-signed certificate | Issue a proper certificate, or enable TLS-skip while piloting |

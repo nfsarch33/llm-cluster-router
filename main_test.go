@@ -533,7 +533,13 @@ func TestRunCancelProbeSetsMaxTokens(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	result := runCancelProbe(server.URL, "qwen3.5-27b", "local", "hello", 10*time.Millisecond, 64)
+	// The subject of this test is the max_tokens value, asserted in the stub
+	// above. The cancellation deadline must therefore be long enough that it
+	// cannot fire before an immediate local response completes: with a 10ms
+	// deadline a loaded machine cancels the in-flight request and the probe
+	// correctly reports "context canceled", failing a test that is not about
+	// cancellation at all.
+	result := runCancelProbe(server.URL, "qwen3.5-27b", "local", "hello", 30*time.Second, 64)
 	if result.Error != "" {
 		t.Fatalf("runCancelProbe returned error: %#v", result)
 	}

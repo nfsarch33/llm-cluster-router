@@ -1,0 +1,64 @@
+# HelixChannel gateway configuration.
+#
+# Every provider is a route. Turning a provider on or off, or adding a new
+# one, is an edit to this file — not a code change and not a new binary.
+#
+# Credentials are never written here. Each route names an environment
+# variable (key_env) or a file (key_file) that holds the key at runtime, so
+# this file is safe to commit and to copy between nodes.
+
+listen: "0.0.0.0:14443"   # bind loopback instead when a TLS terminator runs on the same host
+timeout: 90s
+audit_log: ""             # empty = stdout (captured by the container/journal)
+
+routes:
+  # MiniMax — the pilot upstream. Clients send a placeholder bearer; the
+  # gateway swaps in the real key, so the key never leaves the server.
+  - name: minimax
+    prefix: /minimax/
+    upstream: https://api.minimaxi.com
+    auth: inject
+    key_file: /run/secrets/minimax.key
+    enabled: true
+
+  # Qwen via Aliyun TokenPlan compatible-mode.
+  - name: qwen
+    prefix: /qwen/
+    upstream: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    auth: inject
+    key_file: /run/secrets/qwen.key
+    enabled: true
+
+  # OpenAI / Codex CLI. Flip enabled to true and mount the key to switch it
+  # on — this entry is the worked example of adding a provider by config.
+  - name: codex
+    prefix: /codex/
+    upstream: https://api.openai.com
+    auth: inject
+    key_file: /run/secrets/openai.key
+    enabled: false
+
+  # Anthropic over the reverse-proxy path, for clients that hold their own
+  # API key and simply want the traffic to travel through the channel.
+  # Claude Code itself uses the CONNECT leg below instead, because its OAuth
+  # session must terminate at Anthropic rather than at this gateway.
+  - name: anthropic
+    prefix: /anthropic/
+    upstream: https://api.anthropic.com
+    auth: passthrough
+    enabled: false
+
+# CONNECT leg: an authenticated, allowlisted TCP tunnel.
+#
+# This is what lets Claude Code (and any agent that must keep its own TLS
+# session end to end) route through the channel: the gateway pipes bytes
+# without terminating the inner TLS, so the agent's credential is never
+# visible to the gateway or to any hop in between.
+connect:
+  enabled: true
+  token_file: /run/secrets/connect.token
+  dial_timeout: 10s
+  allowed_hosts:
+    - api.anthropic.com:443
+    - statsig.anthropic.com:443
+    - api.minimaxi.com:443
