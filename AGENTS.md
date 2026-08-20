@@ -46,7 +46,7 @@ prompted this rule.)
 ## How to find the UUID
 
 ```bash
-op item list --vault HelixonSafe --format json | \
+op item list --vault <vault-name> --format json | \
   python3 -c "import sys, json; [print(f\"{i['id']:26s} | {i['title']}\") for i in json.load(sys.stdin)]"
 ```
 
@@ -54,23 +54,23 @@ op item list --vault HelixonSafe --format json | \
 
 ```go
 // CORRECT
-val, err := opRead("HelixonSafe", "ripotpfq43jzlreor4zo2ay734", "api-key")
+val, err := opRead("<vault-name>", "<item-uuid>", "api-key")
 
 // WRONG — display name with spaces and special chars
-val, err := opRead("HelixonSafe", "minimax-api-1", "api-key")
+val, err := opRead("<vault-name>", "<item-name>", "api-key")
 ```
 
 ```bash
 # CORRECT
-op read "op://HelixonSafe/ripotpfq43jzlreor4zo2ay734/api-key"
+op read "op://<vault-name>/<item-uuid>/api-key"
 
 # WRONG
-op read "op://HelixonSafe/minimax-api-1/api-key"
+op read "op://<vault-name>/<item-name>/api-key"
 ```
 
 ## Exceptions
 
-- The 1Password **vault** names (e.g. `HelixonSafe`) use display names
+- The 1Password **vault** names (e.g. `<vault-name>`) use display names
   by convention — they don't contain special characters and they're
   shorter.
 - Comments in code can refer to items by display name, but the

@@ -12,9 +12,9 @@ import (
 // at the same secret.
 func TestDedupeKeys_PreservesFirstOccurrence(t *testing.T) {
 	in := []ConfigKeyRef{
-		{Name: "minimax", Vault: "HelixonSafe", Item: "rip1", Field: "tag1"},
-		{Name: "minimax-aliased", Vault: "HelixonSafe", Item: "rip1", Field: "tag1"},
-		{Name: "grafana", Vault: "HelixonSafe", Item: "rip2", Field: "tag2"},
+		{Name: "minimax", Vault: "<vault-name>", Item: "rip1", Field: "tag1"},
+		{Name: "minimax-aliased", Vault: "<vault-name>", Item: "rip1", Field: "tag1"},
+		{Name: "grafana", Vault: "<vault-name>", Item: "rip2", Field: "tag2"},
 	}
 	out := dedupeKeys(in)
 	if len(out) != 2 {
@@ -84,7 +84,7 @@ func TestProbeOnePasswordKey_OpMissingSkips(t *testing.T) {
 	// returns ENOENT.
 	t.Setenv("PATH", "")
 	res := probeOnePasswordKey(ConfigKeyRef{
-		Name: "minimax", Vault: "HelixonSafe", Item: "x", Field: "y",
+		Name: "minimax", Vault: "<vault-name>", Item: "x", Field: "y",
 	})
 	if res.Status != "skip" {
 		t.Errorf("expected skip when op missing; got %q (err=%q)", res.Status, res.ErrorClass)

@@ -39,8 +39,8 @@ import (
 var defaultCheckKeys = []ConfigKeyRef{
 	{
 		Name:  "minimax",
-		Vault: "HelixonSafe",
-		Item:  "ripotpfq43jzlreor4zo2ay734",
+		Vault: "<vault-name>",
+		Item:  "<item-uuid>",
 		Field: "tagc4supdfgjj3rujdpb67ygm",
 	},
 }
