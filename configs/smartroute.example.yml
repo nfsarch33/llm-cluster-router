@@ -9,6 +9,16 @@
 
 enabled: true
 
+# Per-agent route switches: one boolean each. Flip with
+#   scripts/agent-route.sh <agent> on|off
+# Only an explicit false blocks (403 at the router); unknown or absent
+# agents always pass, so adding a tool later needs no config change.
+agents:
+  cursor: true
+  claude-code: true
+  kilo-code: true
+  codex: false
+
 # Used when nothing else matches.
 default_class: chat
 

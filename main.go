@@ -46,9 +46,10 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/gpuprobe"
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
-	"github.com/nfsarch33/llm-cluster-router/internal/quota"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
+	"github.com/nfsarch33/llm-cluster-router/internal/quota"
 	rtr "github.com/nfsarch33/llm-cluster-router/internal/router"
+	"github.com/nfsarch33/llm-cluster-router/internal/smartroute"
 	"github.com/nfsarch33/llm-cluster-router/internal/tunnel"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -118,6 +119,7 @@ type router struct {
 	semaphore     chan struct{}
 	nodes         []*upstreamNode
 	fairScheduler *fairshare.Scheduler
+	smart         *smartroute.Router
 
 	mu sync.RWMutex // protects cfg, client, semaphore, nodes during Reload
 
@@ -138,6 +140,7 @@ type routerSnap struct {
 	nodes     []*upstreamNode
 	client    *http.Client
 	semaphore chan struct{}
+	smart     *smartroute.Router
 }
 
 // snap takes an RLock and copies the reloadable router state into a
@@ -155,6 +158,7 @@ func (r *router) snap() routerSnap {
 		nodes:     nodes,
 		client:    r.client,
 		semaphore: r.semaphore,
+		smart:     r.smart,
 	}
 }
 
@@ -189,11 +193,16 @@ func (r *router) Reload(path string) error {
 	if err != nil {
 		return fmt.Errorf("router reload: build state: %w", err)
 	}
+	smart, err := loadSmartRoute(cfg)
+	if err != nil {
+		return fmt.Errorf("router reload: %w", err)
+	}
 	r.mu.Lock()
 	r.cfg = cfg
 	r.nodes = nodes
 	r.client = client
 	r.semaphore = sem
+	r.smart = smart
 	r.mu.Unlock()
 	log.Printf("router reload succeeded for %s (nodes=%d, max_concurrency=%d, request_timeout=%s)",
 		path, len(nodes), cfg.Defaults.MaxConcurrency, cfg.Defaults.RequestTimeout.Duration)
@@ -225,6 +234,21 @@ func watchReloadSignal(sigCh <-chan os.Signal, path string, r *router, after fun
 // pieces of router state. It is shared by newRouter (initial boot)
 // and Reload (atomic swap) so both paths apply identical validation
 // and defaulting.
+// loadSmartRoute builds the optional smartroute router from config. A
+// disabled feature or empty policy path returns nil, which every call site
+// treats as pass-through — misconfiguration fails loudly at boot/reload
+// instead of silently misrouting traffic.
+func loadSmartRoute(c config) (*smartroute.Router, error) {
+	if !c.SmartRoute.Enabled || c.SmartRoute.PolicyFile == "" {
+		return nil, nil
+	}
+	p, err := smartroute.LoadPolicy(c.SmartRoute.PolicyFile)
+	if err != nil {
+		return nil, fmt.Errorf("smart_route: %w", err)
+	}
+	return smartroute.NewRouter(p), nil
+}
+
 func buildReloadable(cfg config) ([]*upstreamNode, *http.Client, chan struct{}, error) {
 	nodes := make([]*upstreamNode, 0, len(cfg.Nodes))
 	for _, nc := range cfg.Nodes {
@@ -506,6 +530,11 @@ func newRouter(cfg config) (*router, error) {
 		semaphore: sem,
 		nodes:     nodes,
 	}
+	smart, err := loadSmartRoute(cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.smart = smart
 	if cfg.FairShare.Enabled {
 		r.fairScheduler = fairshare.New(fairshare.Config{
 			MaxRequestsPerUser: cfg.FairShare.MaxRequestsPerUser,
@@ -689,8 +718,24 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	// from one config and a timeout from a newer one.
 	snap := r.snap()
 
-	model := extractModel(body)
 	tier := req.Header.Get("X-Tier")
+	if snap.smart != nil {
+		agent := smartroute.DetectAgent(req)
+		if !snap.smart.AgentAllowed(agent) {
+			http.Error(w, fmt.Sprintf("route disabled for agent %q by smartroute policy", agent), http.StatusForbidden)
+			requestsTotal.WithLabelValues(extractModel(body), "none", "agent_disabled").Inc()
+			return
+		}
+		if d, derr := snap.smart.Decide(req, body); derr == nil {
+			if nb, rerr := snap.smart.Rewrite(body, d); rerr == nil {
+				body = nb
+			}
+			if tier == "" {
+				tier = d.Tier
+			}
+		}
+	}
+	model := extractModel(body)
 	node := r.selectNodeFromSnap(snap, model, tier, "")
 	if node == nil {
 		http.Error(w, "no healthy upstream available for requested model", http.StatusServiceUnavailable)
@@ -1599,7 +1644,6 @@ var _ = httputil.ReverseProxy{}
 // detector.Notify.
 var _ = quota.New
 
-
 // Ready evaluates the canonical readiness contract for the router.
 //
 //   - At least one upstream must be healthy (healthy_nodes >= 1).
@@ -1621,23 +1665,23 @@ func (r *router) Ready() (bool, string) {
 	snap := r.snap()
 	healthy := 0
 	for _, node := range snap.nodes {
-			if node.healthy.Load() {
-					healthy++
-			}
+		if node.healthy.Load() {
+			healthy++
+		}
 	}
 	if healthy == 0 {
-			return false, "no healthy upstream nodes"
+		return false, "no healthy upstream nodes"
 	}
 
 	maxQD := int64(snap.cfg.Defaults.MaxQueueDepth)
 	if cur := r.queueDepth.Load(); cur > maxQD {
-			return false, fmt.Sprintf("queue depth %d exceeds ceiling %d", cur, maxQD)
+		return false, fmt.Sprintf("queue depth %d exceeds ceiling %d", cur, maxQD)
 	}
 
 	for _, node := range snap.nodes {
-			if node.breaker != nil && node.breaker.Stats().State == circuitOpen {
-					return false, fmt.Sprintf("upstream %q breaker is open", node.cfg.Name)
-			}
+		if node.breaker != nil && node.breaker.Stats().State == circuitOpen {
+			return false, fmt.Sprintf("upstream %q breaker is open", node.cfg.Name)
+		}
 	}
 
 	return true, ""
@@ -1652,10 +1696,10 @@ func (r *router) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	ready, reason := r.Ready()
 	status := http.StatusOK
 	if !ready {
-			status = http.StatusServiceUnavailable
+		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, map[string]any{
-			"ready":  ready,
-			"reason": reason,
+		"ready":  ready,
+		"reason": reason,
 	})
 }

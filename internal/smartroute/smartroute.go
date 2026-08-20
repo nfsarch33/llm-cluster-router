@@ -92,6 +92,10 @@ type Policy struct {
 	// Enabled is the master switch. When false the router is inert and
 	// bodies pass through untouched.
 	Enabled bool `yaml:"enabled"`
+	// Agents is the per-agent route gate: one boolean per calling agent
+	// (cursor, claude-code, kilo-code, codex, ...). Only an explicit false
+	// blocks; a missing entry allows, so the section is purely additive.
+	Agents map[string]*bool `yaml:"agents"`
 	// DefaultClass is used when no class matches.
 	DefaultClass string  `yaml:"default_class"`
 	Classes      []Class `yaml:"classes"`
