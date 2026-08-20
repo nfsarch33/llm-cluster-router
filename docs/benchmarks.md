@@ -85,9 +85,26 @@ go run . bench -url http://127.0.0.1:8010 -model qwen3.8-27b-local \
 Run perf sweeps only while the model is otherwise idle — a concurrent eval
 pollutes TTFT and tok/s (observed: TTFT p50 inflated 3.8 s under contention).
 
-> **Known issue:** the `bench` subcommand currently mislabels its token
-> rates (generation/prompt appear swapped) and reports content-TTFT, which
-> for reasoning models equals full latency because thinking tokens stream
-> first. Use the server-side `print_timing` journal lines as authority
-> until the tracked fix lands. All numbers above come from server-side
-> timing or raw curl measurements.
+### `bench` metric semantics
+
+- **TTFT** = time to the **first SSE delta of any kind**, reasoning/thinking
+  deltas included (`delta.reasoning_content` / `delta.reasoning` /
+  `delta.content`). This is the standard queue + prefill definition and is
+  comparable across thinking and non-thinking models. `bench` deliberately
+  does **not** report time-to-first-*visible*-content: for reasoning models
+  the whole think phase streams before the first visible delta, so that
+  number tracks how long the model chose to think, not how responsive the
+  serving stack is.
+- **`avg_prompt_tokens_per_sec`** = prompt tokens / TTFT window (prefill
+  rate, slightly understated by network + router hop).
+- **`avg_generation_tokens_per_sec`** = completion tokens (thinking +
+  visible) / decode window (latency − TTFT).
+
+History: before the fix that introduced these semantics, `bench` anchored
+TTFT at the first *visible* content delta, which for reasoning models made
+TTFT ≈ full latency, inflated the generation rate several-fold (completion
+tokens divided by only the visible tail) and deflated the prompt rate
+(prompt tokens divided by full latency) — e.g. 1254 tok/s "generation"
+against a server-side truth of ~36 tok/s. Numbers from `bench` builds
+predating `TestRunBenchRequestReasoningStreamMetrics` are unreliable;
+server-side `print_timing` journal lines remain the cross-check authority.
