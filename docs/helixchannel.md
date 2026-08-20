@@ -123,7 +123,7 @@ curl -s https://gateway.example.com/healthz
 # {"status":"ok","service":"helixchannel-gateway","routes":["minimax","qwen"],"connect":true}
 
 # A route end-to-end
-curl -s https://gateway.example.com/minimax/v1/models -H 'Authorization: Bearer placeholder'
+curl -s https://gateway.example.com/minimax/v1/models -H "Authorization: Bearer $CLIENT_TOKEN"
 
 # The CONNECT leg, and that the certificate is the provider's
 curl -v -x http://127.0.0.1:47810 https://api.anthropic.com/ 2>&1 | grep -E 'subject:|verify'
