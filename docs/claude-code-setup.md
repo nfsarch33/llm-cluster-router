@@ -128,3 +128,15 @@ Remove the five proxy keys from `~/.claude/settings.json` and restart the app. K
 | `407` from the gateway | Token missing or wrong | Compare the client token file with the gateway's |
 | TLS error dialling the gateway | Self-signed certificate | Use a CA-issued certificate, or `--insecure` while piloting |
 | `curl` works, agent does not | Agent read a stale config | Fully restart the app; confirm the keys are in the user-level `settings.json` |
+
+## Local models and the per-agent gate
+
+Claude Code's Anthropic traffic keeps using the CONNECT proxy above (OAuth
+intact, keys never proxied in plain form). Independently of that, tooling on
+the same machine can call the local model pool through the router:
+
+- Base URL `http://127.0.0.1:8787/v1`, model `qwen3.8-27b-local` (or `auto`).
+- Claude Code is a first-class gated agent: the smart-route policy carries a
+  `claude-code` boolean (`scripts/agent-route.sh claude-code on|off`). A
+  gated-off agent receives `403 route disabled for agent "claude-code"` —
+  that response comes from the router's policy, not from Anthropic.

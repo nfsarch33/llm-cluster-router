@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -81,9 +82,13 @@ func WarnIfOutdated(logger *slog.Logger, owner, repo, current string) {
 	}
 }
 
+// aheadOfTag matches git-describe output for commits past a tag
+// (v1.0.0-11-gabc123): effectively a dev build — warning would be noise.
+var aheadOfTag = regexp.MustCompile(`-[0-9]+-g[0-9a-f]+(-dirty)?$`)
+
 func skippable(current string) bool {
 	c := strings.TrimSpace(current)
-	return c == "" || c == "dev" || strings.HasSuffix(c, "-dirty")
+	return c == "" || c == "dev" || strings.HasSuffix(c, "-dirty") || aheadOfTag.MatchString(c)
 }
 
 func normalize(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "v") }

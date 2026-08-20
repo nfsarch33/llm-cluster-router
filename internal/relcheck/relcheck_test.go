@@ -52,7 +52,7 @@ func TestCheck_CurrentBinaryIsQuiet(t *testing.T) {
 func TestCheck_DevBuildsNeverWarn(t *testing.T) {
 	var hits atomic.Int64
 	fakeAPI(t, &hits, `[{"name":"v9.9.9"}]`)
-	for _, v := range []string{"", "dev", "v1.0.0-3-gabc123-dirty"} {
+	for _, v := range []string{"", "dev", "v1.0.0-3-gabc123-dirty", "v1.0.0-11-g86256f1"} {
 		res, err := Check(context.Background(), "o", "r", v, t.TempDir())
 		if err != nil {
 			t.Fatalf("Check(%q): %v", v, err)
