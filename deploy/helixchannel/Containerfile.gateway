@@ -1,0 +1,39 @@
+# HelixChannel gateway — rootless, read-only, distroless.
+#
+# Build (from the repository root):
+#   podman build -t localhost/helixon/helixchannel-gateway:dev \
+#     -f deploy/helixchannel/Containerfile.gateway .
+#
+# The image carries no shell and no package manager: the only executable is
+# the statically linked gateway. Credentials are never baked in — they arrive
+# at runtime as mounted files or environment variables, so the same image is
+# safe to publish and to reuse across nodes.
+
+FROM docker.io/library/golang:1.25-alpine AS build
+WORKDIR /src
+
+# Dependencies first so a source-only change reuses the module cache layer.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+# CGO off keeps the binary static so it runs on a scratch base; -trimpath and
+# an empty build id keep the artefact reproducible.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -buildid=" \
+      -o /out/helixchannel ./cmd/helixchannel
+
+FROM gcr.io/distroless/static-debian12:nonroot
+LABEL org.opencontainers.image.title="helixchannel-gateway" \
+      org.opencontainers.image.description="HelixChannel encrypted egress gateway for LLM API traffic" \
+      org.opencontainers.image.source="https://github.com/nfsarch33/llm-cluster-router" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY --from=build /out/helixchannel /usr/local/bin/helixchannel
+
+# 65532:65532 is distroless "nonroot"; the gateway needs no privileges and
+# binds an unprivileged port.
+USER 65532:65532
+EXPOSE 14443
+
+ENV HELIXCHANNEL_GATEWAY_CONFIG=/etc/helixchannel/gateway.yml
+ENTRYPOINT ["/usr/local/bin/helixchannel", "gateway"]
