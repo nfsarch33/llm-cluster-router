@@ -53,20 +53,63 @@ func DetectAgent(req *http.Request) string {
 	return ""
 }
 
+// AgentPolicy is one agent's entry in the policy's agents map. YAML accepts
+// two shapes, so the simple case stays a one-liner:
+//
+//	agents:
+//	  codex: false                      # plain boolean gate
+//	  cursor:                           # extended form
+//	    enabled: true
+//	    force_class: code               # ALL cursor traffic routed as "code",
+//	                                    # even when it names a concrete model
+//
+// force_class exists for callers whose UIs insist on sending their own model
+// ids (Cursor sends gpt-* names): it overrides both the explicit-model bypass
+// and heuristic classification for that agent only.
+type AgentPolicy struct {
+	Enabled    *bool  `yaml:"enabled"`
+	ForceClass string `yaml:"force_class"`
+}
+
+// UnmarshalYAML accepts either a bare boolean or the extended mapping form.
+func (ap *AgentPolicy) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var b bool
+	if err := unmarshal(&b); err == nil {
+		ap.Enabled = &b
+		return nil
+	}
+	type raw AgentPolicy // shed the method set to avoid recursion
+	var r raw
+	if err := unmarshal(&r); err != nil {
+		return err
+	}
+	*ap = AgentPolicy(r)
+	return nil
+}
+
 // AgentAllowed reports whether the named agent may route through this
-// policy. Only an explicit `false` in the agents map blocks; a missing
-// entry, an empty identity, or a policy with no agents section all allow.
-// That default keeps the feature purely additive: existing policies and
-// unidentified callers behave exactly as before it existed.
+// policy. Only an explicit `enabled: false` blocks; a missing entry, an
+// empty identity, or a policy with no agents section all allow. That default
+// keeps the feature purely additive: existing policies and unidentified
+// callers behave exactly as before it existed.
 func (p *Policy) AgentAllowed(agent string) bool {
 	if p == nil || len(p.Agents) == 0 || agent == "" {
 		return true
 	}
-	v, present := p.Agents[strings.ToLower(agent)]
-	if !present || v == nil {
+	ap, present := p.Agents[strings.ToLower(agent)]
+	if !present || ap.Enabled == nil {
 		return true
 	}
-	return *v
+	return *ap.Enabled
+}
+
+// ForceClass returns the class name all of this agent's traffic must take,
+// or "" when the agent routes normally.
+func (p *Policy) ForceClass(agent string) string {
+	if p == nil || agent == "" {
+		return ""
+	}
+	return p.Agents[strings.ToLower(agent)].ForceClass
 }
 
 // AgentAllowed on the Router is the surface the serving layer calls. It is

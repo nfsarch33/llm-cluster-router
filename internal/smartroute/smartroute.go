@@ -52,6 +52,7 @@ const (
 	SourceHeuristic     = "heuristic"      // inferred from the request shape
 	SourceDefault       = "default"        // nothing matched; default class
 	SourceDisabled      = "disabled"       // feature flag off; pass through
+	SourceAgentForce    = "agent_force"    // agents force_class overrode everything
 )
 
 // Match holds the (deterministic) conditions for a class to apply.
@@ -95,7 +96,7 @@ type Policy struct {
 	// Agents is the per-agent route gate: one boolean per calling agent
 	// (cursor, claude-code, kilo-code, codex, ...). Only an explicit false
 	// blocks; a missing entry allows, so the section is purely additive.
-	Agents map[string]*bool `yaml:"agents"`
+	Agents map[string]AgentPolicy `yaml:"agents"`
 	// DefaultClass is used when no class matches.
 	DefaultClass string  `yaml:"default_class"`
 	Classes      []Class `yaml:"classes"`
@@ -142,6 +143,11 @@ func (p *Policy) Validate() error {
 	}
 	if !seen[p.DefaultClass] {
 		return fmt.Errorf("default_class %q does not name a defined class", p.DefaultClass)
+	}
+	for agent, ap := range p.Agents {
+		if ap.ForceClass != "" && !seen[ap.ForceClass] {
+			return fmt.Errorf("agents.%s: force_class %q does not name a defined class", agent, ap.ForceClass)
+		}
 	}
 	return nil
 }
@@ -269,6 +275,15 @@ func (r *Router) WithClassifiers(cs ...Classifier) *Router {
 func (r *Router) Decide(req *http.Request, body []byte) (Decision, error) {
 	if r.policy == nil || !r.policy.Enabled {
 		return Decision{Source: SourceDisabled, Model: extractModel(body)}, nil
+	}
+
+	// An agent with force_class routes there unconditionally — this is how
+	// clients whose UIs insist on their own model ids (Cursor sends gpt-*)
+	// still land on policy-chosen upstreams.
+	if fc := r.policy.ForceClass(DetectAgent(req)); fc != "" {
+		if cl, found := r.policy.lookup(fc); found && cl.IsEnabled() {
+			return decisionFor(cl, SourceAgentForce), nil
+		}
 	}
 
 	// A caller naming a concrete model means it; do not second-guess.

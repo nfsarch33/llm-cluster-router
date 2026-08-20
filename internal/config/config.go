@@ -61,7 +61,13 @@ type Defaults struct {
 	MaxQueueDepth  int           `yaml:"max_queue_depth"`
 	MaxConcurrency int           `yaml:"max_concurrency"`
 	RequestTimeout DurationValue `yaml:"request_timeout"`
-	MaxBodySize    int64         `yaml:"max_body_size"`
+	// KeyCooldown is how long an API key sits out of rotation after a
+	// quota signal (429 or a quota_detect_regex body match). Keeps failure
+	// isolation at the KEY level: with three paid token plans on one node,
+	// one exhausted plan must not keep eating every third request nor trip
+	// the whole node's circuit breaker. 0 disables cooling.
+	KeyCooldown DurationValue `yaml:"key_cooldown"`
+	MaxBodySize int64         `yaml:"max_body_size"`
 	// Circuit tunes the per-upstream circuit breaker fleet-wide. It was
 	// previously hardcoded to 5 failures / 30s in main.go; exposing it here
 	// lets operators retune the breaker for a single-tier provider (e.g.
@@ -311,6 +317,11 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Defaults.RequestTimeout.Duration <= 0 {
 		cfg.Defaults.RequestTimeout.Duration = 120 * time.Second
+	}
+	if cfg.Defaults.KeyCooldown.Duration < 0 {
+		cfg.Defaults.KeyCooldown.Duration = 0
+	} else if cfg.Defaults.KeyCooldown.Duration == 0 {
+		cfg.Defaults.KeyCooldown.Duration = 5 * time.Minute
 	}
 	if cfg.Defaults.MaxBodySize <= 0 {
 		cfg.Defaults.MaxBodySize = 1 << 20
