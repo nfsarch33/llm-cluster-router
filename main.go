@@ -1455,7 +1455,18 @@ func runBenchRequest(client *http.Client, baseURL, model, apiKey, prompt string,
 		if err := json.Unmarshal([]byte(data), &payload); err != nil {
 			continue
 		}
-		if !firstTokenSeen && hasDeltaContent(payload) {
+		// TTFT anchors at the first streamed delta of ANY kind —
+		// reasoning/thinking tokens included — not the first visible
+		// content delta. Reasoning models stream the entire think
+		// phase as delta.reasoning_content before the first
+		// delta.content, so content-anchored TTFT degenerates to
+		// ~full request latency and corrupts both derived rates
+		// below. First-delta TTFT is the standard definition (queue +
+		// prefill time) and stays comparable across thinking and
+		// non-thinking models; time-to-first-visible-content is a
+		// property of the prompt/model, not the serving stack, so
+		// bench does not report it.
+		if !firstTokenSeen && hasDeltaToken(payload) {
 			ttft = time.Since(start)
 			firstTokenSeen = true
 		}
@@ -1475,10 +1486,23 @@ func runBenchRequest(client *http.Client, baseURL, model, apiKey, prompt string,
 		LatencyMillis:    durationMillis(latency),
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
-		PromptTokensSec:  safeRate(promptTokens, latency),
+		// Prefill happens inside the TTFT window: every prompt token
+		// is processed before the first generated token arrives, so
+		// the prefill rate divides by ttft. Dividing by total latency
+		// (dominated by decode) understates it by the whole decode
+		// duration. Client-side ttft includes network + router hop, so
+		// this slightly understates the server-side prefill rate.
+		PromptTokensSec: safeRate(promptTokens, ttft),
 	}
-	if completionTokens > 0 && latency > ttft {
-		result.GenerationTokensSec = float64(completionTokens) / (latency.Seconds() - ttft.Seconds())
+	// Completion tokens (thinking + visible alike) are generated across
+	// the decode window: first delta to stream end. Fall back to total
+	// latency if no delta was ever observed.
+	if completionTokens > 0 {
+		window := latency
+		if firstTokenSeen && latency > ttft {
+			window = latency - ttft
+		}
+		result.GenerationTokensSec = safeRate(completionTokens, window)
 	}
 	return result
 }
@@ -1640,7 +1664,13 @@ func parsePrometheusGauge(payload, name string) int64 {
 	return 0
 }
 
-func hasDeltaContent(payload map[string]any) bool {
+// hasDeltaToken reports whether an SSE chunk carries a generated token of
+// any kind. Reasoning models stream think-phase tokens as
+// delta.reasoning_content (llama.cpp, DeepSeek) or delta.reasoning (some
+// gateways) long before the first visible delta.content; all three count
+// as generation for TTFT purposes. Role-only priming chunks and empty
+// strings do not.
+func hasDeltaToken(payload map[string]any) bool {
 	choices, ok := payload["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		return false
@@ -1653,8 +1683,12 @@ func hasDeltaContent(payload map[string]any) bool {
 	if !ok {
 		return false
 	}
-	content, ok := delta["content"].(string)
-	return ok && strings.TrimSpace(content) != ""
+	for _, key := range []string{"content", "reasoning_content", "reasoning"} {
+		if s, ok := delta[key].(string); ok && strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func numberValue(v any) float64 {
