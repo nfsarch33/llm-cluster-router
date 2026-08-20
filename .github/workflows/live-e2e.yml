@@ -1,0 +1,41 @@
+name: live-e2e-regression
+
+# Regression suite against the REAL deployed HelixChannel edge. It catches the
+# failure classes mocks cannot (dead fan-out, route drift, credential rot,
+# CONNECT allowlist regressions). Endpoint and token come from repository
+# secrets so no internal address is committed to this public repo.
+#
+# Runs on a schedule and on demand, and (when a self-hosted runner is present)
+# on every push to main so a merge that breaks the live channel is caught
+# same-day rather than in production.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  push:
+    branches: [main]
+    paths:
+      - "internal/channel/**"
+      - "cmd/helixchannel/**"
+
+permissions:
+  contents: read
+
+jobs:
+  live-e2e:
+    runs-on: [self-hosted, linux]
+    # The suite SKIPs (not fails) when HELIXCHANNEL_LIVE_BASE is unset, so a
+    # runner without the secret configured stays green rather than blocking.
+    env:
+      HELIXCHANNEL_LIVE_BASE: ${{ secrets.HELIXCHANNEL_LIVE_BASE }}
+      HELIXCHANNEL_LIVE_INSECURE: ${{ secrets.HELIXCHANNEL_LIVE_INSECURE }}
+      HELIXCHANNEL_LIVE_CHAT: ${{ secrets.HELIXCHANNEL_LIVE_CHAT }}
+      HELIXCHANNEL_CONNECT_ADDR: ${{ secrets.HELIXCHANNEL_CONNECT_ADDR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Live E2E + regression
+        run: go test -tags=live_e2e -count=1 -v -run TestLive_ ./internal/channel/

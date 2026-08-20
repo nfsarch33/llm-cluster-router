@@ -5,11 +5,18 @@ on:
     branches: [main, master, feat/**]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   leak-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: BurntSushi/ripgrep@v0.1.0
+      # ripgrep is a package, not a GitHub Action. The previous
+      # `uses: BurntSushi/ripgrep@v0.1.0` referenced a non-existent action and
+      # failed every run. Install the package instead.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: leak-scan
         run: bash tools/leak-scan.sh
