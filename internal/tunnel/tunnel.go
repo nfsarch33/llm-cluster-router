@@ -177,11 +177,13 @@ func DialContext(ctx context.Context, cfg SSHTunnelConfig, network, addr string)
 	case <-ctx.Done():
 		_ = ln.Close()
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // reap + stop the stderr copier before reading the buffer
 		return nil, fmt.Errorf("%w: ctx: %v ssh_stderr=%q",
 			ErrSSHDial, ctx.Err(), stderrBuf.String())
 	case r := <-resCh:
 		if r.err != nil {
 			_ = cmd.Process.Kill()
+			_ = cmd.Wait() // reap + stop the stderr copier before reading the buffer
 			return nil, fmt.Errorf("%w: accept: %v ssh_stderr=%q",
 				ErrSSHDial, r.err, stderrBuf.String())
 		}
@@ -192,6 +194,7 @@ func DialContext(ctx context.Context, cfg SSHTunnelConfig, network, addr string)
 	case <-deadline.C:
 		_ = ln.Close()
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // reap + stop the stderr copier before reading the buffer
 		return nil, fmt.Errorf("%w: timeout after %s connecting to %s ssh_stderr=%q",
 			ErrSSHDial, timeout, hostPort, stderrBuf.String())
 	}
