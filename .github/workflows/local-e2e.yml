@@ -48,7 +48,7 @@ jobs:
         if: env.SKIP_STACK != '1'
         run: curl -sf --max-time 5 http://127.0.0.1:8010/health
 
-      - name: Chat round-trip through router (regression: full serving path)
+      - name: "Chat round-trip through router (regression of the full serving path)"
         if: env.SKIP_STACK != '1'
         run: |
           RESP=$(curl -sf --max-time 240 http://127.0.0.1:8787/v1/chat/completions \
