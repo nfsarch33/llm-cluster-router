@@ -37,5 +37,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
       - name: Live E2E + regression
         run: go test -tags=live_e2e -count=1 -v -run TestLive_ ./internal/channel/
