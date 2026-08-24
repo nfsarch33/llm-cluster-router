@@ -100,8 +100,12 @@ routes:
 
   # ---------------------------------------------------------------------
   # auth: header — providers whose key is not a bearer token.
-  # The named header REPLACES any caller-supplied value, and an inbound
-  # Authorization the route is not itself writing is stripped.
+  # The named header REPLACES any caller-supplied value. On this mode and on
+  # `inject`, every caller-supplied credential header — Authorization,
+  # Proxy-Authorization, X-Api-Key, Api-Key, X-Goog-Api-Key, Cookie, and this
+  # route's own key_header — is STRIPPED before the gateway applies its key, so
+  # a provider that honours a second auth header cannot be reached as the
+  # caller's own account. `passthrough` is the one mode exempt.
   # ---------------------------------------------------------------------
 
   # Pooled header route with a REQUEST budget.

@@ -31,37 +31,52 @@ Use this for Claude Code (see [Claude Code setup](claude-code-setup.md)).
 
 | Mode | Who supplies the credential | Use for |
 |---|---|---|
-| `inject` | The gateway, from `key_ref`, `key_env` or `key_file` (or a pool: `key_envs` / `key_files` / `key_refs`). The caller's `Authorization` header is **replaced**, so the placeholder a client is told to configure never leaves the gateway. | API-key providers |
-| `header` | The gateway, into an operator-named header (`key_header`, optionally prefixed with `key_prefix`). It replaces any caller-supplied value in that header, and strips an inbound `Authorization` it is not itself writing. | Providers whose key is not a bearer token (Exa `x-api-key`, Tavily) |
-| `passthrough` | The caller. Forwarded untouched. | Clients holding their own session token |
+| `inject` | The gateway, from `key_ref`, `key_env` or `key_file` (or a pool: `key_envs` / `key_files` / `key_refs`). Every caller-supplied credential header is **stripped** before the gateway applies its own, so the placeholder a client is told to configure never leaves the gateway. | API-key providers |
+| `header` | The gateway, into an operator-named header (`key_header`, optionally prefixed with `key_prefix`). Same strip as `inject`, and the named header is written afterwards, so a caller can neither supply it nor smuggle a competing provider's. | Providers whose key is not a bearer token (Exa `x-api-key`, Tavily) |
+| `passthrough` | The caller. Forwarded untouched — the one mode exempt from the strip, because carrying the client's own credential is its entire purpose. | Clients holding their own session token |
 
-### What "replaced" does and does not buy you
+### What "stripped" does and does not buy you
 
-`inject` replaces exactly one header: `Authorization`. Every other inbound
-header that is not hop-by-hop is forwarded to the upstream unchanged — that is
-what makes the gateway a transparent proxy for content types, idempotency keys
-and provider-specific options.
+On every mode where the **gateway** holds the credential — `inject` and `header`,
+single-key and pooled alike — a caller-supplied credential header is dropped
+before the request is forwarded. It is not overwritten and it is not renamed: it
+does not leave the gateway.
 
-So the guarantee is narrower than "a client cannot reach the upstream as another
-account". It is:
+The deny-set is **data**, in `callerCredentialHeaders`
+(`internal/channel/forward.go`), and covers:
 
-- a caller's `Authorization` value never reaches the upstream on an `inject`
-  route, and never reaches it on a `header` route either (that mode deletes it),
-  and
-- the gateway's own key is the only bearer credential the upstream sees.
+| Header | Why it is on the list |
+|---|---|
+| `Authorization` | every bearer provider |
+| `Proxy-Authorization` | also hop-by-hop; listed so the guarantee does not rest on that |
+| `X-Api-Key` | Anthropic, Exa, Tavily |
+| `Api-Key` | Azure OpenAI |
+| `X-Goog-Api-Key` | Google Generative Language |
+| `Cookie` | a provider session the caller is already signed in to |
 
-It is **not** a guarantee that no caller-supplied credential can reach the
-upstream at all. A provider that also accepts an alternative auth header — an
-`x-api-key`, an `api-key`, a vendor-specific variant — will still receive
-whatever the caller put there, because the gateway forwards it. On a `header`
-route the one header the gateway writes is overwritten, but its siblings are
-not.
+— plus whatever the route names in `key_header`, whatever it is called. Matching
+is case-insensitive. Onboarding a provider whose key travels in a new header is
+**one line in that slice**: not a change to an authenticator, to the handler, or
+to the forwarder body.
+
+So the guarantee is:
+
+- on an `inject` or `header` route the upstream sees exactly one credential —
+  the gateway's — and no caller-supplied credential header of any listed kind
+  reaches it, whether or not the gateway writes that same header itself; and
+- `passthrough` is deliberately exempt. That mode exists to carry the client's
+  own credential to the provider, so nothing is stripped there.
+
+It is still **not** a general impersonation control. Everything that is neither
+on the deny-set nor hop-by-hop is forwarded unchanged — content types,
+idempotency keys, provider-specific options — because that is what makes the
+gateway a transparent proxy. A provider that accepts a credential through some
+*other* header that nobody has listed yet would still receive it.
 
 Treat the channel token as the real authorisation boundary: it decides **who may
-use the gateway at all**. If a route's upstream honours a second auth header and
-that matters to you, terminate it in front of the gateway or give the route its
-own prefix and allowlist. Do not read `inject` as an impersonation control it
-was never able to be.
+use the gateway at all**. If a route's upstream honours an auth header that is
+not on the list above, add it to `callerCredentialHeaders` — that is the seam it
+exists for — or terminate it in front of the gateway.
 
 ## Credentials
 
@@ -268,9 +283,9 @@ Pooled routes add three `omitempty` fields to each `proxy_request` event, so exi
 
 ## Threat model
 
-**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a client's own `Authorization` header reaching the upstream on an `inject` or `header` route.
+**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account by presenting its own `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key` or `Cookie` on an `inject` or `header` route.
 
-**Does not protect against:** a compromised gateway host — it holds the keys; a malicious client that has a valid channel token, within its allowlisted scope; a caller presenting a credential in some **other** header that the upstream also accepts, since every non-hop-by-hop header is forwarded (see [What "replaced" does and does not buy you](#what-replaced-does-and-does-not-buy-you)); provider-side logging. The CONNECT allowlist bounds what a stolen token can reach, which is why it is required and why it should stay short.
+**Does not protect against:** a compromised gateway host — it holds the keys; a malicious client that has a valid channel token, within its allowlisted scope; a caller presenting a credential in some **other** header that the upstream also accepts and that is not on the deny-set, since every remaining non-hop-by-hop header is forwarded (see [What "stripped" does and does not buy you](#what-stripped-does-and-does-not-buy-you)); provider-side logging. The CONNECT allowlist bounds what a stolen token can reach, which is why it is required and why it should stay short.
 
 ---
 

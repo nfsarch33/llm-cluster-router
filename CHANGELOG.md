@@ -43,6 +43,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it at startup, so the series actually exists for alerts to watch.
 
 ### Fixed
+- **Caller credential headers reached the upstream (confirmed, HIGH).** The forwarder
+  copied every non-hop-by-hop inbound header verbatim, and the only deletion anywhere
+  was of `Authorization`. A caller could therefore present `X-Api-Key` (Anthropic,
+  Exa, Tavily), `Api-Key` (Azure OpenAI), `X-Goog-Api-Key` (Google) or `Cookie` and the
+  provider received it **alongside** the injected key — on `inject` and on `header`,
+  single-key and pooled alike, including a `header` route leaking a competing
+  provider's credential. The gateway looked like a credential boundary while being a
+  credential *adder*. Every mode that supplies its own credential now drops the
+  caller's first, from the `callerCredentialHeaders` deny-set plus the route's own
+  `key_header`, matched case-insensitively. `passthrough` is exempt by design, via an
+  allow-list of modes rather than a hardcoded comparison, so a mode added later strips
+  until someone deliberately exempts it.
 - **CONNECT auth bypass (confirmed).** A credential source holding only
   whitespace passed the old "is it non-empty?" test *before* it was trimmed,
   and collapsed to `""` afterwards. An empty CONNECT token then made
@@ -70,11 +82,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `deploy/helixchannel/gateway.example.yml` is the **only** example config and
   covers every reconciled decision. Two examples in two directories is how a
   node gets deployed from the one that was not updated.
-- `docs/helixchannel.md` no longer claims that replacing `Authorization` means
-  "a client cannot reach the upstream as another account". That was false: every
-  non-hop-by-hop header is forwarded, so a provider that also accepts an
-  alternative auth header will still receive whatever the caller put there. The
-  guarantee is now stated as what it actually is, in the threat model too.
+- `docs/helixchannel.md` and the threat model now state the credential guarantee as
+  what the code enforces — the deny-set, its contents, and the fact that
+  `passthrough` is exempt — instead of the old wording, which conceded that a
+  caller-supplied alternative auth header would reach the provider.
 
 ### Added
 - Tier-aware multi-hop failover: a request now fails over to the next untried

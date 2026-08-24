@@ -38,22 +38,25 @@ type AuthMode string
 
 const (
 	// AuthInject replaces the caller's Authorization header with the
-	// server-held API key. The client never sees the real credential; a
-	// placeholder bearer is sufficient. Used for API-key upstreams
-	// (MiniMax, Qwen, OpenAI/Codex).
+	// server-held API key, and STRIPS every other caller-supplied credential
+	// header (see callerCredentialHeaders) so the upstream sees exactly one
+	// credential. The client never sees the real one; a placeholder bearer is
+	// sufficient. Used for API-key upstreams (MiniMax, Qwen, OpenAI/Codex).
 	AuthInject AuthMode = "inject"
 
-	// AuthPassthrough forwards the caller's Authorization header unchanged.
-	// Used for upstreams where the client holds its own session credential
-	// (for example Claude Code's OAuth session against api.anthropic.com),
-	// where injecting a server-side key would break authentication.
+	// AuthPassthrough forwards the caller's credential headers unchanged. It
+	// is the ONLY mode exempt from the caller-credential strip, because
+	// carrying the client's own credential is the whole point: it is used for
+	// upstreams where the client holds a session credential (for example Claude
+	// Code's OAuth session against api.anthropic.com), where injecting a
+	// server-side key would break authentication.
 	AuthPassthrough AuthMode = "passthrough"
 
 	// AuthHeaderInject places the server-held credential in an operator-named
 	// header instead of "Authorization: Bearer". It exists for providers whose
 	// API key is not a bearer token (the Exa "x-api-key" / Tavily shape). Like
-	// AuthInject it REPLACES any caller-supplied value in that header, and it
-	// strips an inbound Authorization it is not itself writing.
+	// AuthInject it strips every caller-supplied credential header — including
+	// key_header itself, whatever it is named — before writing its own.
 	AuthHeaderInject AuthMode = "header"
 )
 
