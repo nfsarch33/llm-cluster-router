@@ -354,8 +354,14 @@ func TestRotation_StreamingWithoutUsageChargesAMarkedEstimate(t *testing.T) {
 	if !strings.Contains(audit.String(), `"tokens_estimated":true`) {
 		t.Errorf("audit = %s, want tokens_estimated true", audit.String())
 	}
-	if strings.Contains(audit.String(), `"tokens":`) {
-		t.Errorf("audit = %s, want no invented token figure when the upstream reported none", audit.String())
+	// The audit line must carry the CHARGE, not merely the fact that one was
+	// estimated. This assertion was previously the opposite — it demanded the
+	// figure be omitted — which is exactly how the NDJSON stream stopped
+	// reconciling to the store: every streaming request went into the budget at
+	// 150 tokens and into the audit trail at nothing. tokens_estimated:true is
+	// the provenance marker; it does not replace the amount.
+	if !strings.Contains(audit.String(), `"tokens":150`) {
+		t.Errorf("audit = %s, want the 150 tokens the store was actually charged", audit.String())
 	}
 }
 

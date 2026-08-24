@@ -72,9 +72,25 @@ func (e *tailExtractor) Result() UsageSample {
 	return UsageSample{Outcome: OutcomeCompleted, Tokens: TokensUnknown, Estimated: true}
 }
 
-// parseUsageValue reads `: 1234` following the marker. It requires a
-// terminating byte after the digits so a number truncated by the tail boundary
-// is reported as unreadable rather than as a plausible-looking short value.
+// parseUsageValue reads `: 1234` following the marker. It requires the digits
+// to be followed by a byte that actually ENDS a JSON value, so a number
+// truncated by the tail boundary — or one whose digits are merely a prefix of
+// something else — is reported as unreadable rather than as a plausible-looking
+// short value.
+//
+// The terminator rule is what stops a fractional total being charged as an
+// authoritative integer. `"total_tokens":1.5` scans one digit, and a bare
+// "is there a byte after the digits" check accepted the '.' as proof the number
+// was complete: the charge became 1, with Estimated FALSE. That combination is
+// the worst of both worlds — it under-charges the budget arbitrarily AND
+// suppresses leastTokens' degrade-to-request-ordering guard, which only fires
+// when a sample is marked estimated. Every other hostile shape (a quoted
+// number, a negative, a non-numeric) already failed the digit scan; this one
+// did not, so the fix belongs at the terminator.
+//
+// Unreadable is never zero: the caller demotes a false return to
+// Budget.EstimateTokens, which is the documented answer for "the upstream
+// reported nothing this gateway can trust".
 func parseUsageValue(b []byte) (int64, bool) {
 	i := skipSpace(b, 0)
 	if i >= len(b) || b[i] != ':' {
@@ -85,7 +101,7 @@ func parseUsageValue(b []byte) (int64, bool) {
 	for i < len(b) && b[i] >= '0' && b[i] <= '9' {
 		i++
 	}
-	if i == start || i == len(b) {
+	if i == start || i == len(b) || !endsJSONValue(b[i]) {
 		return 0, false
 	}
 	n, err := strconv.ParseInt(string(b[start:i]), 10, 64)
@@ -93,6 +109,17 @@ func parseUsageValue(b []byte) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// endsJSONValue reports whether c can legally follow a complete JSON number.
+// Anything else means the digits scanned were only a PREFIX of the real value.
+func endsJSONValue(c byte) bool {
+	switch c {
+	case ',', '}', ']', ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 func skipSpace(b []byte, i int) int {

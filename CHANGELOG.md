@@ -43,6 +43,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it at startup, so the series actually exists for alerts to watch.
 
 ### Fixed
+- **Budget caps were not admission-controlled (confirmed, HIGH).** `Store.reserve`
+  selected on "is this key retired", never "would this reservation exceed the
+  plan"; caps were evaluated exclusively at settlement. A settlement that has not
+  happened yet cannot stop a request being dispatched, so every request in a
+  concurrent burst saw the same uncharged key and went upstream: a 5-request cap
+  under a 60-request burst produced 60 upstream calls, 60 × 200 and zero 503s — a
+  12x overspend of the whole per-window plan. Sequential traffic was exact, which
+  is why a suite full of sequential budget tests never saw it. The hard cap is now
+  checked at reservation, counting in-flight leases. The request cap is exact; the
+  token cap bounds the projected estimate, since `estimate_tokens` is the only
+  figure available before a response exists. The soft cap is untouched, so the
+  sequential boundary does not move.
+- **A failed upstream was charged as spend (confirmed, HIGH).** Any response
+  carrying no usage object was charged the full streaming estimate — including
+  5xx, with only 429 special-cased. Four upstream HTTP 500s carrying zero real
+  tokens drained both keys' 1000-token budgets through a 500-token estimate, and
+  the route then answered 503 with `Retry-After: 3600` for a six-hour window,
+  labelled `reason: cap`, having spent nothing: a transient upstream outage
+  became a self-inflicted multi-hour quota outage. Charging is now decided from
+  the status. 5xx settles as `OutcomeFailed` — no request, no tokens, `errors`
+  incremented — and 3xx/4xx settle as a completed request charged only what the
+  upstream actually reported, never an estimate: a refusal consumed upstream work
+  and counts against a request plan, but generated no completion. The 4xx/5xx
+  split is documented in `docs/helixchannel.md`.
+- **The retirement metric over-counted on the default config (confirmed).**
+  `retireForWindow` recomputed `now + DefaultQuotaCooldown` on every call when no
+  `budget.window` was set, so the dedup guard never suppressed: 60 concurrent
+  429s over two keys produced 60 increments for two real retirements. With a
+  window it was correct — which meant the required alerting surface was unusable
+  on exactly the minimal documented block, `rotation: {}`. The counter now counts
+  keys *leaving* rotation; pushing an already-parked key further out is an
+  extension, not a second retirement. Separately, the deadline was computed under
+  one critical section and applied under another, so a window rollover landing
+  between them rolled past the deadline just derived from it and silently
+  downgraded the retirement to a no-op — the key stayed in rotation with no event
+  to say so. Both are now one critical section.
+- **Estimated charges were unrecoverable from the audit stream (confirmed).**
+  `AuditEvent.Tokens` was set only from a real reported total, leaving the
+  estimate path at `0` for `omitempty` to drop; only `tokens_estimated: true`
+  survived. Summing the NDJSON therefore under-reported consumption by the whole
+  of every streaming request — every request on a header-auth route. `tokens` is
+  now the amount actually charged, so the stream reconciles to the store, and
+  `tokens_estimated` is provenance for that figure rather than a replacement.
+- **A fractional usage value was charged as an authoritative integer.**
+  `parseUsageValue` stopped its digit scan at the first non-digit and accepted
+  whatever byte that was as proof the number was complete, so
+  `"total_tokens":1.5` was charged as `1` with `Estimated` false — the one
+  combination that both under-charges the budget arbitrarily and suppresses
+  `least_tokens`' degrade-to-request-ordering guard. Digits must now be followed
+  by a byte that actually ends a JSON value; anything else demotes to the
+  estimate, as every other unreadable shape already did.
 - **Caller credential headers reached the upstream (confirmed, HIGH).** The forwarder
   copied every non-hop-by-hop inbound header verbatim, and the only deletion anywhere
   was of `Authorization`. A caller could therefore present `X-Api-Key` (Anthropic,

@@ -386,3 +386,95 @@ func TestIT_HeaderPooledRouteWithARequestBudget(t *testing.T) {
 		}
 	}
 }
+
+// TestIT_ConcurrentBurstIsAdmissionControlledOverRealHTTP is the R1 guarantee
+// over a real loopback listener, a real client and a real connection pool,
+// rather than through an in-process handler call.
+//
+// The claim being proven is a production-concurrency claim, so it is worth
+// making once against the real stack: a per-key hard cap of 5 under a 60-way
+// simultaneous burst admits exactly 5 requests to the upstream and answers the
+// other 55 with 503, never contacting the upstream for them.
+//
+// Determinism comes from the release gate, not from timing: every request
+// notices exactly once — on arrival at the upstream, or on being refused
+// without a round trip — so the upstream is released only when the whole burst
+// has come to rest. That predicate is reached whether admission control works
+// or not, which is what lets one assertion separate the two without a timeout.
+func TestIT_ConcurrentBurstIsAdmissionControlledOverRealHTTP(t *testing.T) {
+	const (
+		burst  = 60
+		reqCap = 5
+	)
+	gate := newReleaseGate(burst)
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		gate.note()
+		gate.wait()
+		_, _ = io.WriteString(w, `{"usage":{"total_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	srv := rotServer(t, rotatingConfig(t, "mm", upstream.URL,
+		[]string{"k1-not-real", "k2-not-real"},
+		&RotationConfig{Budget: Budget{
+			Window: time.Hour, Requests: reqCap, SoftRatio: 1, EstimateTokens: 1,
+		}}), nil, nil)
+	gateway := realGateway(t, srv)
+
+	var served, refused atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(burst)
+	for range burst {
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+				gateway.URL+"/mm/v1/chat/completions", nil)
+			if err != nil {
+				t.Errorf("build request: %v", err)
+				gate.note()
+				return
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("GET through the gateway: %v", err)
+				gate.note()
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			switch resp.StatusCode {
+			case http.StatusOK:
+				served.Add(1)
+			case http.StatusServiceUnavailable:
+				refused.Add(1)
+				gate.note() // refused without a round trip: this request is at rest
+			default:
+				refused.Add(1)
+				gate.note()
+				t.Errorf("status = %d, want 200 or 503", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Two keys, five requests each: the plan is ten, not five.
+	const plan = 2 * reqCap
+	if got := hits.Load(); got != plan {
+		t.Errorf("upstream saw %d of %d burst requests against a %d-request cap on each of 2 keys, want %d",
+			got, burst, reqCap, plan)
+	}
+	if served.Load() != plan || refused.Load() != burst-plan {
+		t.Errorf("served=%d refused=%d, want %d served and %d answered 503",
+			served.Load(), refused.Load(), plan, burst-plan)
+	}
+	for i, k := range storeFor(t, srv, "mm").Snapshot("mm") {
+		if k.Requests != reqCap {
+			t.Errorf("key %d settled %d requests, want exactly its %d-request plan", i, k.Requests, reqCap)
+		}
+		if k.InFlight != 0 {
+			t.Errorf("key %d InFlight = %d after the burst settled, want 0", i, k.InFlight)
+		}
+	}
+}

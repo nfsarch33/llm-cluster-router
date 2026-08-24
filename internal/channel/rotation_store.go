@@ -356,6 +356,11 @@ func (s *Store) Acquire(route string) (*KeyLease, bool) {
 // candidates, releasing the lock and then reserving would let a key retired in
 // between be leased anyway, which is why RotationPolicy.Select is documented
 // as non-blocking and forbidden from calling back into the store.
+//
+// The filter is admissibleLocked, NOT selectableAt: a cap that is only ever
+// evaluated at settlement is overspendable by the concurrency factor, because
+// every request in a simultaneous burst sees the same not-yet-charged key and
+// is dispatched before any of them settles.
 func (s *Store) reserve(route string) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -369,7 +374,7 @@ func (s *Store) reserve(route string) (int, bool) {
 
 	states := make([]KeyState, 0, len(rs.keys))
 	for i := range rs.keys {
-		if selectableAt(&rs.keys[i], now) {
+		if s.admissibleLocked(&rs.keys[i], now) {
 			states = append(states, s.keyStateLocked(rs, i, now))
 		}
 	}
@@ -386,6 +391,51 @@ func (s *Store) reserve(route string) (int, bool) {
 	idx := states[pos].Index
 	rs.keys[idx].inFlight++
 	return idx, true
+}
+
+// admissibleLocked reports whether a key may accept ANOTHER reservation right
+// now: it is selectableAt plus admission control against the HARD cap, counting
+// the leases already in flight.
+//
+// Why admission control has to exist at all: applyCapsLocked runs at
+// SETTLEMENT, and a settlement that has not happened yet cannot stop a request
+// from being dispatched. Under sequential traffic that is invisible, because
+// every request settles before the next one is selected. Under the concurrency
+// production actually has, a burst of N requests all see the same uncharged key
+// and are all sent upstream, so a per-window plan is overspendable by N — which
+// is precisely the outcome the budget exists to prevent.
+//
+// It enforces the HARD cap only, deliberately. The soft cap is a PLANNED early
+// exit that trips at settlement well before the hard cap; enforcing it here too
+// would move the sequential boundary and change behaviour no finding asked to
+// change. Admission is a floor under the existing rule, not a replacement.
+//
+// Exactness, honestly stated:
+//
+//   - Requests is EXACT. requests+inFlight is invariant across a settlement and
+//     rises only on reservation, so the count admitted per window can never
+//     exceed the cap.
+//   - Tokens is a BOUND on the estimate, not a guarantee. Before a response
+//     exists, Budget.EstimateTokens is the only figure available to project an
+//     in-flight lease by; a response that reports MORE than the estimate can
+//     still overshoot at settlement, and the hard cap then catches it there as
+//     it always did. A route that sets Tokens without EstimateTokens gets no
+//     token admission control at all — Config.Validate rejects that pairing.
+func (s *Store) admissibleLocked(k *keyState, now time.Time) bool {
+	if !selectableAt(k, now) {
+		return false
+	}
+	b := s.budget
+	if b.Window <= 0 {
+		return true
+	}
+	if b.Requests > 0 && k.requests+k.inFlight >= b.Requests {
+		return false
+	}
+	if b.Tokens > 0 && k.tokens+k.inFlight*b.EstimateTokens >= b.Tokens {
+		return false
+	}
+	return true
 }
 
 // RecordUsage implements RotationStore. It is exactly equivalent to
@@ -479,38 +529,64 @@ func (s *Store) RetireWithReason(route string, idx int, until time.Time, reason 
 	if rs, ok := s.routes[route]; ok && idx >= 0 && idx < len(rs.keys) {
 		now := s.now()
 		s.rollLocked(rs, now)
-		k := &rs.keys[idx]
-		if until.After(now) && until.After(k.retiredUntil) {
-			k.retiredUntil, k.retireReason = until, reason
-			events = append(events, reason)
-		}
+		events = retireLocked(&rs.keys[idx], now, until, reason)
 	}
 	s.mu.Unlock()
 
 	s.emit(route, events)
 }
 
+// retireLocked applies one retirement to one key and reports whether it was a
+// RETIREMENT rather than an extension of one already in force.
+//
+// The distinction is the whole contract of the metric: KeyRetiredTotal counts
+// keys LEAVING rotation, so a key that is already parked and is pushed further
+// out has not left it a second time. Without that guard a burst of concurrent
+// quota answers — all of them settling against a key retired by the first one —
+// increments the counter once per response, and the alerting surface reads a
+// two-key outage as sixty.
+func retireLocked(k *keyState, now, until time.Time, reason RetireReason) []RetireReason {
+	if !until.After(now) {
+		return nil
+	}
+	alreadyOut := k.retiredUntil.After(now)
+	if until.After(k.retiredUntil) {
+		k.retiredUntil, k.retireReason = until, reason
+	}
+	if alreadyOut {
+		return nil
+	}
+	return []RetireReason{reason}
+}
+
 // retireForWindow parks a key for the remainder of the accounting window,
 // which is the natural cooldown for an upstream quota signal: the plan resets
 // when the window does.
+//
+// The deadline is computed AND applied under ONE critical section. Splitting
+// them let a rollover land in between: the second reading rolled the window
+// past the deadline the first reading had just derived from it, `until` was no
+// longer in the future, and the retirement silently became a no-op — a key that
+// had just reported a spent plan stayed in rotation, with no event to say so.
 func (s *Store) retireForWindow(route string, idx int, reason RetireReason) {
+	if reason == "" {
+		reason = ReasonQuota
+	}
+	var events []RetireReason
+
 	s.mu.Lock()
-	var until time.Time
-	if rs, ok := s.routes[route]; ok {
+	if rs, ok := s.routes[route]; ok && idx >= 0 && idx < len(rs.keys) {
 		now := s.now()
 		s.rollLocked(rs, now)
+		until := now.Add(DefaultQuotaCooldown)
 		if s.budget.Window > 0 {
 			until = rs.windowStart.Add(s.budget.Window)
-		} else {
-			until = now.Add(DefaultQuotaCooldown)
 		}
+		events = retireLocked(&rs.keys[idx], now, until, reason)
 	}
 	s.mu.Unlock()
 
-	if until.IsZero() {
-		return
-	}
-	s.RetireWithReason(route, idx, until, reason)
+	s.emit(route, events)
 }
 
 // RetryAfter implements RetryAfterReporter. The result is clamped into

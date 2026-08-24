@@ -49,10 +49,20 @@ type AuditEvent struct {
 	// would gain a spurious "key_index":0. A nil pointer keeps today's lines
 	// unchanged. The pointer must address a fresh local, never a shared field.
 	KeyIndex *int `json:"key_index,omitempty"`
-	// Tokens is set only when a real usage.total_tokens was observed.
+	// Tokens is the amount the rotation store was ACTUALLY charged for this
+	// request — the upstream's own usage.total_tokens when it reported one,
+	// and Budget.EstimateTokens when it did not. Summing this field across the
+	// NDJSON stream therefore reconciles to the store's accounting.
+	//
+	// It once carried the real total only, leaving the estimate path at 0 for
+	// omitempty to drop: the stream then under-reported consumption by the
+	// whole of every streaming request, which is every request on a header-auth
+	// route. A zero really is zero (a failed request, or no estimate
+	// configured), so omitempty stays correct.
 	Tokens int64 `json:"tokens,omitempty"`
 	// TokensEstimated marks a charge derived from Budget.EstimateTokens
-	// because the response carried no usage object.
+	// because the response carried no usage object. It is PROVENANCE for
+	// Tokens, not a substitute for it.
 	TokensEstimated bool `json:"tokens_estimated,omitempty"`
 }
 
@@ -408,7 +418,7 @@ func (s *Server) writeNotFound(w http.ResponseWriter) {
 // event. An upstream quota signal retires the key BEFORE the lease is settled,
 // so the next selection already skips it.
 func (s *Server) settleLease(rt *boundRoute, lease *KeyLease, status int, usage UsageExtractor, event *AuditEvent) {
-	sample := usage.Result()
+	sample := chargeableSample(status, usage.Result())
 	if isQuotaStatus(status) {
 		if kl, ok := rt.Auth.(keyLeaser); ok {
 			kl.retire(lease.Index(), ReasonQuota)
@@ -420,10 +430,74 @@ func (s *Server) settleLease(rt *boundRoute, lease *KeyLease, status int, usage 
 	// request mutate a value this line has not yet marshalled.
 	idx := lease.Index()
 	event.KeyIndex = &idx
-	if sample.Tokens != TokensUnknown {
-		event.Tokens = sample.Tokens
-	}
+	event.Tokens = chargedTokensFor(rt.Route, sample)
 	event.TokensEstimated = sample.Estimated
+}
+
+// chargeableSample decides what an upstream response may be charged for, from
+// its status. The extracted usage alone cannot answer that: "no usage object"
+// looks identical on a completed stream and on an upstream that fell over.
+//
+// The policy, stated explicitly because the two halves differ ON PURPOSE:
+//
+//	5xx  the upstream did NOT serve the request. OutcomeFailed: the lease is
+//	     released, Errors is incremented, and NOTHING is charged. Charging the
+//	     streaming estimate here is how a transient upstream outage became a
+//	     self-inflicted multi-hour quota outage — four 500s carrying zero real
+//	     tokens drained two whole plans and the route then answered 503 with a
+//	     one-hour Retry-After, labelled reason=cap, having spent nothing.
+//	4xx  the upstream DID serve the request and refused it. That consumed
+//	     upstream work and counts against a request plan, so it settles as a
+//	     completed request — but a refusal generates no completion, so it is
+//	     charged only the tokens the upstream actually reported, never the
+//	     streaming estimate. (429 and 402 additionally retire the key; see
+//	     isQuotaStatus.)
+//	3xx  no completion was generated either. Same treatment as 4xx.
+//	2xx  unchanged: the real total when the response reported one, and
+//	     Budget.EstimateTokens when it did not, which is the whole reason
+//	     TokensUnknown is not zero.
+//
+// A 5xx that somehow DID report usage is still treated as a failure: a response
+// this gateway could not deliver as a success is not evidence of spend.
+func chargeableSample(status int, sample UsageSample) UsageSample {
+	switch {
+	case status >= 500:
+		return UsageSample{Outcome: OutcomeFailed}
+	case status >= 300 && sample.Tokens == TokensUnknown:
+		// A real, trustworthy zero — NOT TokensUnknown, which would be charged
+		// the estimate downstream.
+		return UsageSample{Outcome: OutcomeCompleted, Tokens: 0}
+	default:
+		return sample
+	}
+}
+
+// chargedTokensFor is the figure the store ACTUALLY charged for this sample, so
+// the audit stream reconciles to the accounting rather than merely hinting at
+// it.
+//
+// The estimate path used to leave Tokens at 0, which omitempty then dropped
+// entirely: only tokens_estimated:true survived, and anyone summing the NDJSON
+// under-reported consumption by the whole of every streaming request.
+// tokens_estimated says HOW the figure was arrived at; it is not a substitute
+// for the figure.
+//
+// The estimate is read back from the route's own configuration because that is
+// exactly what its Store was built with (newRotationStore passes
+// Rotation.Budget straight through), and Settle deliberately returns nothing —
+// a lease that reported its charge back would be a second, drifting copy of
+// state the store already owns.
+func chargedTokensFor(r Route, sample UsageSample) int64 {
+	switch {
+	case sample.Outcome == OutcomeFailed:
+		return 0
+	case sample.Tokens != TokensUnknown:
+		return sample.Tokens
+	case r.Rotation == nil:
+		return 0
+	default:
+		return r.Rotation.Budget.EstimateTokens
+	}
 }
 
 // isQuotaStatus reports whether an upstream status means "this key's plan is

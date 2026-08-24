@@ -276,8 +276,16 @@ Pooled routes add three `omitempty` fields to each `proxy_request` event, so exi
 | field | meaning |
 |---|---|
 | `key_index` | which slot served the request — an index, never a value |
-| `tokens` | tokens charged, present only when the upstream actually reported a total |
+| `tokens` | tokens **charged** — the upstream's reported total, or `budget.estimate_tokens` when it reported none |
 | `tokens_estimated` | true when the charge came from `budget.estimate_tokens` |
+
+`tokens` is the amount the budget was actually charged, so summing it across the
+stream reconciles to the store. `tokens_estimated` is *provenance* for that
+figure, not a substitute for it: an estimated charge that recorded only the flag
+made every streaming request — which is every request on a header-auth route —
+invisible to anyone totalling consumption from the NDJSON. A zero really is zero
+(a failed request, or no `estimate_tokens` configured), so `omitempty` stays
+correct and unchanged lines stay unchanged.
 
 `key_index` appears on the 502 line too: during a per-key outage, which account failed is exactly what an operator needs.
 
@@ -338,6 +346,22 @@ estimate is exactly the skew the estimate marker exists to prevent.
 
 Both are unselectable, but they are reported separately: "spent its whole plan"
 and "parked early on purpose" are different operational facts.
+
+The **hard cap is admission-controlled**: it is checked when a request is
+*reserved*, counting leases already in flight, not only when one settles. A cap
+that is evaluated at settlement alone is invisible to a concurrent burst — every
+request in the burst sees the same not-yet-charged key and is dispatched before
+any of them settles, so a per-window plan is overspendable by the concurrency
+factor. Sequential traffic is exact either way, which is why this only ever bites
+in production.
+
+The request cap is therefore **exact**: the number of requests admitted in a
+window can never exceed `requests`. The token cap is a **bound on the estimate**:
+before a response exists, `estimate_tokens` is the only figure available to
+project an outstanding lease by, so a response reporting more than the estimate
+can still overshoot at settlement, where the hard cap catches it as before.
+Admission enforces the hard cap only — the soft cap remains the planned early
+exit that decides when a key leaves rotation under normal traffic.
 
 The window is **tumbling** and rollover is **lazy** — evaluated from the clock on
 every call. The gateway therefore starts no timer goroutine for rotation, and a
@@ -400,6 +424,36 @@ disconnect) releases its lease and increments an error counter but charges no
 requests and no tokens: a dead upstream must not make a healthy key look like
 the most-used one.
 
+### What a failed response is charged
+
+"No usage object" looks identical on a completed stream and on an upstream that
+fell over, so the charge is decided from the response status:
+
+| status | charged | rationale |
+|---|---|---|
+| 2xx | reported total, else `estimate_tokens` | unchanged |
+| 3xx / 4xx | reported total, else **nothing** — but it counts as a request | the upstream served the request and refused it: that consumed upstream work and counts against a request plan, but a refusal generates no completion to estimate |
+| 5xx | **nothing at all** — no request, no tokens, `errors` incremented | the upstream did not serve the request |
+
+The 5xx rule matters more than it looks. Charging the streaming estimate for a
+5xx turns a transient upstream outage into a self-inflicted quota outage: four
+HTTP 500s carrying zero real tokens were enough to drain two 1000-token plans
+through a 500-token estimate, after which the route answered 503 with an
+hour-long `Retry-After` for a six-hour window — labelled `reason: cap`, having
+spent nothing. A 5xx that somehow *did* report usage is still treated as a
+failure: a response the gateway could not deliver as a success is not evidence
+of spend.
+
+`429` and `402` are 4xx and follow the 4xx rule, and additionally retire the key
+with reason `quota` (above).
+
+A usage figure the gateway cannot read in full — a fractional or exponent value,
+digits running into something else, or a number cut off by the 8 KiB tail — is
+treated as **no usage at all** and demoted to the estimate. It is never charged
+as the digits that happened to parse: a malformed or hostile upstream sending
+`"total_tokens":1.5` must not be able to bill a plan 1 token while the sample is
+marked authoritative.
+
 ### `auth: header` with a budget
 
 Header-auth upstreams report no `usage.total_tokens`, so **every** sample on such
@@ -425,8 +479,14 @@ llm_cluster_router_helixchannel_key_retired_total{route,reason}
 | `quota` | an upstream quota signal (HTTP 429 or 402) |
 | `error` | repeated upstream failure that is not a quota signal |
 
-The counter fires once per key per window for `cap`, so late settlements of
-in-flight leases cannot inflate it.
+The counter counts keys **leaving** rotation, once per departure, for every
+reason. Late settlements of in-flight leases cannot inflate `cap`, and a key
+that is already parked and is pushed further out is an *extension*, not a second
+retirement — so a burst of concurrent 429s all answering for the same key
+increments `quota` once, not once per response. Without that rule the minimal
+documented block (`rotation: {}`, no `budget.window`) inflated the series by the
+concurrency factor — 60 increments for two real retirements — which made the
+alerting surface unusable on the default configuration.
 
 Registration is explicit — `channel.RegisterMetrics(reg)` — rather than an
 `init()`, so importing the package never mutates the default Prometheus
