@@ -3,9 +3,15 @@
 # Every provider is a route. Turning a provider on or off, or adding a new
 # one, is an edit to this file — not a code change and not a new binary.
 #
-# Credentials are never written here. Each route names an environment
-# variable (key_env) or a file (key_file) that holds the key at runtime, so
-# this file is safe to commit and to copy between nodes.
+# Credentials are never written here. A route NAMES where its key lives:
+# an environment variable (key_env), a file (key_file), or a scheme-qualified
+# reference (key_ref: env:NAME | file:/path | op://<vault>/<item>/<field>).
+# A reference is an identifier, not a secret, so this file stays safe to
+# commit and to copy between nodes.
+#
+# This is the ONLY example config. There is deliberately not a second one
+# under configs/: two examples in two directories is how a node gets deployed
+# from the one that was not updated.
 
 listen: "0.0.0.0:14443"   # bind loopback instead when a TLS terminator runs on the same host
 timeout: 90s
@@ -31,11 +37,12 @@ routes:
 
   # OpenAI / Codex CLI. Flip enabled to true and mount the key to switch it
   # on — this entry is the worked example of adding a provider by config.
+  # It also shows key_ref: the same route could name any scheme.
   - name: codex
     prefix: /codex/
     upstream: https://api.openai.com
     auth: inject
-    key_file: /run/secrets/openai.key
+    key_ref: op://Infra/openai/api-key   # or key_env: / key_file:
     enabled: false
 
   # Anthropic over the reverse-proxy path, for clients that hold their own
@@ -48,6 +55,88 @@ routes:
     auth: passthrough
     enabled: false
 
+  # ---------------------------------------------------------------------
+  # POOLED ROUTES — several paid plans behind one prefix.
+  #
+  # Singular (key_env/key_file/key_ref) and plural (key_envs/key_files/
+  # key_refs) sources are mutually exclusive on one route. Slot order is
+  # FROZEN — key_envs, then key_files, then key_refs, in declaration order —
+  # so the key_index in an audit line means the same account on every node
+  # running this file.
+  # ---------------------------------------------------------------------
+
+  # A token budget with the full rotation block.
+  # Slots: key_files[0] -> 0, key_files[1] -> 1, key_refs[0] -> 2.
+  - name: minimax-pool
+    prefix: /minimax-pool/
+    upstream: https://api.minimaxi.com
+    auth: inject
+    key_files:
+      - /run/secrets/minimax-1.key
+      - /run/secrets/minimax-2.key
+    key_refs:
+      - op://Infra/minimax/key-3
+    rotation:
+      policy: least_tokens      # round_robin (default) | least_used | least_tokens
+      max_retry_after: 1h       # clamps the Retry-After on a 503; 0 = 1h
+      budget:
+        window: 1h              # tumbling; 0 disables ALL caps
+        tokens: 2000000         # hard per-key cap; 0 = uncapped
+        soft_ratio: 0.8         # retire at 80% of the cap; 0 selects the default
+        estimate_tokens: 1500   # REQUIRED when tokens is set — a streaming
+                                # response reports no usage, and charging it
+                                # zero would let the cap never advance
+    enabled: false
+
+  # The shorthand spelling. `rotation: round_robin` is exactly
+  # `rotation: {policy: round_robin}` — a policy with no budget.
+  - name: qwen-pool
+    prefix: /qwen-pool/
+    upstream: https://dashscope.aliyuncs.com
+    auth: inject
+    key_envs: [QWEN_KEY_1, QWEN_KEY_2]
+    rotation: round_robin
+    enabled: false
+
+  # ---------------------------------------------------------------------
+  # auth: header — providers whose key is not a bearer token.
+  # The named header REPLACES any caller-supplied value, and an inbound
+  # Authorization the route is not itself writing is stripped.
+  # ---------------------------------------------------------------------
+
+  # Pooled header route with a REQUEST budget.
+  #
+  # A header-auth upstream reports no usage.total_tokens, so every sample is
+  # an estimate. Budget these by requests, not tokens — and note that
+  # `policy: least_tokens` is REJECTED here at config load, because it would
+  # compare estimates against estimates while claiming to balance tokens.
+  - name: exa-pool
+    prefix: /exa/
+    upstream: https://api.exa.ai
+    auth: header
+    key_header: x-api-key
+    key_files:
+      - /run/secrets/exa-1.key
+      - /run/secrets/exa-2.key
+    rotation:
+      policy: least_used
+      max_retry_after: 15m
+      budget:
+        window: 24h
+        requests: 1000
+        soft_ratio: 0.8
+    enabled: false
+
+  # Single-key header route: no pool, no accounting store, no key_index.
+  - name: tavily
+    prefix: /tavily/
+    upstream: https://api.tavily.com
+    auth: header
+    key_header: x-api-key
+    key_prefix: "tvly-"
+    key_ref: env:TAVILY_KEY
+    enabled: false
+
 # CONNECT leg: an authenticated, allowlisted TCP tunnel.
 #
 # This is what lets Claude Code (and any agent that must keep its own TLS
@@ -57,6 +146,7 @@ routes:
 connect:
   enabled: true
   token_file: /run/secrets/connect.token
+  # token_ref: op://Infra/helixchannel/connect-token   # takes precedence
   dial_timeout: 10s
   allowed_hosts:
     - api.anthropic.com:443

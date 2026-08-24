@@ -31,8 +31,114 @@ Use this for Claude Code (see [Claude Code setup](claude-code-setup.md)).
 
 | Mode | Who supplies the credential | Use for |
 |---|---|---|
-| `inject` | The gateway, from `key_env` or `key_file`. The caller's `Authorization` header is **replaced**, so a client cannot reach the upstream as another account and the placeholder it sends never leaves the gateway. | API-key providers |
+| `inject` | The gateway, from `key_ref`, `key_env` or `key_file` (or a pool: `key_envs` / `key_files` / `key_refs`). The caller's `Authorization` header is **replaced**, so the placeholder a client is told to configure never leaves the gateway. | API-key providers |
+| `header` | The gateway, into an operator-named header (`key_header`, optionally prefixed with `key_prefix`). It replaces any caller-supplied value in that header, and strips an inbound `Authorization` it is not itself writing. | Providers whose key is not a bearer token (Exa `x-api-key`, Tavily) |
 | `passthrough` | The caller. Forwarded untouched. | Clients holding their own session token |
+
+### What "replaced" does and does not buy you
+
+`inject` replaces exactly one header: `Authorization`. Every other inbound
+header that is not hop-by-hop is forwarded to the upstream unchanged — that is
+what makes the gateway a transparent proxy for content types, idempotency keys
+and provider-specific options.
+
+So the guarantee is narrower than "a client cannot reach the upstream as another
+account". It is:
+
+- a caller's `Authorization` value never reaches the upstream on an `inject`
+  route, and never reaches it on a `header` route either (that mode deletes it),
+  and
+- the gateway's own key is the only bearer credential the upstream sees.
+
+It is **not** a guarantee that no caller-supplied credential can reach the
+upstream at all. A provider that also accepts an alternative auth header — an
+`x-api-key`, an `api-key`, a vendor-specific variant — will still receive
+whatever the caller put there, because the gateway forwards it. On a `header`
+route the one header the gateway writes is overwritten, but its siblings are
+not.
+
+Treat the channel token as the real authorisation boundary: it decides **who may
+use the gateway at all**. If a route's upstream honours a second auth header and
+that matters to you, terminate it in front of the gateway or give the route its
+own prefix and allowlist. Do not read `inject` as an impersonation control it
+was never able to be.
+
+## Credentials
+
+A route names **where** its credential lives, never the credential itself.
+Three schemes are understood, and any of them may be given as a `key_ref`:
+
+| Scheme | Example | Resolved by |
+|---|---|---|
+| `env:` | `env:MINIMAX_KEY` | the process environment |
+| `file:` | `file:/run/secrets/minimax.key` | reading the file, surrounding whitespace trimmed |
+| `op://` | `op://<vault>/<item>/<field>` | `op read --no-newline <ref>`, the 1Password CLI |
+
+Precedence within a single-key route is `key_ref`, then `key_env`, then
+`key_file` — the first source that yields a value wins. The CONNECT leg mirrors
+this with `token_ref`, `token_env` and `token_file`.
+
+Two guarantees hold regardless of scheme:
+
+- **Startup fails loud.** A source that is missing, unreadable, or holds only
+  whitespace is a startup error naming the route and the reference. The gateway
+  never falls through to an empty credential, and it never starts holding one.
+  A blank `token_env` used to produce an empty CONNECT token, which authorised
+  the header `Proxy-Authorization: Bearer ` — see the changelog.
+- **Values never reach a log.** Errors carry the reference (committed config,
+  not secret) and a bounded diagnostic. The credential itself, and the `op`
+  CLI's stdout, are never placed in an error or an audit event.
+
+Resolution happens once, at construction: two routes naming the same 1Password
+item cause one `op` invocation and one biometric prompt, not two. A disabled
+route is never resolved, so a broken credential on a switched-off route cannot
+take the gateway down.
+
+### Multi-key routes
+
+A route may hold a **pool** of keys, each with its own paid plan. Use the
+plural fields; there is one spelling, and it is the plural of the singular one:
+
+```yaml
+  - name: minimax-pool
+    prefix: /minimax-pool/
+    upstream: https://api.minimaxi.com
+    auth: inject
+    key_files:                        # one key per file
+      - /run/secrets/minimax-1.key
+      - /run/secrets/minimax-2.key
+    key_refs:                         # any scheme the resolver understands
+      - op://Infra/minimax/key-3
+    # key_envs: [MINIMAX_KEY_A, MINIMAX_KEY_B]   # one key per env var
+    rotation: round_robin
+    enabled: true
+```
+
+Rules the validator enforces at startup, not at request time:
+
+- Singular (`key_env`/`key_file`/`key_ref`) and plural
+  (`key_envs`/`key_files`/`key_refs`) sources are **mutually exclusive** on one
+  route. Silently preferring one is how a route ends up serving from a key you
+  thought was retired.
+- A declared list must not be empty or blank, and must not name the same source
+  twice (file paths are compared after cleaning, so two spellings of one path
+  cannot inflate a pool).
+- Every key is resolved when the gateway starts. A missing, blank or duplicated
+  key is a **boot failure**, never a 502 later: a pool that silently shrinks at
+  boot is a capacity lie that surfaces weeks later as a quota alarm. Two
+  distinct sources resolving to the same account is caught too, and reported by
+  slot label rather than by value.
+- A `rotation` block requires a pool. On a single-key route it would advertise a
+  budget that is never enforced, so it is rejected.
+
+Slot order is fixed: `key_envs`, then `key_files`, then `key_refs`, in
+declaration order. That is what makes the `key_index` in an audit line mean the
+same account on every node running the same config.
+
+A pool of **one** is still a pool: it leases, it reports `key_index`, and it
+charges its budget. Pooling is a property of the spelling, not of the count —
+otherwise a two-key route that lost a key would silently become an unaccounted
+single-key route.
 
 ## Configuration
 
@@ -71,6 +177,10 @@ tls:                        # only needed when the gateway owns a public socket
 Adding a provider is one entry. Turning it on is one boolean. Nothing is compiled in: route names, prefixes, upstreams and auth modes are all data, and the config is validated at startup so a typo in a route that is switched off today does not become an outage the day it is switched on.
 
 `enabled: false` routes are not registered at all — requests to their prefix return 404, and `/healthz` lists only what is actually being served.
+
+`/healthz` also reports `keys`: per enabled route, the auth mode, whether the route is pooled, how many server-held credentials back it and how many are selectable right now. It is **counts only** — never a key, prefix, suffix, length or fingerprint, because any per-key hint on an unauthenticated endpoint is an oracle for correlating which account served which request.
+
+Reporting the mode alongside the count is the point. A bare number cannot tell `"this route holds no credential by design"` (a `passthrough` route, where the caller holds it) from `"this route holds no credential by accident"` — both render as `0`. `degraded: true` means a pool whose every key is currently retired or drained, which is a page; `keys: 0, pooled: false` on a passthrough route is not.
 
 ## Running it
 
@@ -120,7 +230,10 @@ The CONNECT leg cannot be relayed by an ordinary HTTP reverse proxy. Give it its
 ```bash
 # Live route set — reflects the enabled flags, not a hardcoded string
 curl -s https://gateway.example.com/healthz
-# {"status":"ok","service":"helixchannel-gateway","routes":["minimax","qwen"],"connect":true}
+# {"status":"ok","service":"helixchannel-gateway","routes":["minimax","qwen"],
+#  "keys":{"minimax":{"mode":"inject","pooled":false,"keys":1,"available":1,"degraded":false},
+#          "qwen":{"mode":"inject","pooled":true,"keys":3,"available":2,"degraded":false}},
+#  "connect":true}
 
 # A route end-to-end
 curl -s https://gateway.example.com/minimax/v1/models -H "Authorization: Bearer $CLIENT_TOKEN"
@@ -143,8 +256,166 @@ One NDJSON line per event, with request metadata only — no bodies, no headers,
 
 Errors are recorded as classes (`timeout`, `refused`, `dns`, `tls`, `upstream_error`) rather than raw strings, so a URL carrying a token cannot reach the log.
 
+Pooled routes add three `omitempty` fields to each `proxy_request` event, so existing consumers of the NDJSON stream are unaffected and single-key lines stay byte-identical:
+
+| field | meaning |
+|---|---|
+| `key_index` | which slot served the request — an index, never a value |
+| `tokens` | tokens charged, present only when the upstream actually reported a total |
+| `tokens_estimated` | true when the charge came from `budget.estimate_tokens` |
+
+`key_index` appears on the 502 line too: during a per-key outage, which account failed is exactly what an operator needs.
+
 ## Threat model
 
-**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a client reaching the upstream as another account.
+**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a client's own `Authorization` header reaching the upstream on an `inject` or `header` route.
 
-**Does not protect against:** a compromised gateway host — it holds the keys; a malicious client that has a valid channel token, within its allowlisted scope; provider-side logging. The CONNECT allowlist bounds what a stolen token can reach, which is why it is required and why it should stay short.
+**Does not protect against:** a compromised gateway host — it holds the keys; a malicious client that has a valid channel token, within its allowlisted scope; a caller presenting a credential in some **other** header that the upstream also accepts, since every non-hop-by-hop header is forwarded (see [What "replaced" does and does not buy you](#what-replaced-does-and-does-not-buy-you)); provider-side logging. The CONNECT allowlist bounds what a stolen token can reach, which is why it is required and why it should stay short.
+
+---
+
+## Rotation, budgets and exhaustion
+
+A pooled route may carry a `rotation` block. Two spellings, one shape:
+
+```yaml
+rotation: round_robin        # shorthand for {policy: round_robin}
+```
+
+```yaml
+rotation:
+  policy: least_tokens       # round_robin (default) | least_used | least_tokens
+  max_retry_after: 1h        # clamps the Retry-After on a 503; 0 selects 1h
+  budget:
+    window: 1h               # tumbling per-key accounting window; 0 disables ALL caps
+    tokens: 2000000          # hard per-key cap; 0 = uncapped
+    requests: 0              # hard per-key cap; 0 = uncapped
+    soft_ratio: 0.8          # retire at 80% of the cap; 0 selects the default
+    estimate_tokens: 1500    # charged when a response reports no usage
+```
+
+A **single-key** route is unaffected by all of this. It resolves to the same
+bearer injector as before, no accounting store is built for it, its outbound
+request is byte-for-byte what it is today, and its audit line carries no
+`key_index`.
+
+### Selection policies
+
+| policy | picks | ties |
+|---|---|---|
+| `round_robin` (default) | next key in index order | n/a |
+| `least_used` | fewest settled requests **plus outstanding leases** this window | round-robin |
+| `least_tokens` | fewest tokens charged this window | round-robin |
+
+Counting outstanding leases is what stops a simultaneous burst — which sees no
+settled usage at all — from stampeding one key.
+
+`least_tokens` falls back to request ordering for any selection where **any**
+candidate carries an estimated sample. Comparing a real token total against an
+estimate is exactly the skew the estimate marker exists to prevent.
+
+### Soft and hard caps
+
+- **Soft cap** (`soft_ratio`, default `0.8`): the key leaves rotation for the
+  rest of the window while it still has headroom. This is a *planned* rotation —
+  the key is never discovered dead by an upstream error.
+- **Hard cap** (100% of `tokens` or `requests`): the key is marked **drained**.
+
+Both are unselectable, but they are reported separately: "spent its whole plan"
+and "parked early on purpose" are different operational facts.
+
+The window is **tumbling** and rollover is **lazy** — evaluated from the clock on
+every call. The gateway therefore starts no timer goroutine for rotation, and a
+test can advance an injected clock instead of sleeping. An explicit retirement
+whose deadline outlives the window (a one-hour provider cooldown, for instance)
+survives a five-minute accounting boundary.
+
+### Exhaustion is 503, never 502
+
+When every key on a route is retired or drained the gateway answers:
+
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 90
+Content-Type: application/json
+
+{"error":"keys_exhausted","route":"minimax-pool","retry_after_seconds":90, ...}
+```
+
+The upstream is **not** contacted. This is deliberately distinct from the
+existing `502 upstream unavailable`: an operator paging on 502 is hunting a
+broken upstream, whereas a route whose plans are all spent is a billing
+question. Collapsing the two is how a quota outage gets triaged as an outage.
+
+`Retry-After` is the true minimum wait across all keys, floored at 1s (a
+`Retry-After: 0` tells a client nothing) and clamped to `max_retry_after`
+(default 1h — several agents treat an hours-long value as fatal). A client that
+retries early simply receives another 503 with a fresh value.
+
+Neither the 503 body nor the audit line ever carries key material: only the
+route name, the reason and the wait.
+
+An upstream **429** or **402** retires the serving key with reason `quota` before
+the lease settles, so the next selection already skips it. 402 is included
+because header-auth providers commonly signal a spent plan with Payment
+Required, and treating that as a generic upstream error would keep re-selecting
+the dead key until the window rolled.
+
+### Streaming responses and the estimate fallback
+
+Token usage is read from the response as it streams past, from a rolling 8 KiB
+tail scanned for the last `"total_tokens": N`. One implementation serves both
+plain JSON and SSE, because a rolling tail is agnostic to chunk boundaries and
+to the `data: ` frame wrapper.
+
+Many SSE completions carry no `usage` object at all. That case is **not** charged
+as zero — zero is a real, trustworthy count, and conflating the two is how an
+all-streaming route would under-charge its budget forever and never rotate.
+Instead the sample's token count is structurally unknown, `budget.estimate_tokens`
+is charged, the key is marked **estimated** (which makes `least_tokens` degrade
+to request ordering), and the audit line records `"tokens_estimated": true`.
+
+`Config.Validate` rejects `budget.tokens > 0` with `estimate_tokens: 0` at
+startup, so the silent-skew configuration cannot be deployed. A usage object
+that falls outside the retained tail is treated the same way — an estimate,
+never a zero.
+
+A request that fails before producing a response (dial error, timeout, client
+disconnect) releases its lease and increments an error counter but charges no
+requests and no tokens: a dead upstream must not make a healthy key look like
+the most-used one.
+
+### `auth: header` with a budget
+
+Header-auth upstreams report no `usage.total_tokens`, so **every** sample on such
+a route is an estimate. Budget those routes by `requests`, not by `tokens`.
+
+`policy: least_tokens` is **rejected at config load** on an `auth: header` route:
+with every sample estimated it would behave exactly as `least_used` while
+claiming to balance tokens. Everything else composes normally — a pooled header
+route leases, retires, emits `auth_mode: header` alongside `key_index`, and
+answers the same 503 with `Retry-After`.
+
+### Metric
+
+```
+llm_cluster_router_helixchannel_key_retired_total{route,reason}
+```
+
+`reason` is one of:
+
+| reason | meaning |
+|---|---|
+| `cap` | this gateway's own accounting — the soft cap or the hard cap |
+| `quota` | an upstream quota signal (HTTP 429 or 402) |
+| `error` | repeated upstream failure that is not a quota signal |
+
+The counter fires once per key per window for `cap`, so late settlements of
+in-flight leases cannot inflate it.
+
+Registration is explicit — `channel.RegisterMetrics(reg)` — rather than an
+`init()`, so importing the package never mutates the default Prometheus
+registry and a test can use its own `prometheus.NewRegistry()`. The `gateway`
+subcommand performs that registration on the process registry at startup; an
+alert written against this series with nothing calling `RegisterMetrics` would
+be dead on arrival.

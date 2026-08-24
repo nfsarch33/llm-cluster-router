@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/nfsarch33/llm-cluster-router/internal/channel"
 )
@@ -53,6 +56,22 @@ func runGateway(args []string) error {
 	srv, err := channel.NewServer(cfg, channel.NewHTTPForwarder(), channel.NewAuditor(auditWriter))
 	if err != nil {
 		return err
+	}
+
+	// Register the rotation metric on the process registry. Without this call
+	// llm_cluster_router_helixchannel_key_retired_total is never exported and
+	// every alert written against it is dead on arrival — the same failure
+	// mode as a rule file that looks real and routes to nobody.
+	//
+	// AlreadyRegisteredError is tolerated so that a second gateway invocation
+	// inside one process (the in-process CLI tests do exactly this) is not a
+	// startup failure; the collector is a package-level var, so the first
+	// registration is the one that counts.
+	if err := channel.RegisterMetrics(prometheus.DefaultRegisterer); err != nil {
+		var dup prometheus.AlreadyRegisteredError
+		if !errors.As(err, &dup) {
+			return fmt.Errorf("register helixchannel metrics: %w", err)
+		}
 	}
 
 	if *printRoutes {

@@ -360,50 +360,109 @@ func TestConfigValidate_ConnectTokenRefMirrorsKeyRef(t *testing.T) {
 	}
 }
 
-// TestExampleConfig_StillLoadsUnchanged guards the committed deployment
-// contract: the example config must keep parsing, validating and describing
-// exactly the same routes it did before key_ref existed.
-func TestExampleConfig_StillLoadsUnchanged(t *testing.T) {
+// TestExampleConfig_IsTheOneShippedSchema guards the committed deployment
+// contract. deploy/helixchannel/gateway.example.yml is the ONLY example config
+// in the tree: configs/helixchannel.rotation.example.yml is gone, and a second
+// example in a second directory is how a node gets deployed from the one that
+// was not updated.
+//
+// Every reconciled decision has to survive a real parse of that file, not just
+// a hand-built Config in a test.
+func TestExampleConfig_IsTheOneShippedSchema(t *testing.T) {
 	t.Parallel()
 	const path = "../../deploy/helixchannel/gateway.example.yml"
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("LoadConfig(%s): %v", path, err)
 	}
-	type want struct {
+
+	byName := map[string]Route{}
+	for _, r := range cfg.Routes {
+		byName[r.Name] = r
+	}
+
+	// The pre-existing routes keep their shape, so an operator upgrading in
+	// place sees no behavioural change on anything already deployed.
+	legacy := map[string]struct {
 		prefix, upstream string
 		auth             AuthMode
 		enabled          bool
-		timeout          time.Duration
+	}{
+		"minimax":   {"/minimax/", "https://api.minimaxi.com", AuthInject, true},
+		"qwen":      {"/qwen/", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", AuthInject, true},
+		"anthropic": {"/anthropic/", "https://api.anthropic.com", AuthPassthrough, false},
 	}
-	expected := map[string]want{
-		"minimax":   {"/minimax/", "https://api.minimaxi.com", AuthInject, true, 90 * time.Second},
-		"qwen":      {"/qwen/", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", AuthInject, true, 90 * time.Second},
-		"codex":     {"/codex/", "https://api.openai.com", AuthInject, false, 90 * time.Second},
-		"anthropic": {"/anthropic/", "https://api.anthropic.com", AuthPassthrough, false, 90 * time.Second},
-	}
-	if len(cfg.Routes) != len(expected) {
-		t.Fatalf("routes = %d, want %d", len(cfg.Routes), len(expected))
-	}
-	for _, r := range cfg.Routes {
-		w, ok := expected[r.Name]
+	for name, w := range legacy {
+		r, ok := byName[name]
 		if !ok {
-			t.Fatalf("unexpected route %q in the committed example config", r.Name)
+			t.Fatalf("route %q disappeared from the example config", name)
 		}
-		if r.Prefix != w.prefix || r.Upstream != w.upstream || r.Auth != w.auth ||
-			r.Enabled != w.enabled || r.Timeout != w.timeout {
-			t.Errorf("route %q = %+v, want prefix %q upstream %q auth %q enabled %v timeout %v",
-				r.Name, r, w.prefix, w.upstream, w.auth, w.enabled, w.timeout)
+		if r.Prefix != w.prefix || r.Upstream != w.upstream || r.Auth != w.auth || r.Enabled != w.enabled {
+			t.Errorf("route %q = %+v, want prefix %q upstream %q auth %q enabled %v",
+				name, r, w.prefix, w.upstream, w.auth, w.enabled)
 		}
-		if r.KeyRef != "" {
-			t.Errorf("route %q carries key_ref %q; the committed example must not depend on the new field", r.Name, r.KeyRef)
+		if r.Timeout != 90*time.Second {
+			t.Errorf("route %q timeout = %v, want the inherited default", name, r.Timeout)
+		}
+		if hasPluralKeys(r) || r.Rotation != nil {
+			t.Errorf("route %q gained a pool or a rotation block it did not have", name)
 		}
 	}
-	if cfg.Connect.TokenRef != "" {
-		t.Errorf("connect carries token_ref %q; the committed example must not depend on the new field", cfg.Connect.TokenRef)
+
+	// key_ref on a single-key route: the secret seam, reachable from config.
+	if got := byName["codex"].KeyRef; !strings.HasPrefix(got, SchemeOP) {
+		t.Errorf("codex key_ref = %q, want an %s reference", got, SchemeOP)
 	}
+
+	// The full rotation block, with a token budget.
+	mmPool := byName["minimax-pool"]
+	if declaredKeyCount(mmPool) != 3 {
+		t.Errorf("minimax-pool declares %d slots, want 3", declaredKeyCount(mmPool))
+	}
+	if mmPool.Rotation == nil || mmPool.Rotation.Policy != PolicyLeastTokens {
+		t.Fatalf("minimax-pool rotation = %+v, want least_tokens", mmPool.Rotation)
+	}
+	if mmPool.Rotation.Budget.EstimateTokens == 0 {
+		t.Error("minimax-pool sets a token cap with no estimate_tokens; Validate should have refused it")
+	}
+
+	// The scalar shorthand the pooledauth branch shipped must still parse.
+	qwenPool := byName["qwen-pool"]
+	if qwenPool.Rotation == nil || qwenPool.Rotation.Policy != PolicyRoundRobin {
+		t.Errorf("qwen-pool rotation = %+v, want the scalar shorthand to mean round_robin", qwenPool.Rotation)
+	}
+
+	// auth: header, pooled, with a REQUEST budget — the composition no source
+	// branch supported.
+	exa := byName["exa-pool"]
+	if exa.Auth != AuthHeaderInject || exa.KeyHeader != "x-api-key" {
+		t.Errorf("exa-pool = %+v, want a header route on x-api-key", exa)
+	}
+	if exa.Rotation == nil || exa.Rotation.Budget.Requests == 0 {
+		t.Errorf("exa-pool rotation = %+v, want a request budget", exa.Rotation)
+	}
+	if exa.Rotation != nil && exa.Rotation.Policy == PolicyLeastTokens {
+		t.Error("exa-pool uses least_tokens on a header route; Validate should have refused it")
+	}
+
+	// auth: header, single key.
+	if tav := byName["tavily"]; tav.Auth != AuthHeaderInject || hasPluralKeys(tav) || tav.KeyPrefix == "" {
+		t.Errorf("tavily = %+v, want a single-key header route with a key_prefix", tav)
+	}
+
+	// Nothing enabled by default may depend on an unmounted new-style source:
+	// a fresh node must come up on exactly the routes it came up on before.
+	for _, r := range cfg.EnabledRoutes() {
+		if _, ok := legacy[r.Name]; !ok {
+			t.Errorf("route %q is enabled by default in the example config; only the pre-existing routes may be", r.Name)
+		}
+	}
+
 	if !cfg.Connect.Enabled || cfg.Connect.TokenFile == "" {
 		t.Error("connect stanza changed shape")
+	}
+	if cfg.Connect.TokenRef != "" {
+		t.Errorf("connect carries token_ref %q; the committed example must not depend on a vault being reachable", cfg.Connect.TokenRef)
 	}
 }
 
