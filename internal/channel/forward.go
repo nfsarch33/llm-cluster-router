@@ -3,7 +3,6 @@ package channel
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -104,41 +103,11 @@ func (f *httpForwarder) Forward(ctx context.Context, req *http.Request, rt *boun
 	return f.client.Do(outReq)
 }
 
-// copyResponse streams an upstream response back to the caller, preserving
-// status and headers and flushing incrementally so streamed completions
-// arrive as they are produced rather than at the end.
+// copyResponse streams an upstream response back to the caller.
+//
+// It is a thin wrapper over copyResponseObserving so that every existing
+// caller and test fake keeps compiling and behaving identically; rotation
+// passes a usage extractor through the same path.
 func copyResponse(w http.ResponseWriter, resp *http.Response) (int64, error) {
-	for k, vs := range resp.Header {
-		if hopByHop[strings.ToLower(k)] {
-			continue
-		}
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	flusher, canFlush := w.(http.Flusher)
-	if !canFlush {
-		return io.Copy(w, resp.Body)
-	}
-	var total int64
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			written, werr := w.Write(buf[:n])
-			total += int64(written)
-			flusher.Flush()
-			if werr != nil {
-				return total, werr
-			}
-		}
-		if err == io.EOF {
-			return total, nil
-		}
-		if err != nil {
-			return total, err
-		}
-	}
+	return copyResponseObserving(w, resp, nil)
 }

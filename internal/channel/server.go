@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,22 @@ type AuditEvent struct {
 	BytesOut   int64  `json:"bytes_out,omitempty"`
 	ClientAddr string `json:"client_addr,omitempty"`
 	Error      string `json:"error,omitempty"`
+
+	// KeyIndex is the pool slot that served the request. It appears only on
+	// pooled routes, so legacy single-key and passthrough lines stay
+	// byte-identical.
+	//
+	// *int, not int: with `omitempty` a plain int would DROP key_index==0 —
+	// the most common slot, and the one a two-key route uses half the time —
+	// and without omitempty every existing single-key and passthrough line
+	// would gain a spurious "key_index":0. A nil pointer keeps today's lines
+	// unchanged. The pointer must address a fresh local, never a shared field.
+	KeyIndex *int `json:"key_index,omitempty"`
+	// Tokens is set only when a real usage.total_tokens was observed.
+	Tokens int64 `json:"tokens,omitempty"`
+	// TokensEstimated marks a charge derived from Budget.EstimateTokens
+	// because the response carried no usage object.
+	TokensEstimated bool `json:"tokens_estimated,omitempty"`
 }
 
 // Auditor writes audit events.
@@ -66,9 +83,43 @@ func (a *ndjsonAuditor) Log(e AuditEvent) {
 	_, _ = a.w.Write(append(b, '\n'))
 }
 
+// KeyInventory is the /healthz key surface for one route.
+//
+// It exists to separate "this route holds no credential BY DESIGN" from "this
+// route holds no credential BY ACCIDENT", which a bare map[string]int could
+// not: both rendered as 0. Every entry carries Mode, so a zero is never
+// ambiguous.
+//
+// Invariants:
+//
+//	Keys == 0 && !Pooled  <=>  Mode == AuthPassthrough   (by design)
+//	Keys == 0 &&  Pooled   =>  misconfiguration          (by accident)
+//	Degraded == Pooled && Available == 0
+//
+// NewServer rejects an empty resolved pool, so the by-accident case is
+// unreachable from configuration and Degraded means only "every key on this
+// route is currently retired or drained" — page-worthy, but a different fact
+// from "this route was never given a credential".
+//
+// Counts only: never a key, prefix, suffix, length or fingerprint. Any per-key
+// hint on an unauthenticated endpoint is an oracle for correlating which
+// account served which request.
+type KeyInventory struct {
+	Mode      AuthMode `json:"mode"`
+	Pooled    bool     `json:"pooled"`
+	Keys      int      `json:"keys"`
+	Available int      `json:"available"`
+	Degraded  bool     `json:"degraded"`
+}
+
 // Server is the HelixChannel gateway: a path-prefix reverse proxy for
 // API-key upstreams plus an optional CONNECT tunnel for clients that must
 // keep their own end-to-end TLS session.
+//
+// There is deliberately no map of rotation stores here. Each pooled route's
+// Store is owned by its *rotatingInjector and reached through the keyLeaser
+// capability; a second reference that only tests ever read is a field that
+// drifts.
 type Server struct {
 	cfg       *Config
 	routes    []*boundRoute
@@ -79,18 +130,70 @@ type Server struct {
 	httpSrv   *http.Server
 }
 
+// serverOptions are the injectable construction dependencies.
+type serverOptions struct {
+	secrets  SecretProvider
+	now      func() time.Time
+	observer RetireObserver
+}
+
+// ServerOption customises Server construction. Variadic options keep every
+// existing three-argument NewServer call compiling unchanged.
+type ServerOption func(*serverOptions)
+
+// WithSecretProvider overrides the SecretProvider used to resolve every route
+// credential and the CONNECT token. It defaults to NewDefaultSecretProvider().
+func WithSecretProvider(sp SecretProvider) ServerOption {
+	return func(o *serverOptions) { o.secrets = sp }
+}
+
+// WithRotationClock injects the clock every rotation Store reads, so a test can
+// advance a window instead of sleeping. Named apart from the StoreOption
+// WithClock because Go has one package namespace for both.
+func WithRotationClock(now func() time.Time) ServerOption {
+	return func(o *serverOptions) { o.now = now }
+}
+
+// WithRotationRetireObserver replaces the retirement metric sink on every
+// rotation Store, so a test can assert reasons without touching a global
+// registry.
+func WithRotationRetireObserver(o RetireObserver) ServerOption {
+	return func(so *serverOptions) { so.observer = o }
+}
+
 // NewServer builds a gateway from validated configuration.
 //
-// All credentials are resolved here so that a misconfigured route fails at
-// startup with a clear message instead of returning 502s later.
-func NewServer(cfg *Config, fwd Forwarder, audit Auditor) (*Server, error) {
+// Every credential is resolved HERE, eagerly, before Handler() is reachable —
+// so a misconfigured route fails at startup with a clear message instead of
+// returning 502s later, and Server.connToken is written exactly once and only
+// read thereafter. ONE SecretProvider is shared across every route and the
+// CONNECT token, so a vault item named twice is fetched once.
+//
+// Only ENABLED routes are resolved: a switched-off route with a broken
+// credential must not be able to take the gateway down.
+func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) (*Server, error) {
 	if fwd == nil {
 		fwd = NewHTTPForwarder()
+	}
+	var o serverOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	sp := o.secrets
+	if sp == nil {
+		sp = NewDefaultSecretProvider()
 	}
 	s := &Server{cfg: cfg, forwarder: fwd, audit: audit, allowed: map[string]bool{}}
 
 	for _, r := range cfg.EnabledRoutes() {
-		auth, err := NewAuthenticator(r)
+		// The Store is sized from configuration alone: resolveKeyPool yields
+		// exactly one key per declared slot, so the pool can be accounted for
+		// before any credential is held.
+		var st *Store
+		if hasPluralKeys(r) {
+			st = newRotationStore(r, declaredKeyCount(r), o)
+		}
+		auth, err := newAuthenticatorFor(r, sp, st)
 		if err != nil {
 			return nil, err
 		}
@@ -103,9 +206,15 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor) (*Server, error) {
 	})
 
 	if cfg.Connect.Enabled {
-		tok, err := readSecret(cfg.Connect.TokenEnv, cfg.Connect.TokenFile)
+		tok, err := resolveFirst(sp, secretRefs(cfg.Connect.TokenRef, cfg.Connect.TokenEnv, cfg.Connect.TokenFile))
 		if err != nil {
 			return nil, fmt.Errorf("connect: %w", err)
+		}
+		// Belt and braces: connToken can never be "" on a running server,
+		// because an empty token would make ConstantTimeCompare authorise an
+		// empty bearer. authorizeConnect guards the same fact independently.
+		if tok = strings.TrimSpace(tok); tok == "" {
+			return nil, fmt.Errorf("connect: %w", ErrSecretEmpty)
 		}
 		s.connToken = tok
 		for _, h := range cfg.Connect.AllowedHosts {
@@ -115,12 +224,61 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor) (*Server, error) {
 	return s, nil
 }
 
+// newRotationStore builds one accounting Store per pooled route. Budgets and
+// policies are per-route configuration, so a shared store would have to pick
+// one route's budget for all of them.
+func newRotationStore(r Route, keys int, o serverOptions) *Store {
+	rot := r.Rotation
+	if rot == nil {
+		rot = &RotationConfig{}
+	}
+	policy, err := NewPolicy(rot.Policy)
+	if err != nil {
+		// Validate rejects an unknown policy at startup; falling back here
+		// keeps a programmatically built Config serving rather than panicking.
+		policy = NewRoundRobinPolicy()
+	}
+	opts := []StoreOption{
+		WithPolicy(policy),
+		WithBudget(rot.Budget),
+		WithMaxRetryAfter(rot.MaxRetryAfter),
+	}
+	if o.now != nil {
+		opts = append(opts, WithClock(o.now))
+	}
+	if o.observer != nil {
+		opts = append(opts, WithRetireObserver(o.observer))
+	}
+	return NewStore(map[string]int{r.Name: keys}, opts...)
+}
+
 // RouteNames returns the enabled route names, longest-prefix first. Used by
 // /healthz and by the CLI to show what the gateway is actually serving.
 func (s *Server) RouteNames() []string {
 	out := make([]string, 0, len(s.routes))
 	for _, r := range s.routes {
 		out = append(out, r.Route.Name)
+	}
+	return out
+}
+
+// KeyInventory reports, per enabled route, how many server-held credentials
+// back it and how many are selectable right now. See the KeyInventory type for
+// the by-design / by-accident distinction it exists to preserve.
+func (s *Server) KeyInventory() map[string]KeyInventory {
+	out := make(map[string]KeyInventory, len(s.routes))
+	for _, rt := range s.routes {
+		if kl, ok := rt.Auth.(keyLeaser); ok {
+			out[rt.Route.Name] = kl.inventory()
+			continue
+		}
+		mode := rt.Auth.Mode()
+		if mode == AuthPassthrough {
+			// No credential BY DESIGN: the caller holds it.
+			out[rt.Route.Name] = KeyInventory{Mode: mode}
+			continue
+		}
+		out[rt.Route.Name] = KeyInventory{Mode: mode, Keys: 1, Available: 1}
 	}
 	return out
 }
@@ -148,7 +306,10 @@ func (s *Server) Handler() http.Handler {
 // Reporting the live route set is deliberate: a static health response that
 // cannot distinguish "gateway up" from "upstreams configured" is precisely
 // what masked a month-long outage on the pilot host, where a reverse proxy
-// answered /healthz from a literal while the fan-out behind it was dead.
+// answered /healthz from a literal while the fan-out behind it was dead. The
+// key inventory extends the same argument to credentials: a route with every
+// key drained is serving 503s, and a health endpoint that cannot say so is
+// answering from a literal again.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -156,6 +317,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"status":  "ok",
 		"service": "helixchannel-gateway",
 		"routes":  s.RouteNames(),
+		"keys":    s.KeyInventory(),
 		"connect": s.cfg.Connect.Enabled,
 	})
 }
@@ -166,40 +328,149 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	rt := s.match(r.URL.Path)
 	if rt == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error":  "not_found",
-			"hint":   "prefix the path with an enabled route",
-			"routes": s.RouteNames(),
-		})
+		s.writeNotFound(w)
 		return
+	}
+
+	// The rotation branch is entered only through a type assertion that
+	// bearerInjector, leasedInjector and passthrough deliberately fail, so the
+	// single-key path runs through code this change does not touch.
+	fwdRoute, lease := rt, (*KeyLease)(nil)
+	if kl, ok := rt.Auth.(keyLeaser); ok {
+		auth, l, live := kl.leaseFor()
+		if !live {
+			s.denyDrained(w, rt, r, requestID, start, kl.retryAfter())
+			return
+		}
+		fwdRoute, lease = &boundRoute{Route: rt.Route, Auth: auth}, l
+		// Settle is sync.Once-guarded, so this deferred failure settlement is
+		// a no-op once the success path has settled. Between them, exactly one
+		// settlement happens on every exit path including a panic.
+		defer lease.Settle(UsageSample{Outcome: OutcomeFailed})
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), rt.Route.Timeout)
 	defer cancel()
 
-	resp, err := s.forwarder.Forward(ctx, r, rt)
+	resp, err := s.forwarder.Forward(ctx, r, fwdRoute)
 	if err != nil {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		s.audit.Log(AuditEvent{
+		event := AuditEvent{
 			Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 			AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 			Upstream: rt.Route.Upstream, Status: http.StatusBadGateway,
 			LatencyMS: time.Since(start).Milliseconds(), ClientAddr: r.RemoteAddr,
 			Error: errorClass(err),
-		})
+		}
+		// The 502 line carries the key index too: during a per-key outage,
+		// which account failed is exactly what an operator needs.
+		if lease != nil {
+			idx := lease.Index()
+			event.KeyIndex = &idx
+		}
+		s.audit.Log(event)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	n, _ := copyResponse(w, resp)
-	s.audit.Log(AuditEvent{
+	var usage UsageExtractor
+	if lease != nil {
+		usage = NewUsageExtractor()
+	}
+	n, _ := copyResponseObserving(w, resp, usage)
+
+	event := AuditEvent{
 		Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 		AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 		Upstream: rt.Route.Upstream, Status: resp.StatusCode,
 		LatencyMS: time.Since(start).Milliseconds(), BytesOut: n,
 		ClientAddr: r.RemoteAddr,
+	}
+	if lease != nil {
+		s.settleLease(rt, lease, resp.StatusCode, usage, &event)
+	}
+	s.audit.Log(event)
+}
+
+// writeNotFound is the unchanged 404 body, extracted so handleProxy stays
+// readable.
+func (s *Server) writeNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":  "not_found",
+		"hint":   "prefix the path with an enabled route",
+		"routes": s.RouteNames(),
+	})
+}
+
+// settleLease charges the request against its key and annotates the audit
+// event. An upstream quota signal retires the key BEFORE the lease is settled,
+// so the next selection already skips it.
+func (s *Server) settleLease(rt *boundRoute, lease *KeyLease, status int, usage UsageExtractor, event *AuditEvent) {
+	sample := usage.Result()
+	if isQuotaStatus(status) {
+		if kl, ok := rt.Auth.(keyLeaser); ok {
+			kl.retire(lease.Index(), ReasonQuota)
+		}
+	}
+	lease.Settle(sample)
+
+	// A fresh local, addressed once: sharing a field here would let a later
+	// request mutate a value this line has not yet marshalled.
+	idx := lease.Index()
+	event.KeyIndex = &idx
+	if sample.Tokens != TokensUnknown {
+		event.Tokens = sample.Tokens
+	}
+	event.TokensEstimated = sample.Estimated
+}
+
+// isQuotaStatus reports whether an upstream status means "this key's plan is
+// spent" rather than "this upstream is broken".
+//
+// 402 is included alongside 429 because header-auth providers (the Exa/Tavily
+// class) commonly signal an exhausted plan with Payment Required. Treating that
+// as a generic upstream error would keep re-selecting the dead key until the
+// window rolled.
+func isQuotaStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
+}
+
+// denyDrained answers a request that arrived with every plan spent.
+func (s *Server) denyDrained(w http.ResponseWriter, rt *boundRoute, r *http.Request, requestID string, start time.Time, retryAfter time.Duration) {
+	s.writeDrained(w, rt.Route.Name, retryAfter)
+	s.audit.Log(AuditEvent{
+		Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
+		AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
+		Upstream: rt.Route.Upstream, Status: http.StatusServiceUnavailable,
+		LatencyMS: time.Since(start).Milliseconds(), ClientAddr: r.RemoteAddr,
+		Error: "keys_exhausted",
+	})
+}
+
+// writeDrained writes the all-keys-spent answer: 503 with Retry-After, NOT 502.
+//
+// An operator paging on 502 is hunting a broken upstream; a route whose plans
+// are all spent is a billing question. Collapsing the two is how a quota
+// outage gets triaged as an outage. The body names the route and the wait and
+// carries no credential material.
+func (s *Server) writeDrained(w http.ResponseWriter, route string, retryAfter time.Duration) {
+	secs := int64(retryAfter / time.Second)
+	if retryAfter%time.Second != 0 {
+		secs++
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":               "keys_exhausted",
+		"hint":                "every upstream key on this route is retired or drained; retry after the advertised wait",
+		"route":               route,
+		"retry_after_seconds": secs,
 	})
 }
 
@@ -311,12 +582,23 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorizeConnect compares the presented token in constant time.
+//
+// The two emptiness guards are defence in depth and are not optional:
+// subtle.ConstantTimeCompare([]byte(""), []byte("")) returns 1, so a server
+// holding an empty token would AUTHORISE the header "Bearer " and become an
+// allowlisted open relay. The credential layer already makes an empty token
+// unreachable from configuration — envProvider trims before testing, and
+// NewServer refuses a blank one — and this makes it unreachable from anywhere,
+// so the property still holds if a future credential path regresses.
 func (s *Server) authorizeConnect(header string) bool {
 	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	if s.connToken == "" || !strings.HasPrefix(header, prefix) {
 		return false
 	}
 	got := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	if got == "" {
+		return false
+	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.connToken)) == 1
 }
 
