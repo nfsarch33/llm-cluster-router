@@ -77,6 +77,17 @@ var hopByHop = map[string]bool{
 // an edit to any Authenticator, to the handler, or to the forwarder body.
 //
 // Entries are matched case-insensitively, so spell them however reads best.
+//
+// Not every entry is independently provable, and that is recorded here so a
+// later reader does not mistake redundancy for coverage. X-Api-Key, Api-Key,
+// X-Goog-Api-Key and Cookie are each load-bearing: delete one and a caller
+// value reaches the provider (each is mutation-killed by
+// credential_strip_test.go). Authorization and Proxy-Authorization are NOT —
+// the first is overwritten by bearerInjector and deleted by leasedInjector, the
+// second is already dropped by the hopByHop table above. They are kept anyway,
+// because those are DIFFERENT layers: a substituted Forwarder, or an edit to
+// the hop-by-hop table, removes them and not this one. Two string comparisons
+// is a cheap price for a guarantee that does not depend on code elsewhere.
 var callerCredentialHeaders = []string{
 	"Authorization",       // OpenAI, MiniMax, Qwen — every bearer provider
 	"Proxy-Authorization", // also hop-by-hop; listed so the guarantee does not rest on that
@@ -100,10 +111,12 @@ var modesSupplyingTheirOwnCredential = map[AuthMode]bool{
 // credential, given the route configured key header.
 //
 // routeKeyHeader extends the static table with whatever the operator named in
-// key_header. It is belt and braces on today code — leasedInjector overwrites
-// that exact header a moment later — but it keeps the guarantee true of the
-// NAME rather than of the current write order, so a future Authenticator that
-// writes a different header cannot silently reopen the hole.
+// key_header. Mutation check: deleting this clause changes no observable
+// behaviour today, because leasedInjector writes that exact header a moment
+// later and Header.Set replaces every existing value. It is kept, and pinned by
+// a direct predicate test rather than an end-to-end one, so the guarantee is a
+// property of the header NAME rather than of the current write order — a future
+// Authenticator that writes a different header cannot silently reopen the hole.
 func isCallerCredential(name, routeKeyHeader string) bool {
 	for _, deny := range callerCredentialHeaders {
 		if strings.EqualFold(name, deny) {
