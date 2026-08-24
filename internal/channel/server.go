@@ -583,13 +583,21 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // authorizeConnect compares the presented token in constant time.
 //
-// The two emptiness guards are defence in depth and are not optional:
 // subtle.ConstantTimeCompare([]byte(""), []byte("")) returns 1, so a server
 // holding an empty token would AUTHORISE the header "Bearer " and become an
 // allowlisted open relay. The credential layer already makes an empty token
 // unreachable from configuration — envProvider trims before testing, and
-// NewServer refuses a blank one — and this makes it unreachable from anywhere,
-// so the property still holds if a future credential path regresses.
+// NewServer refuses a blank one — and the guards below make it unreachable from
+// anywhere, so the property still holds if a future credential path regresses.
+//
+// The two emptiness checks are MUTUALLY REDUNDANT, not two independent
+// properties, and the comment says so because a mutation run proved it: with
+// one empty side ConstantTimeCompare already returns 0, so each check only ever
+// fires when BOTH sides are empty — the case the other one also catches.
+// Deleting either alone changes no behaviour; deleting both reopens the bypass.
+// They are both kept because the failure is an unauthenticated open relay and
+// the cost is two string comparisons, but do not read them as belt and braces
+// for different risks.
 func (s *Server) authorizeConnect(header string) bool {
 	const prefix = "Bearer "
 	if s.connToken == "" || !strings.HasPrefix(header, prefix) {
