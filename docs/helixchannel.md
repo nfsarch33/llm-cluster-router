@@ -111,6 +111,45 @@ So on the reverse-proxy leg, reachability **is** authorisation:
 The `CONNECT` leg is the one leg with a caller credential, and its allowlist —
 not the token — is what bounds where a stolen token can go.
 
+### Redirects are never followed
+
+The gateway does not follow a `3xx` from an upstream. On **every** auth mode,
+`inject`, `header` and `passthrough` alike, the redirect is relayed to the caller
+with its `Location` intact and the caller decides what to do with it. The audit
+line for that request carries `error: redirect_not_followed`.
+
+This is a security property, not a preference. `http.Client.CheckRedirect` was
+nil, which selects the standard library's default: follow up to ten hops,
+**replaying the outbound headers on each one**. On an injecting route those
+headers carry the credential the gateway holds and the caller is never shown, so
+an upstream — or anything able to answer as one — could exfiltrate a server-held
+key by answering `302`. Measured on this build with the provider and the target
+on different domains, so Go's own cross-domain header strip was fully in force,
+the target received the route's `x-api-key` from a single-key header route and
+from a pooled one. `Authorization` stayed behind only because `net/http` happens
+to strip that one header name across a domain change, which is an accident of the
+standard library and no help at all on a same-domain redirect. The shipped
+`exa-pool` route is exactly the leaking shape.
+
+Two further consequences shared that one root cause and are fixed by the same
+line:
+
+- **SSRF.** A redirect made the gateway fetch a host named in no configuration
+  and hand the body back to an unauthenticated caller.
+- **Spend.** A chain inside a single forward was up to nine extra upstream round
+  trips, all charged as one request against the budget.
+
+There is deliberately **no same-host exception**. A same-host redirect still
+multiplies round trips, still charges them as one, and still lets the upstream
+choose the request path; and a "same host?" comparison in the forwarder would be
+a security control in exactly the place this defect lived. An upstream that
+genuinely needs a redirect followed is a **configuration** change: point the
+route's `upstream` at the redirect target.
+
+Because no redirect is followed, the host the gateway contacts is always the host
+its route configured — and the audit line proves it rather than assuming it, by
+recording `upstream_host` read back from the request that was actually sent.
+
 ## Credentials
 
 A route names **where** its credential lives, never the credential itself.
@@ -309,7 +348,9 @@ One NDJSON line per event, with request metadata only — no bodies, no headers,
 {"ts":"2026-08-20T01:09:11Z","event":"connect_denied","target":"example.com:443","status":403,"error":"host_not_allowlisted"}
 ```
 
-Errors are recorded as classes (`timeout`, `refused`, `dns`, `tls`, `upstream_error`) rather than raw strings, so a URL carrying a token cannot reach the log.
+Errors are recorded as classes (`timeout`, `refused`, `dns`, `tls`, `upstream_error`, `redirect_not_followed`) rather than raw strings, so a URL carrying a token cannot reach the log.
+
+Every `proxy_request` line that obtained a response also carries `upstream_host`: the `host:port` the gateway **actually** contacted, read back from the request `net/http` sent. `upstream` remains the host the route was **configured** to contact. Recording both is the point — the two agree on every request that went where it was told, so a line where they differ is a request that did not, and that is an assertable, alertable signature instead of an invisible one. It used to be one field carrying the configured value, which made this stream — the record this document presents as the forensic one — incapable of recording an SSRF the gateway had just performed. A line with no response to read it from (a `502` after a dial failure) omits it.
 
 Pooled routes add three `omitempty` fields to each `proxy_request` event, so existing consumers of the NDJSON stream are unaffected and single-key lines stay byte-identical:
 
@@ -331,7 +372,7 @@ correct and unchanged lines stay unchanged.
 
 ## Threat model
 
-**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account through one of the **named** headers on the deny-set — `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Cookie`, plus whatever the route names in `key_header` — on an `inject` or `header` route.
+**Protects against:** an upstream exfiltrating the gateway's own credential by answering `3xx` — no redirect is followed on any mode, so no header is ever replayed to a host the route did not name (see [Redirects are never followed](#redirects-are-never-followed)); provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account through one of the **named** headers on the deny-set — `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Cookie`, plus whatever the route names in `key_header` — on an `inject` or `header` route.
 
 That last one is a **blocklist**, and its scope is exactly the six names in `callerCredentialHeaders` plus the route's own `key_header`. It is not "a caller cannot reach the upstream as another account"; it is "a caller cannot reach the upstream as another account *through one of these headers*". A provider that also honours a credential in a header nobody has listed yet still receives it.
 

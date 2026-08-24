@@ -39,6 +39,7 @@ type httpForwarder struct {
 func NewHTTPForwarder() Forwarder {
 	return &httpForwarder{
 		client: &http.Client{
+			CheckRedirect: refuseRedirect,
 			Transport: &http.Transport{
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 60 * time.Second,
@@ -48,6 +49,98 @@ func NewHTTPForwarder() Forwarder {
 			},
 		},
 	}
+}
+
+// refuseRedirect is the http.Client.CheckRedirect policy for the gateway's
+// outbound client. It follows NOTHING, on any auth mode, and hands the 3xx back
+// to the caller instead.
+//
+// Leaving CheckRedirect nil — which is what this forwarder did, and what
+// `rg CheckRedirect --type go .` found nowhere in the tree — selects the stdlib
+// default: follow up to ten hops, REPLAYING the outbound headers on each. On an
+// injecting route those headers carry the credential this gateway holds and the
+// caller is never shown, so any upstream, or anything able to answer as one,
+// could exfiltrate a server-held key by answering 302. Measured on this build
+// with the provider and the attacker on DIFFERENT domains, so Go's own
+// cross-domain strip was fully in force: the attacker received
+// x-api-key="XAPIKEY-SERVER-SECRET" from a single-key header route and
+// x-api-key="POOLKEY-SECRET-1" from a pooled one. Authorization survived only
+// because net/http happens to strip that ONE header name across a domain change
+// — an accident of the standard library rather than a property of this code, and
+// no help at all on a same-domain redirect, where the bearer travels too. The
+// shipped exa-pool route is exactly the leaking shape: auth header, key_header
+// x-api-key.
+//
+// Three consequences share that single root cause, which is why one line fixes
+// all three:
+//
+//   - EXFILTRATION, above: the gateway's own credential, to a host of the
+//     upstream's choosing.
+//   - SSRF: an unauthenticated caller drove the gateway to a host named in no
+//     configuration and received the body back, while the audit line recorded
+//     the CONFIGURED upstream — the forensic record asserted the request had
+//     gone where it was supposed to. See AuditEvent.UpstreamHost for the other
+//     half of that fix.
+//   - SPEND: one caller request became up to nine further upstream round trips
+//     inside a single Forward, all charged as one against the budget.
+//
+// passthrough refuses too, deliberately. The credential replayed there is the
+// CALLER's, sent to a host the caller did not choose, and the SSRF and spend
+// arguments do not care whose credential is on the wire. There is no per-mode
+// exception, so there is no mode whose redirect behaviour has to be reasoned
+// about separately.
+//
+// There is also no same-host exception. It would buy nothing: a same-host
+// redirect still multiplies round trips, still charges them as one request, and
+// still hands control of the request path to the upstream — and the "same host"
+// test would then be a security control implemented in this function, which is
+// how the class of bug this fixes gets reintroduced. An upstream that genuinely
+// requires a redirect to be followed is a CONFIGURATION change: point the
+// route's upstream at the redirect target.
+//
+// http.ErrUseLastResponse, not an error, because declining to follow is not a
+// failure. The upstream answered; the answer was "go there instead", and a proxy
+// relays that answer and lets the client decide. A client that follows it does
+// so with its own connection and its own credentials, never with this gateway's
+// key, which is the entire point. The outcome is not swallowed: handleProxy
+// labels the audit line redirect_not_followed.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// redirectNotFollowed reports whether resp is a redirect the gateway declined to
+// follow, so the audit stream NAMES that outcome instead of leaving an operator
+// to infer it from a status code and the absence of a second event.
+//
+// The Location test, not the status class alone, is what makes this mean "we
+// chose not to go there": 304 Not Modified is a 3xx that names no destination
+// and was never a redirect anyone would follow.
+func redirectNotFollowed(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode < 300 || resp.StatusCode > 399 {
+		return false
+	}
+	return resp.Header.Get("Location") != ""
+}
+
+// contactedHost is the host the gateway ACTUALLY reached, read back from the
+// request net/http attached to the response rather than from configuration.
+//
+// Every audit line used to carry rt.Route.Upstream alone: the host an operator
+// CONFIGURED, which is the host contacted only for as long as nothing moves the
+// connection elsewhere. That is precisely the assumption a redirect breaks, so
+// the one event that most needed to say "this went somewhere else" was the one
+// event structurally incapable of saying it. Recording both — intent in
+// upstream, fact in upstream_host — makes a divergence an assertable and
+// alertable signature rather than an invisible one.
+//
+// Empty when there is no response to read it from (a dial failure) or when a
+// substituted Forwarder returned a hand-built response; omitempty then leaves
+// those lines exactly as they were.
+func contactedHost(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.Host
 }
 
 // hopByHop headers are connection-scoped and must not be copied between the

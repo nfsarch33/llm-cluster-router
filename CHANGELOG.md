@@ -43,6 +43,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it at startup, so the series actually exists for alerts to watch.
 
 ### Fixed
+- **A redirect replayed the server-held credential to wherever the upstream said
+  (confirmed, CRITICAL).** `NewHTTPForwarder` left `http.Client.CheckRedirect`
+  nil — `rg CheckRedirect --type go .` matched nothing in the tree — which
+  selects the standard library default: follow up to ten hops, replaying the
+  outbound headers on each. On an injecting route those headers carry the
+  credential the gateway holds and the caller is never shown. Measured
+  cross-domain, with Go's own cross-domain strip fully in force, the redirect
+  target received `x-api-key` from a single-key header route and from a pooled
+  one; `Authorization` survived only because `net/http` happens to strip that one
+  header name across a domain change, which is an accident of the library and no
+  help on a same-domain redirect. The shipped `exa-pool` route is exactly that
+  shape. Two more findings shared the root cause: a redirect drove the gateway to
+  a host in no configuration and returned the body to an unauthenticated caller
+  (**SSRF**), and a chain inside one forward became up to nine extra upstream
+  round trips charged as one request (**spend**). No redirect is now followed on
+  any mode — there is no same-host exception, and an upstream that needs one
+  followed is a configuration change — the `3xx` is relayed to the caller with
+  its `Location`, and the audit line names the outcome
+  `error: redirect_not_followed`.
+- **The audit line could not record where a request actually went (confirmed).**
+  Every `proxy_request` event carried `rt.Route.Upstream`, the host the route was
+  CONFIGURED to contact, so a gateway that had just been driven to a host in no
+  configuration recorded that it had gone where it was told. Lines that obtained
+  a response now also carry `upstream_host`, the `host:port` read back from the
+  request `net/http` actually sent. Intent and fact are both recorded, so a
+  divergence is an assertable signature rather than an invisible one.
 - **The documentation named a security boundary that does not exist (confirmed,
   HIGH).** `docs/helixchannel.md` told operators to "treat the channel token as
   the real authorisation boundary: it decides who may use the gateway at all".

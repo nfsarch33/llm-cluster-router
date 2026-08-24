@@ -24,20 +24,31 @@ import (
 // header and no credential material — only the metadata needed to answer
 // "did this work, how fast, and through which route".
 type AuditEvent struct {
-	TS         string `json:"ts"`
-	Event      string `json:"event"`
-	RequestID  string `json:"request_id"`
-	Route      string `json:"route,omitempty"`
-	AuthMode   string `json:"auth_mode,omitempty"`
-	Method     string `json:"method,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Upstream   string `json:"upstream,omitempty"`
-	Target     string `json:"target,omitempty"`
-	Status     int    `json:"status,omitempty"`
-	LatencyMS  int64  `json:"latency_ms"`
-	BytesOut   int64  `json:"bytes_out,omitempty"`
-	ClientAddr string `json:"client_addr,omitempty"`
-	Error      string `json:"error,omitempty"`
+	TS        string `json:"ts"`
+	Event     string `json:"event"`
+	RequestID string `json:"request_id"`
+	Route     string `json:"route,omitempty"`
+	AuthMode  string `json:"auth_mode,omitempty"`
+	Method    string `json:"method,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Upstream  string `json:"upstream,omitempty"`
+	// UpstreamHost is the host:port the gateway ACTUALLY contacted, as opposed
+	// to Upstream, which is the host it was CONFIGURED to contact. The two are
+	// the same on every request that goes where it was told to, and that is the
+	// point: a line where they differ is a request that did not.
+	//
+	// It exists because the pair was previously one field carrying the
+	// configured value, which made the audit stream — the record these docs
+	// present as the forensic one — incapable of recording an SSRF it had just
+	// performed. omitempty, and populated only from a real response, so a line
+	// with no response to read (a 502 from a dial failure) is unchanged.
+	UpstreamHost string `json:"upstream_host,omitempty"`
+	Target       string `json:"target,omitempty"`
+	Status       int    `json:"status,omitempty"`
+	LatencyMS    int64  `json:"latency_ms"`
+	BytesOut     int64  `json:"bytes_out,omitempty"`
+	ClientAddr   string `json:"client_addr,omitempty"`
+	Error        string `json:"error,omitempty"`
 
 	// KeyIndex is the pool slot that served the request. It appears only on
 	// pooled routes, so legacy single-key and passthrough lines stay
@@ -392,9 +403,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	event := AuditEvent{
 		Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 		AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
-		Upstream: rt.Route.Upstream, Status: resp.StatusCode,
+		Upstream: rt.Route.Upstream, UpstreamHost: contactedHost(resp),
+		Status:    resp.StatusCode,
 		LatencyMS: time.Since(start).Milliseconds(), BytesOut: n,
 		ClientAddr: r.RemoteAddr,
+	}
+	// A redirect the gateway declined to follow is a distinct outcome, not a
+	// plain 3xx relay: the upstream asked for a credential to be replayed
+	// somewhere and was refused. Naming it here is what makes the refusal
+	// countable in the NDJSON instead of merely absent from it.
+	if redirectNotFollowed(resp) {
+		event.Error = "redirect_not_followed"
 	}
 	if lease != nil {
 		s.settleLease(rt, lease, resp.StatusCode, usage, &event)
