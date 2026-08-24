@@ -73,10 +73,43 @@ idempotency keys, provider-specific options — because that is what makes the
 gateway a transparent proxy. A provider that accepts a credential through some
 *other* header that nobody has listed yet would still receive it.
 
-Treat the channel token as the real authorisation boundary: it decides **who may
-use the gateway at all**. If a route's upstream honours an auth header that is
-not on the list above, add it to `callerCredentialHeaders` — that is the seam it
-exists for — or terminate it in front of the gateway.
+If a route's upstream honours an auth header that is not on the list above, add
+it to `callerCredentialHeaders` — that is the seam it exists for — or terminate
+it in front of the gateway.
+
+### The gateway does not authenticate reverse-proxy callers
+
+This is the part that decides how you may deploy it, so it is stated before the
+configuration reference rather than in a footnote.
+
+**The reverse-proxy leg authenticates nobody.** `handleProxy` matches a prefix,
+leases a key, applies the gateway's credential and forwards. It reads no caller
+token, and there is no configuration key that makes it read one.
+
+The channel token (`connect.token_ref` / `token_env` / `token_file`) is read at
+exactly **one** call site — `authorizeConnect`, inside `handleConnect` — and it
+gates the `CONNECT` tunnel and nothing else. It is not a gateway-wide
+authorisation boundary, and treating it as one is how a gateway ends up on a
+public interface.
+
+Stated as the code behaves: **anyone who can open a TCP connection to `listen`
+can spend every key on every enabled route.** The deny-set above stops a caller
+billing its *own* account through the gateway; it does nothing to stop an
+unauthenticated caller billing *yours*.
+
+So on the reverse-proxy leg, reachability **is** authorisation:
+
+- bind `listen` to loopback or to a tailnet address — the configuration example
+  below binds `127.0.0.1` for exactly this reason, not merely because a TLS
+  terminator is expected;
+- if it must be reachable from anywhere wider, put an **authenticating**
+  terminator in front (mTLS, an OIDC-verifying proxy, a signed-header check) and
+  let only that terminator reach the gateway socket;
+- treat a gateway published on a public interface as an open, funded relay to
+  every provider whose key it holds.
+
+The `CONNECT` leg is the one leg with a caller credential, and its allowlist —
+not the token — is what bounds where a stolen token can go.
 
 ## Credentials
 
@@ -250,8 +283,15 @@ curl -s https://gateway.example.com/healthz
 #          "qwen":{"mode":"inject","pooled":true,"keys":3,"available":2,"degraded":false}},
 #  "connect":true}
 
-# A route end-to-end
-curl -s https://gateway.example.com/minimax/v1/models -H "Authorization: Bearer $CLIENT_TOKEN"
+# A route end-to-end. No client credential is needed or wanted: the gateway
+# supplies its own. On inject and header modes — single-key and pooled alike —
+# an inbound Authorization, Proxy-Authorization, X-Api-Key, Api-Key,
+# X-Goog-Api-Key or Cookie is DROPPED before the request is forwarded, so a
+# placeholder a client insists on sending never leaves the gateway. Only
+# passthrough forwards it.
+curl -s https://gateway.example.com/minimax/v1/models
+curl -s https://gateway.example.com/minimax/v1/models \
+  -H "Authorization: Bearer placeholder-is-stripped-not-forwarded"
 
 # The CONNECT leg, and that the certificate is the provider's
 curl -v -x http://127.0.0.1:47810 https://api.anthropic.com/ 2>&1 | grep -E 'subject:|verify'
@@ -291,9 +331,17 @@ correct and unchanged lines stay unchanged.
 
 ## Threat model
 
-**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account by presenting its own `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key` or `Cookie` on an `inject` or `header` route.
+**Protects against:** provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account through one of the **named** headers on the deny-set — `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Cookie`, plus whatever the route names in `key_header` — on an `inject` or `header` route.
 
-**Does not protect against:** a compromised gateway host — it holds the keys; a malicious client that has a valid channel token, within its allowlisted scope; a caller presenting a credential in some **other** header that the upstream also accepts and that is not on the deny-set, since every remaining non-hop-by-hop header is forwarded (see [What "stripped" does and does not buy you](#what-stripped-does-and-does-not-buy-you)); provider-side logging. The CONNECT allowlist bounds what a stolen token can reach, which is why it is required and why it should stay short.
+That last one is a **blocklist**, and its scope is exactly the six names in `callerCredentialHeaders` plus the route's own `key_header`. It is not "a caller cannot reach the upstream as another account"; it is "a caller cannot reach the upstream as another account *through one of these headers*". A provider that also honours a credential in a header nobody has listed yet still receives it.
+
+**Does not protect against:**
+
+- **An unauthenticated caller on the reverse-proxy leg.** There is no caller authentication there to defeat: reaching the socket is sufficient to spend every key on every enabled route. See [The gateway does not authenticate reverse-proxy callers](#the-gateway-does-not-authenticate-reverse-proxy-callers). This is the single most important line in this section.
+- A compromised gateway host — it holds the keys.
+- A client with a valid channel token on the `CONNECT` leg, within its allowlisted scope. The allowlist is what bounds a stolen token, which is why it is required and why it should stay short.
+- A caller presenting a credential in some **other** header that the upstream also accepts and that is not on the blocklist, since every remaining non-hop-by-hop header is forwarded (see [What "stripped" does and does not buy you](#what-stripped-does-and-does-not-buy-you)).
+- Provider-side logging.
 
 ---
 

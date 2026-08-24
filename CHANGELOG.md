@@ -43,6 +43,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it at startup, so the series actually exists for alerts to watch.
 
 ### Fixed
+- **The documentation named a security boundary that does not exist (confirmed,
+  HIGH).** `docs/helixchannel.md` told operators to "treat the channel token as
+  the real authorisation boundary: it decides who may use the gateway at all".
+  The channel token is read at exactly one call site — `authorizeConnect`, inside
+  `handleConnect` — and gates the `CONNECT` tunnel only. `handleProxy` reads no
+  caller credential of any kind and no configuration makes it read one, so on the
+  reverse-proxy leg reaching the socket is sufficient to spend every key on every
+  enabled route. An operator who believed that sentence would deploy the gateway
+  exposed and publish an open, funded relay to every provider whose key it holds.
+  The doc now states the absence of caller authentication as a deployment
+  constraint, in its own section, ahead of the configuration reference; the
+  threat model leads with it instead of implying a channel token is required. The
+  `curl` recipe no longer instructs clients to send `Authorization` — that header
+  is stripped on every injecting mode — and the "cannot reach the upstream as
+  another account" claim is now qualified as what it is: a **blocklist** of six
+  header names plus the route's own `key_header`.
 - **Budget caps were not admission-controlled (confirmed, HIGH).** `Store.reserve`
   selected on "is this key retired", never "would this reservation exceed the
   plan"; caps were evaluated exclusively at settlement. A settlement that has not
