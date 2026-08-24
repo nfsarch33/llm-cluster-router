@@ -429,32 +429,49 @@ func TestOnePasswordProvider_StderrKeepsOnlyTheFirstLine(t *testing.T) {
 	}
 }
 
-// TestOnePasswordProvider_HungCLIFailsInsteadOfHangingStartup proves the call
-// is bounded by a context deadline. There is no time.Sleep: the fake runner
-// blocks on ctx.Done(), so the only thing that can release it is the timeout.
+// TestOnePasswordProvider_HungCLIFailsInsteadOfHangingStartup drives the REAL
+// execOPRead against a stub `op` that exits immediately and successfully but
+// leaves a child holding the inherited stdout pipe.
+//
+// The predecessor of this test injected a fake runner that returned on
+// <-ctx.Done(). It asserted the runner's own cooperation, never reached
+// execOPRead, and stayed green in a tree where NewServer hung at startup.
+// There is still no time.Sleep for synchronisation: the stub's grandchild is
+// what blocks, and only the deadline can release the call.
 func TestOnePasswordProvider_HungCLIFailsInsteadOfHangingStartup(t *testing.T) {
-	t.Parallel()
-	p := &onepasswordProvider{
-		timeout: time.Millisecond,
-		run: func(ctx context.Context, _ string) ([]byte, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
-	}
+	// No t.Parallel: t.Setenv is required to put the stub on PATH.
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	writeHungOPStub(t, dir, 30)
+	prependToPATH(t, dir)
 
-	got, err := p.Resolve("op://example-vault/example-item/credential")
-	if err == nil {
-		t.Fatalf("Resolve() = (%q, nil), want a timeout failure", got)
-	}
-	if !errors.Is(err, ErrSecretUnavailable) {
-		t.Errorf("errors.Is(err, ErrSecretUnavailable) = false, err = %v", err)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
-	}
-	msg := strings.ToLower(err.Error())
-	if !strings.Contains(msg, "locked") && !strings.Contains(msg, "biometric") {
-		t.Errorf("error %q should hint that the vault may be locked or awaiting biometric approval", err)
+	p := newOnePasswordProvider() // the real execOPRead, not an injected runner
+	p.timeout = 300 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Resolve("op://example-vault/example-item/credential")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Resolve() = nil error, want a timeout failure")
+		}
+		if !errors.Is(err, ErrSecretUnavailable) {
+			t.Errorf("errors.Is(err, ErrSecretUnavailable) = false, err = %v", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
+		}
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "locked") && !strings.Contains(msg, "biometric") {
+			t.Errorf("error %q should hint that the vault may be locked or awaiting biometric approval", err)
+		}
+	case <-time.After(hangBound):
+		t.Fatalf("Resolve still blocked %v after a 300ms timeout against a CLI whose child "+
+			"holds stdout: this is the startup hang, reached through the production exec path", hangBound)
 	}
 }
 

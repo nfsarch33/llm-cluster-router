@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -48,9 +50,20 @@ const DefaultOPTimeout = 15 * time.Second
 // opRefSegments is the segment count required after "op://": vault/item/field.
 const opRefSegments = 3
 
+// opWaitDelay is the grace `op` gets, after its context is done or it has
+// exited, before exec force-kills it and closes its I/O pipes. It bounds the
+// second half of the hang execOPRead documents: a well-behaved CLI never
+// reaches it, because its pipes close when it exits.
+const opWaitDelay = 2 * time.Second
+
 // maxCLIErrDetail caps how much CLI stderr is echoed into an error, so a
 // pathological backend cannot flood the startup log.
 const maxCLIErrDetail = 200
+
+// maxRefDetail caps how much of a REFERENCE is echoed into an error. Bounding
+// stderr alone left key_ref/token_ref as an unbounded second channel into the
+// same log.
+const maxRefDetail = 96
 
 // Sentinel causes. Callers assert with errors.Is; messages stay free to change.
 var (
@@ -69,8 +82,10 @@ var (
 
 // SecretError attributes a resolution failure to a reference.
 //
-// Ref is safe to print. The resolved value is deliberately absent from the
-// struct so it cannot be logged by accident.
+// The resolved value is deliberately absent from the struct so it cannot be
+// logged by accident. Ref is rendered through safeRef rather than printed
+// verbatim: see there for why a well-formed reference is safe and an
+// unrecognised one is not.
 type SecretError struct {
 	Ref    string // e.g. "env:MINIMAX_KEY" — never the value
 	Detail string // bounded, non-secret diagnostic (exit code, stderr line)
@@ -79,9 +94,55 @@ type SecretError struct {
 
 func (e *SecretError) Error() string {
 	if e.Detail == "" {
-		return fmt.Sprintf("secret %q: %v", e.Ref, e.Err)
+		return fmt.Sprintf("secret %q: %v", safeRef(e.Ref), e.Err)
 	}
-	return fmt.Sprintf("secret %q: %v: %s", e.Ref, e.Err, e.Detail)
+	return fmt.Sprintf("secret %q: %v: %s", safeRef(e.Ref), e.Err, e.Detail)
+}
+
+// safeRef renders a reference for an operator-visible message.
+//
+// A well-formed reference is committed configuration, not a secret, so its
+// scheme and payload are printed: "env:MINIMAX_KEY" is exactly what the
+// operator needs to fix the problem.
+//
+// A string carrying NO known scheme is not a reference at all, and the
+// commonest way one arrives is an operator pasting the KEY ITSELF into key_ref
+// or token_ref instead of a pointer to it. Interpolating that verbatim puts a
+// live credential into the startup error, the operator's terminal and every
+// log that carries it — a disclosure surface that arrived with the *_ref
+// fields. Nothing of such a value is printed but its length.
+//
+// Recognised references are clipped too. maxCLIErrDetail already refuses to let
+// a backend flood the startup log through stderr; a 4KiB key_ref must not be
+// the way around it.
+func safeRef(ref string) string {
+	scheme, ok := refScheme(ref)
+	if !ok {
+		return fmt.Sprintf("<unrecognised reference, %d bytes, redacted>", len(ref))
+	}
+	rest := strings.TrimPrefix(ref, scheme)
+	if len(rest) > maxRefDetail {
+		// Clip on a rune boundary so a multi-byte reference cannot be turned
+		// into invalid UTF-8 by the truncation itself.
+		cut := maxRefDetail
+		for cut > 0 && !utf8.RuneStart(rest[cut]) {
+			cut--
+		}
+		rest = rest[:cut] + "..."
+	}
+	return scheme + rest
+}
+
+// refScheme reports which registered scheme a reference carries. It returns no
+// error, so it is safe to call from Error() without building an error to
+// describe a failure to build an error.
+func refScheme(ref string) (string, bool) {
+	for _, s := range []string{SchemeEnv, SchemeFile, SchemeOP} {
+		if strings.HasPrefix(ref, s) {
+			return s, true
+		}
+	}
+	return "", false
 }
 
 func (e *SecretError) Unwrap() error { return e.Err }
@@ -134,9 +195,21 @@ func (p *envProvider) Resolve(ref string) (string, error) {
 
 type fileProvider struct {
 	read func(name string) ([]byte, error)
+	stat func(name string) (fs.FileInfo, error)
+	warn func(format string, args ...any)
 }
 
-func newFileProvider() *fileProvider { return &fileProvider{read: os.ReadFile} }
+func newFileProvider() *fileProvider {
+	return &fileProvider{read: os.ReadFile, stat: os.Stat, warn: warnf}
+}
+
+// warnf is the package's only log sink. It exists so a security warning has
+// somewhere to go that is not an error return: a loose-permission credential
+// file must be shouted about, but refusing to start would break every operator
+// whose file is 0644 today.
+func warnf(format string, args ...any) {
+	log.Printf("helixchannel: "+format, args...)
+}
 
 // Resolve reads the file and trims. The file's bytes never enter the returned
 // error: the detail strings below are fixed text, so a key file whose contents
@@ -155,11 +228,45 @@ func (p *fileProvider) Resolve(ref string) (string, error) {
 	case err != nil:
 		return "", secretErr(ref, ErrSecretUnavailable, "file could not be read")
 	}
+	p.warnOnLoosePermissions(ref, path)
 	v := strings.TrimSpace(string(b))
 	if v == "" {
 		return "", secretErr(ref, ErrSecretEmpty, "file holds only whitespace")
 	}
 	return v, nil
+}
+
+// nonOwnerPerm is every permission bit outside the file owner's.
+const nonOwnerPerm fs.FileMode = 0o077
+
+// warnOnLoosePermissions shouts about a credential file that group or other can
+// reach.
+//
+// config.go sells key_file on "root-owned files ... is what keeps them off the
+// wire": that guarantee is made by the FILESYSTEM, and a 0666 key file silently
+// voids it while the configuration still looks correct. Nothing checked it.
+//
+// This warns rather than refuses on purpose. Turning an existing 0644 key file
+// into a startup failure would take a gateway down at upgrade time, mid-
+// incident, over a condition that was already true yesterday. The warning names
+// the mode and the remedy so it is actionable on sight; the value never appears.
+func (p *fileProvider) warnOnLoosePermissions(ref, path string) {
+	if p.stat == nil || p.warn == nil {
+		return
+	}
+	fi, err := p.stat(path)
+	if err != nil {
+		// The read already succeeded. A stat that does not is not worth
+		// failing a resolution that otherwise worked.
+		return
+	}
+	mode := fi.Mode().Perm()
+	if mode&nonOwnerPerm == 0 {
+		return
+	}
+	p.warn("SECURITY: credential file for %s is mode %04o - group or other can read or write it, "+
+		"so the filesystem is no longer protecting this key; chmod 600 it and rotate the key if the host is shared",
+		safeRef(ref), mode)
 }
 
 // -----------------------------------------------------------------------------
@@ -182,8 +289,23 @@ func newOnePasswordProvider() *onepasswordProvider {
 	return &onepasswordProvider{run: execOPRead, timeout: DefaultOPTimeout}
 }
 
+// opResult is one runner outcome handed back across the timeout boundary.
+type opResult struct {
+	out []byte
+	err error
+}
+
 // Resolve validates the reference shape BEFORE calling p.run, so a malformed
 // reference can never reach argv, then bounds the call with p.timeout.
+//
+// The deadline is enforced HERE, not merely handed to the runner. OPRunner is
+// an exported seam and the default runner shells out to a third-party binary;
+// neither can be assumed to notice a cancelled context. Before this select the
+// timeout was honoured only by a cooperative runner, so a hung `op` did not
+// fail startup — it suspended it, with no deadline in sight.
+//
+// The cost of an uncooperative runner is now one parked goroutine, which is the
+// right trade against a gateway that never finishes NewServer.
 func (p *onepasswordProvider) Resolve(ref string) (string, error) {
 	if _, _, _, err := parseOPRef(ref); err != nil {
 		return "", err
@@ -195,11 +317,24 @@ func (p *onepasswordProvider) Resolve(ref string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	out, err := p.run(ctx, ref)
-	if err != nil {
-		return "", opExecError(ref, err)
+	// Buffered: an abandoned runner must always be able to finish its send and
+	// exit rather than block on a receiver that has already given up.
+	done := make(chan opResult, 1)
+	go func() {
+		out, err := p.run(ctx, ref)
+		done <- opResult{out: out, err: err}
+	}()
+
+	var res opResult
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		return "", opExecError(ref, ctx.Err())
 	}
-	v := strings.TrimSpace(string(out))
+	if res.err != nil {
+		return "", opExecError(ref, res.err)
+	}
+	v := strings.TrimSpace(string(res.out))
 	if v == "" {
 		return "", secretErr(ref, ErrSecretEmpty, "op read returned no value")
 	}
@@ -211,11 +346,20 @@ func (p *onepasswordProvider) Resolve(ref string) (string, error) {
 // cmd.Output() is used rather than CombinedOutput(): stdout is the secret and
 // must stay separate from stderr. Output() captures stderr into
 // (*exec.ExitError).Stderr, so cmd.Stderr is left nil deliberately.
+//
+// WaitDelay is not optional here. Cancelling the context kills `op` itself, but
+// it does nothing about a process `op` left behind that inherited the stdout
+// pipe: Output() reads on until EOF, and EOF arrives only when the LAST holder
+// of the write end goes away. So the direct child can exit, the deadline can
+// pass, and Output() still blocks — the observed shape was a startup still
+// wedged at 45s against a 15s DefaultOPTimeout. WaitDelay is the only mechanism
+// that closes those pipes and lets Wait return.
 func execOPRead(ctx context.Context, ref string) ([]byte, error) {
 	// ref has already passed parseOPRef: it is exactly
 	// "op://<vault>/<item>/<field>", contains no whitespace or control
 	// characters, and cannot begin with "-". No shell is involved.
 	cmd := exec.CommandContext(ctx, "op", "read", "--no-newline", ref)
+	cmd.WaitDelay = opWaitDelay
 	return cmd.Output()
 }
 
@@ -256,6 +400,15 @@ func opExecError(ref string, err error) error {
 		// ErrSecretUnavailable, operators want the deadline named.
 		return secretErr(ref, fmt.Errorf("%w: %w", ErrSecretUnavailable, context.DeadlineExceeded),
 			"op read timed out; the vault may be locked or awaiting biometric approval")
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The CLI exited, but something it spawned kept the stdout pipe open
+		// past the shutdown grace. Naming that precisely matters: the operator
+		// otherwise sees a healthy `op read` on the command line and an
+		// unexplained startup failure from the gateway.
+		return secretErr(ref, ErrSecretUnavailable,
+			"op left a child process holding its output pipe; the read was abandoned after "+
+				opWaitDelay.String()+" rather than blocking startup")
 	}
 	if errors.Is(err, exec.ErrNotFound) {
 		return secretErr(ref, ErrSecretUnavailable,
@@ -387,12 +540,11 @@ func (r *Resolver) store(ref, val string) {
 	r.cache[ref] = val
 }
 
-// schemeOf reports which registered scheme a reference belongs to.
+// schemeOf reports which registered scheme a reference belongs to, or the
+// typed rejection for one that belongs to none.
 func schemeOf(ref string) (string, error) {
-	for _, s := range []string{SchemeEnv, SchemeFile, SchemeOP} {
-		if strings.HasPrefix(ref, s) {
-			return s, nil
-		}
+	if s, ok := refScheme(ref); ok {
+		return s, nil
 	}
 	return "", secretErr(ref, ErrSecretRefInvalid,
 		"expected one of "+SchemeEnv+", "+SchemeFile+" or "+SchemeOP)
