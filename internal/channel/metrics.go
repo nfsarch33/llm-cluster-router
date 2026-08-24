@@ -14,12 +14,37 @@ var KeyRetiredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help:      "HelixChannel API keys retired from rotation, by route and reason (cap|quota|error).",
 }, []string{"route", "reason"})
 
+// AdmissionRefusedTotal counts requests refused BEFORE any upstream call, by
+// route and reason.
+//
+// Registered name: llm_cluster_router_helixchannel_admission_refused_total. It
+// is separate from KeyRetiredTotal because a retirement is a key LEAVING
+// rotation while this counts CALLERS turned away, and the two need different
+// alerts: keys_exhausted sustained is a billing page, admission_limited
+// sustained is a capacity signal — the route is being offered more concurrency
+// than its per-window plan allows, with nothing wrong with any key.
+//
+// The reason label carries exactly the error code in the 503 body and in the
+// audit line, so one vocabulary spans the response, the log and the series.
+var AdmissionRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "llm_cluster_router",
+	Name:      "helixchannel_admission_refused_total",
+	Help:      "HelixChannel requests refused before any upstream call, by route and reason (keys_exhausted|admission_limited).",
+}, []string{"route", "reason"})
+
 // RegisterMetrics registers the channel metrics with reg.
 //
 // Registration is the caller's choice rather than an init() so a test can use
 // prometheus.NewRegistry() and so importing this package never mutates the
 // default registry.
-func RegisterMetrics(reg prometheus.Registerer) error { return reg.Register(KeyRetiredTotal) }
+func RegisterMetrics(reg prometheus.Registerer) error {
+	for _, c := range []prometheus.Collector{KeyRetiredTotal, AdmissionRefusedTotal} {
+		if err := reg.Register(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // promRetireObserver is the default RetireObserver.
 type promRetireObserver struct{}

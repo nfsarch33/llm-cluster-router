@@ -358,9 +358,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// single-key path runs through code this change does not touch.
 	fwdRoute, lease := rt, (*KeyLease)(nil)
 	if kl, ok := rt.Auth.(keyLeaser); ok {
-		auth, l, live := kl.leaseFor()
-		if !live {
-			s.denyDrained(w, rt, r, requestID, start, kl.retryAfter())
+		auth, l, refusal := kl.leaseFor()
+		if refusal != refusalNone {
+			s.denyUnavailable(w, rt, r, requestID, start, refusal, kl)
 			return
 		}
 		fwdRoute, lease = &boundRoute{Route: rt.Route, Auth: auth}, l
@@ -530,25 +530,75 @@ func isQuotaStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
 }
 
-// denyDrained answers a request that arrived with every plan spent.
-func (s *Server) denyDrained(w http.ResponseWriter, rt *boundRoute, r *http.Request, requestID string, start time.Time, retryAfter time.Duration) {
-	s.writeDrained(w, rt.Route.Name, retryAfter)
+// denyUnavailable answers a request refused BEFORE any upstream call. It is the
+// only place the reasons for that are turned into a response, so the body, the
+// Retry-After, the audit line and the metric cannot drift apart.
+func (s *Server) denyUnavailable(w http.ResponseWriter, rt *boundRoute, r *http.Request, requestID string, start time.Time, refusal admissionRefusal, kl keyLeaser) {
+	code, hint, wait := refusalAnswerFor(refusal, kl)
+	AdmissionRefusedTotal.WithLabelValues(rt.Route.Name, code).Inc()
+	s.writeUnavailable(w, rt.Route.Name, code, hint, wait)
 	s.audit.Log(AuditEvent{
 		Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 		AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 		Upstream: rt.Route.Upstream, Status: http.StatusServiceUnavailable,
 		LatencyMS: time.Since(start).Milliseconds(), ClientAddr: r.RemoteAddr,
-		Error: "keys_exhausted",
+		Error: code,
 	})
 }
 
-// writeDrained writes the all-keys-spent answer: 503 with Retry-After, NOT 502.
+// refusalAnswerFor maps a refusal to the error code, hint and wait a caller
+// receives. The three move together on purpose: a code without a matching wait
+// is how a client learns to ignore Retry-After.
 //
-// An operator paging on 502 is hunting a broken upstream; a route whose plans
-// are all spent is a billing question. Collapsing the two is how a quota
-// outage gets triaged as an outage. The body names the route and the wait and
-// carries no credential material.
-func (s *Server) writeDrained(w http.ResponseWriter, route string, retryAfter time.Duration) {
+// The two answers are DIFFERENT FACTS and the split is the whole of this fix:
+//
+//	keys_exhausted    no key is selectable. Every plan is spent or every key is
+//	                  in an upstream cooldown. The wait is a time this store can
+//	                  name — until a window rolls or a retirement expires — so
+//	                  Retry-After is that wait. Page on it: it is a billing
+//	                  question and the traffic is not being served.
+//	admission_limited at least one key is healthy and selectable; every one of
+//	                  them is at its hard cap only once the leases already in
+//	                  flight are counted. Nothing is retired, nothing is drained,
+//	                  and /healthz correctly reports the route undegraded. It
+//	                  clears when an outstanding lease settles, which is not a
+//	                  time anything here can name, so Retry-After is the floor:
+//	                  come back immediately, not after the window. Do not page:
+//	                  it means the route is being offered more concurrency than
+//	                  its per-window plan allows.
+//
+// Reporting the second as the first is what sent an operator hunting a billing
+// problem that did not exist, against a route reporting {keys: 2, available: 2,
+// degraded: false} with every key Selectable and none Drained.
+//
+// kl is consulted ONLY on the drained path. An admission refusal deliberately
+// does not ask the store for a wait: Store.RetryAfter answers "no wait" whenever
+// any key is selectable, which is always true here, so the floor would be
+// arrived at by accident rather than by decision.
+func refusalAnswerFor(refusal admissionRefusal, kl keyLeaser) (code, hint string, wait time.Duration) {
+	if refusal == refusalAdmission {
+		return "admission_limited",
+			"every upstream key on this route is at its per-window cap once the requests already in flight are counted; none has been retired and none is drained, so retry immediately rather than after a window",
+			MinRetryAfter
+	}
+	return "keys_exhausted",
+		"every upstream key on this route is retired or drained; retry after the advertised wait",
+		kl.retryAfter()
+}
+
+// writeUnavailable writes a pre-dispatch refusal: 503 with Retry-After, NOT 502.
+//
+// An operator paging on 502 is hunting a broken upstream; a route that refused
+// before dispatch has no broken upstream to find — it may have no upstream
+// contact at all. Collapsing the two is how a quota outage gets triaged as an
+// outage. The body names the route, the reason and the wait, and carries no
+// credential material.
+//
+// The reason is a parameter rather than a constant for the same argument one
+// level down: "refused before dispatch" is not one fact, and a single body that
+// asserted "every upstream key on this route is retired or drained" for both of
+// them was wrong for one of them on every request it answered.
+func (s *Server) writeUnavailable(w http.ResponseWriter, route, code, hint string, retryAfter time.Duration) {
 	secs := int64(retryAfter / time.Second)
 	if retryAfter%time.Second != 0 {
 		secs++
@@ -560,8 +610,8 @@ func (s *Server) writeDrained(w http.ResponseWriter, route string, retryAfter ti
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":               "keys_exhausted",
-		"hint":                "every upstream key on this route is retired or drained; retry after the advertised wait",
+		"error":               code,
+		"hint":                hint,
 		"route":               route,
 		"retry_after_seconds": secs,
 	})

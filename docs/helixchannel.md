@@ -458,9 +458,15 @@ test can advance an injected clock instead of sleeping. An explicit retirement
 whose deadline outlives the window (a one-hour provider cooldown, for instance)
 survives a five-minute accounting boundary.
 
-### Exhaustion is 503, never 502
+### Refused before dispatch: two 503s, never a 502
 
-When every key on a route is retired or drained the gateway answers:
+A request can be refused before any upstream call for **two different reasons**,
+and they are two different operational facts. Both answer `503` with
+`Retry-After`; the `error` code, the hint and the wait tell them apart, and so
+does the metric.
+
+**`keys_exhausted` — the plans are spent.** No key on the route is selectable:
+every one is drained by its own budget or parked by an upstream quota signal.
 
 ```
 HTTP/1.1 503 Service Unavailable
@@ -470,18 +476,46 @@ Content-Type: application/json
 {"error":"keys_exhausted","route":"minimax-pool","retry_after_seconds":90, ...}
 ```
 
-The upstream is **not** contacted. This is deliberately distinct from the
-existing `502 upstream unavailable`: an operator paging on 502 is hunting a
-broken upstream, whereas a route whose plans are all spent is a billing
-question. Collapsing the two is how a quota outage gets triaged as an outage.
+`Retry-After` is the true minimum wait across all keys — a time the store can
+actually name, since it is until a window rolls or a retirement expires — floored
+at 1s (a `Retry-After: 0` tells a client nothing) and clamped to
+`max_retry_after` (default 1h; several agents treat an hours-long value as
+fatal). `/healthz` reports `degraded: true`. **Page on it.** It is a billing
+question and the traffic is not being served.
 
-`Retry-After` is the true minimum wait across all keys, floored at 1s (a
-`Retry-After: 0` tells a client nothing) and clamped to `max_retry_after`
-(default 1h — several agents treat an hours-long value as fatal). A client that
-retries early simply receives another 503 with a fresh value.
+**`admission_limited` — the keys are healthy, the concurrency is not.** At least
+one key is selectable and none is retired or drained, but every selectable key is
+already at its hard cap once the leases **in flight** are counted.
 
-Neither the 503 body nor the audit line ever carries key material: only the
-route name, the reason and the wait.
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 1
+Content-Type: application/json
+
+{"error":"admission_limited","route":"minimax-pool","retry_after_seconds":1, ...}
+```
+
+`Retry-After` is the **floor**, because the condition clears when an outstanding
+lease settles and that is not a time anything here can name. `/healthz` reports
+the route **undegraded**, with every key `available` — and it is right to.
+**Do not page on it.** It means the route is being offered more concurrency than
+its per-window plan allows; the answer is a larger `budget`, more keys, or less
+concurrency, not a billing investigation.
+
+Reporting the second as the first is a defect this document previously described
+as correct behaviour. A route refusing on admission reported `{keys: 2,
+available: 2, degraded: false}`, every key `Selectable` and none `Drained`, while
+telling callers "every upstream key on this route is retired or drained" — which
+sent an operator hunting a billing problem that did not exist, with the only
+contradicting signal on their screen at the same time.
+
+In both cases the upstream is **not** contacted. That is deliberately distinct
+from `502 upstream unavailable`: an operator paging on 502 is hunting a broken
+upstream, and a request refused before dispatch may have made no upstream contact
+at all. Collapsing the two is how a quota outage gets triaged as an outage.
+
+Neither 503 body nor either audit line ever carries key material: only the route
+name, the reason and the wait.
 
 An upstream **429** or **402** retires the serving key with reason `quota` before
 the lease settles, so the next selection already skips it. 402 is included
@@ -558,15 +592,32 @@ answers the same 503 with `Retry-After`.
 
 ```
 llm_cluster_router_helixchannel_key_retired_total{route,reason}
+llm_cluster_router_helixchannel_admission_refused_total{route,reason}
 ```
 
-`reason` is one of:
+The first counts **keys leaving rotation**. `reason` is one of:
 
 | reason | meaning |
 |---|---|
 | `cap` | this gateway's own accounting — the soft cap or the hard cap |
 | `quota` | an upstream quota signal (HTTP 429 or 402) |
 | `error` | repeated upstream failure that is not a quota signal |
+
+The second counts **callers turned away before any upstream call**, and its
+`reason` is exactly the `error` code in the 503 body and in the audit line, so
+one vocabulary spans the response, the log and the series:
+
+| reason | meaning | alert |
+|---|---|---|
+| `keys_exhausted` | no key is selectable; the plans are spent | page — billing |
+| `admission_limited` | keys are healthy; every one is at its cap with leases in flight | do not page — capacity |
+
+They are separate families because a retirement and a refused caller are
+different events: one key leaving rotation can refuse thousands of callers, and
+one refused caller need not mean any key left. An alert written against the
+retirement series cannot see an admission refusal at all, and an alert written
+against `admission_refused_total` without the `reason` label would page on the
+harmless half.
 
 The counter counts keys **leaving** rotation, once per departure, for every
 reason. Late settlements of in-flight leases cannot inflate `cap`, and a key

@@ -43,6 +43,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     it at startup, so the series actually exists for alerts to watch.
 
 ### Fixed
+- **A healthy route reported its keys as exhausted (confirmed).** The R1
+  admission-control fix created a NEW refusal mode — a key at its hard cap once
+  leases in flight are counted — and labelled it with the OLD one. While
+  refusing, `/healthz` reported `{keys: 2, available: 2, degraded: false}` and
+  every key state read `Selectable: true, Drained: false`, yet callers received
+  `{"error":"keys_exhausted","hint":"every upstream key on this route is retired
+  or drained"}`. `writeDrained`'s own doc comment argued against exactly that
+  collapse: an operator paging on it hunts a billing problem that does not exist,
+  while the one signal that could have contradicted them agreed with the truth
+  instead of with the error. The two refusals are now distinct end to end —
+  `admission_limited` with its own hint and `Retry-After: 1` (it clears when an
+  in-flight lease settles, not when a window rolls) against `keys_exhausted` with
+  the wait the store can actually name — and they are counted under separate
+  reasons of a new
+  `llm_cluster_router_helixchannel_admission_refused_total{route,reason}`, so one
+  is page-worthy and the other is a capacity signal rather than both being noise
+  on the same series. `Store.reserve` reports which of its two filters emptied
+  the candidate set, decided inside the same critical section and against the
+  same clock reading as the selection itself.
 - **A redirect replayed the server-held credential to wherever the upstream said
   (confirmed, CRITICAL).** `NewHTTPForwarder` left `http.Client.CheckRedirect`
   nil — `rg CheckRedirect --type go .` matched nothing in the tree — which

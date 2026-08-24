@@ -340,16 +340,53 @@ func (s *Store) Next(route string) int {
 	return idx
 }
 
+// admissionRefusal is WHY a reservation was declined. The two reasons are
+// operationally different questions and must not be collapsed into one boolean.
+//
+// The R1 admission-control fix created a second way for a reservation to fail
+// and left it wearing the first one's label. A route refusing on refusalAdmission
+// reported {available: 2, degraded: false} on /healthz, with every key
+// Selectable and none Drained, while answering callers "every upstream key on
+// this route is retired or drained" — so an operator paged by that answer went
+// hunting a billing problem that did not exist, and the one signal that could
+// have told them otherwise agreed with them.
+type admissionRefusal uint8
+
+const (
+	// refusalNone is a granted lease.
+	refusalNone admissionRefusal = iota
+	// refusalDrained: no key is selectable at all. Every one is retired (an
+	// upstream quota signal) or capped out for the window. The plans are spent;
+	// the wait is until a window rolls or a cooldown expires; it is a BILLING
+	// question and a legitimate page.
+	refusalDrained
+	// refusalAdmission: at least one key is selectable and healthy, but every
+	// selectable key is already at its hard cap once the leases in flight are
+	// counted. Nothing is retired, nothing is drained, and the plan may be
+	// barely touched. It is a CONCURRENCY question, it clears as soon as an
+	// outstanding lease settles, and paging on it is a false alarm.
+	refusalAdmission
+)
+
 // Acquire reserves a key and returns a lease whose Settle is idempotent. It is
 // the only reservation path a gateway should use: a deferred lease.Settle can
-// neither leak an in-flight slot nor release one twice. ok is false when every
-// key on the route is retired or drained.
+// neither leak an in-flight slot nor release one twice. ok is false when no key
+// could be reserved, for either reason; acquire reports which.
 func (s *Store) Acquire(route string) (*KeyLease, bool) {
-	idx, ok := s.reserve(route)
-	if !ok {
-		return nil, false
+	lease, refusal := s.acquire(route)
+	return lease, refusal == refusalNone
+}
+
+// acquire is Acquire with the refusal reason preserved. It is unexported
+// because the reason is a gateway-response concern, not part of the store's
+// published contract, and Acquire's boolean is what every existing caller and
+// test is written against.
+func (s *Store) acquire(route string) (*KeyLease, admissionRefusal) {
+	idx, refusal := s.reserve(route)
+	if refusal != refusalNone {
+		return nil, refusal
 	}
-	return &KeyLease{route: route, index: idx, store: s}, true
+	return &KeyLease{route: route, index: idx, store: s}, refusalNone
 }
 
 // reserve filters, selects and reserves in ONE critical section. Snapshotting
@@ -361,25 +398,39 @@ func (s *Store) Acquire(route string) (*KeyLease, bool) {
 // evaluated at settlement is overspendable by the concurrency factor, because
 // every request in a simultaneous burst sees the same not-yet-charged key and
 // is dispatched before any of them settles.
-func (s *Store) reserve(route string) (int, bool) {
+func (s *Store) reserve(route string) (int, admissionRefusal) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	rs, ok := s.routes[route]
 	if !ok {
-		return -1, false
+		return -1, refusalDrained
 	}
 	now := s.now()
 	s.rollLocked(rs, now)
 
+	// selectable is counted separately from admissible so a refusal can say
+	// which of the two filters emptied the candidate set. It is read from the
+	// same critical section and the same `now` as the selection itself: asking
+	// afterwards would be a second reading of state that may already have
+	// moved, which is how a refusal ends up labelled by a window it was not
+	// decided in.
+	selectable := 0
 	states := make([]KeyState, 0, len(rs.keys))
 	for i := range rs.keys {
+		if !selectableAt(&rs.keys[i], now) {
+			continue
+		}
+		selectable++
 		if s.admissibleLocked(&rs.keys[i], now) {
 			states = append(states, s.keyStateLocked(rs, i, now))
 		}
 	}
 	if len(states) == 0 {
-		return -1, false
+		if selectable > 0 {
+			return -1, refusalAdmission
+		}
+		return -1, refusalDrained
 	}
 	pos := s.policy.Select(states)
 	if pos < 0 || pos >= len(states) {
@@ -390,7 +441,7 @@ func (s *Store) reserve(route string) (int, bool) {
 	}
 	idx := states[pos].Index
 	rs.keys[idx].inFlight++
-	return idx, true
+	return idx, refusalNone
 }
 
 // admissibleLocked reports whether a key may accept ANOTHER reservation right

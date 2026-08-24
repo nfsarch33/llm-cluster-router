@@ -98,7 +98,7 @@ func (l leasedInjector) Mode() AuthMode {
 // through code this change does not touch — which is what makes "extend by
 // adding an implementation" literally true here.
 type keyLeaser interface {
-	leaseFor() (Authenticator, *KeyLease, bool)
+	leaseFor() (Authenticator, *KeyLease, admissionRefusal)
 	retryAfter() time.Duration
 	retire(idx int, reason RetireReason)
 	inventory() KeyInventory
@@ -142,25 +142,34 @@ func (r *rotatingInjector) Apply(*http.Request) error {
 func (r *rotatingInjector) Mode() AuthMode { return r.mode }
 
 // leaseFor reserves a key and returns an Authenticator bound to it plus the
-// lease the caller must settle. ok is false when every key is retired or
-// drained — the 503 case.
-func (r *rotatingInjector) leaseFor() (Authenticator, *KeyLease, bool) {
+// lease the caller must settle.
+//
+// The third result is refusalNone on success and otherwise says WHY — the 503
+// answers differ, and a single boolean is what let an admission refusal be
+// reported to callers as a spent plan. A missing Store and an out-of-range
+// index are refusalDrained rather than refusalAdmission because neither will
+// clear on its own: the safe label is the one that does not promise a caller a
+// short wait it will not get.
+func (r *rotatingInjector) leaseFor() (Authenticator, *KeyLease, admissionRefusal) {
 	if r.store == nil {
-		return nil, nil, false
+		return nil, nil, refusalDrained
 	}
-	lease, ok := r.store.Acquire(r.route)
-	if !ok {
-		return nil, nil, false
+	lease, refusal := r.store.acquire(r.route)
+	if refusal != refusalNone {
+		return nil, nil, refusal
 	}
 	i := lease.Index()
 	if i < 0 || i >= len(r.keys) {
 		lease.Settle(UsageSample{Outcome: OutcomeFailed})
-		return nil, nil, false
+		return nil, nil, refusalDrained
 	}
-	return leasedInjector{key: r.keys[i], header: r.header, prefix: r.prefix, mode: r.mode}, lease, true
+	return leasedInjector{key: r.keys[i], header: r.header, prefix: r.prefix, mode: r.mode}, lease, refusalNone
 }
 
-// retryAfter is the wait to advertise when leaseFor reports !ok.
+// retryAfter is the wait to advertise for a DRAINED route: the time until the
+// earliest key becomes selectable again. It is not the answer for an admission
+// refusal, which clears when an in-flight lease settles rather than at any time
+// this store can name — see refusalAnswerFor.
 func (r *rotatingInjector) retryAfter() time.Duration {
 	if r.store == nil {
 		return MinRetryAfter
