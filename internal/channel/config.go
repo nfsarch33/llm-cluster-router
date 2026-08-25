@@ -355,9 +355,12 @@ func (c *Config) Validate() error {
 	if err := c.validateConnect(); err != nil {
 		return err
 	}
-	// LAST, and it has to stay last: it is the only check that reads `listen`
-	// together with another block, so raising it first would mask the route and
-	// connect mistakes an operator is far likelier to have actually made.
+	// LAST, and it has to stay last: it is the check that turns `listen` into
+	// the gateway's whole admission posture, so raising it first would mask the
+	// route and connect mistakes an operator is far likelier to have actually
+	// made. validateConnect reads `listen` too, but only to ask whether an
+	// allowlist entry points back at this machine, and that IS a connect
+	// mistake — it belongs with the block the operator got wrong.
 	return c.validateGatewayAuth()
 }
 
@@ -592,9 +595,22 @@ func (c *Config) validateConnect() error {
 	if err := validateSecretRef(c.Connect.TokenRef); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
+	// Every entry must be a well-formed host:port AND must not name this
+	// machine. The second half is the CONNECT leg's half of a two-leg defect:
+	// handleConnect dials the target verbatim, so a gateway that allowlists its
+	// own address will dial ITSELF, and the tunnelled request then arrives over
+	// the loopback interface where gateway_auth's loopback exemption serves it
+	// without a token. That turns the CONNECT token — whose blast radius is
+	// supposed to be bounded by this very list — into the gateway token. See
+	// connectSelfReference for exactly which spellings are decided here, and
+	// connectDialRefusal for the ones that can only be decided after a dial.
 	for _, h := range c.Connect.AllowedHosts {
-		if !strings.Contains(h, ":") {
+		host, port, err := net.SplitHostPort(h)
+		if err != nil {
 			return fmt.Errorf("connect: allowed_hosts entry %q must be host:port", h)
+		}
+		if why := connectSelfReference(host, port, c.Listen); why != "" {
+			return fmt.Errorf("connect: allowed_hosts entry %q %s. Remove the entry, or run the service it names on a different host", h, why)
 		}
 	}
 	if c.Connect.DialTimeout == 0 {

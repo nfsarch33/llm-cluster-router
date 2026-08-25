@@ -199,6 +199,11 @@ connect:
   token_file: /run/secrets/connect.token
   # token_ref: op://Infra/helixchannel/connect-token   # takes precedence
   dial_timeout: 10s
+  # Every entry must be a remote host:port. An entry naming this gateway's own
+  # host -- 127.0.0.1, localhost, 0.0.0.0, the bind address itself -- is refused
+  # at startup: the gateway would dial itself, and the tunnelled request would
+  # arrive on the loopback interface where gateway_auth's loopback exemption
+  # serves it without a token.
   allowed_hosts:
     - api.anthropic.com:443
     - statsig.anthropic.com:443

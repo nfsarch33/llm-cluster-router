@@ -766,6 +766,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = upstream.Close() }()
 
+	// SECOND layer, after the dial and before a single byte moves: refuse a
+	// target that turned out to be this machine. Config validation refuses the
+	// spellings it can decide without a resolver; this refuses what only the
+	// opened socket can show — an allowlisted NAME whose address is loopback,
+	// or an answer that changed after startup. Without it the gateway can be
+	// made to dial itself, and the tunnelled request arrives as a LOCAL caller
+	// holding the gateway_auth loopback exemption.
+	if reason := connectDialRefusal(s.cfg.Listen, upstream.LocalAddr(), upstream.RemoteAddr()); reason != "" {
+		deny(http.StatusForbidden, reason)
+		return
+	}
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		deny(http.StatusInternalServerError, "hijack_unsupported")

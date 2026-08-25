@@ -146,6 +146,47 @@ If the gateway genuinely runs behind a proxy on the same host and you want that
 proxy's callers authenticated, set `exempt_loopback: false` and give the
 terminator a token. Do not reach for a forwarded-header rule; there isn't one.
 
+#### ...and it cannot be reached through the gateway's own tunnel
+
+Reading `RemoteAddr` and nothing else is necessary but was not sufficient. The
+`CONNECT` leg dials its target verbatim, so a gateway that allowlisted its **own**
+address would dial itself: the tunnelled request arrives over the loopback
+interface, `RemoteAddr` really is `127.0.0.1`, and the exemption applies. A remote
+holder of the `CONNECT` token — a credential that is supposed to be bounded by
+`allowed_hosts` — could launder itself into a local caller and spend every key on
+every enabled route. It was reproduced over a real socket with
+`listen: 0.0.0.0:P` and `allowed_hosts: [127.0.0.1:P]`.
+
+Two checks close it, and the split between them is deliberate.
+
+**At load, `allowed_hosts` may not name this machine.** On a bind that is *not*
+loopback-only, every local target is refused on every port; on a loopback-only
+bind only the gateway's own listen port is (there every client is already a local
+process, so a tunnel to a local service grants it nothing it could not open
+itself). The gateway's own routable address paired with its own bind is refused
+too. What "names this machine" covers:
+
+| Decided | How |
+| --- | --- |
+| `127.0.0.0/8`, `::1`, `::ffff:127.0.0.1`, `0.0.0.0`, `::`, an empty host | parsed as an address |
+| `127.1`, `127.0.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`, `017700000001` | parsed with `inet_aton`'s grammar, so this is the whole class of numeric spellings, not a list of them |
+| `localhost`, `localhost.localdomain`, `ip6-localhost`, `ip6-loopback`, anything under `.localhost` | **a blocklist of literal names**, and only that |
+
+The name row is the honest limit: any name at all can have a `127.0.0.1` A record,
+and deciding that here would mean a DNS lookup during startup — which makes
+booting depend on a resolver and lets a poisoned answer decide whether the gateway
+runs. Config validation resolves nothing. It also cannot tell one of the host's
+own routable addresses from a neighbour's under a wildcard bind, because that
+needs an interface enumeration that is stale the moment an address is added.
+
+**At dial, the opened socket is checked.** Before a byte moves, a peer that is
+loopback or unspecified — or whose address equals the gateway's own end of that
+same socket, which is what dialling one of your own addresses looks like — is
+refused with `403` and a `connect_denied` audit line. This is the layer that sees
+what a *name* resolved to, so it covers both gaps above, including an answer that
+changed after startup. It is skipped on a loopback-only bind, where there is no
+remote caller to launder and tunnelling to a local service is the ordinary use.
+
 #### If no token is configured
 
 Nothing is authenticated, exactly as before this existed — and the gateway
@@ -363,8 +404,8 @@ connect:
   enabled: true
   token_file: /run/secrets/connect.token
   dial_timeout: 10s
-  allowed_hosts:            # exact host:port matches; empty is rejected
-    - api.anthropic.com:443
+  allowed_hosts:            # exact host:port matches; empty is rejected, and so
+    - api.anthropic.com:443 # is any entry naming this gateway's own host
 
 tls:                        # only needed when the gateway owns a public socket
   cert_file: /etc/helixchannel/tls.crt
@@ -523,9 +564,9 @@ Two of the eight are not credentials at all. `OpenAI-Organization` and `OpenAI-P
 **Does not protect against:**
 
 - **An unauthenticated caller on the reverse-proxy leg when no `gateway_auth` token is configured** — `proxy_auth: loopback_only` or `open`. In those postures reaching the socket is still sufficient to spend every key on every enabled route; `loopback_only` cannot bind a non-loopback address, and `open` is the operator's written-down acceptance that something in front is doing the authenticating. A container that binds loopback and is published with `-p` is reachable from the network in `loopback_only`, and its callers are not loopback peers. Configure a token. See [Authenticating reverse-proxy callers](#authenticating-reverse-proxy-callers).
-- **A stolen gateway token**, which is a bearer secret with no allowlist behind it: unlike the `CONNECT` token, whose blast radius is bounded by `allowed_hosts`, a gateway token holder can reach every enabled route. Rotate it by changing the source and restarting; there is deliberately no second, overlapping token to make that a zero-downtime operation.
+- **A stolen gateway token**, which is a bearer secret with no allowlist behind it: unlike the `CONNECT` token, whose blast radius is bounded by `allowed_hosts` — a bound that holds only because `allowed_hosts` may no longer name the gateway itself, since such an entry would let a tunnel launder a remote caller into a loopback one and hand it this very token's powers (see [...and it cannot be reached through the gateway's own tunnel](#and-it-cannot-be-reached-through-the-gateways-own-tunnel)) — a gateway token holder can reach every enabled route. Rotate it by changing the source and restarting; there is deliberately no second, overlapping token to make that a zero-downtime operation.
 - A compromised gateway host — it holds the keys.
-- A client with a valid channel token on the `CONNECT` leg, within its allowlisted scope. The allowlist is what bounds a stolen token, which is why it is required and why it should stay short.
+- A client with a valid channel token on the `CONNECT` leg, within its allowlisted scope. The allowlist is what bounds a stolen token, which is why it is required, why it may not name the gateway's own host, and why it should stay short. Note what the load-time half of that check does *not* decide: an allowlisted **name** whose address is loopback is caught only at dial time, and one of the host's own routable addresses under a wildcard bind likewise.
 - A caller presenting a credential in some **other** header that the upstream also accepts and that is not on the blocklist, since every remaining non-hop-by-hop header is forwarded (see [What "stripped" does and does not buy you](#what-stripped-does-and-does-not-buy-you)).
 - Provider-side logging.
 
