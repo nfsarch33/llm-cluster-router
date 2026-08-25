@@ -83,7 +83,7 @@ bench-save: ## As `bench`, teed into $(BENCH_OUT) for benchstat comparison
 	@mkdir -p $(dir $(BENCH_OUT))
 	@{ echo "# go:   $$($(GO) version)"; \
 	   echo "# host: $$(uname -srm)"; \
-	   echo "# cpu-count: $$($(GO) env GOMAXPROCS)"; \
+	   echo "# cpu-count: $$(getconf _NPROCESSORS_ONLN)"; \
 	   echo "# date: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > $(BENCH_OUT)
 	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=$(BENCHTIME) -count=$(BENCHCOUNT) ./... | tee -a $(BENCH_OUT)
 
