@@ -3,6 +3,8 @@ package channel
 import (
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,10 +24,13 @@ import (
 //     fails CLOSED, so it recognises inet_aton's whole grammar (127.1,
 //     0x7f000001, 2130706433, 0177.0.0.1) and a blocklist of reserved names.
 //   - isLoopbackListen predicts what a LISTEN address will bind. The OS resolver
-//     decides that, not us, and deciding "loopback" RELAXES three things: it
-//     waives the gateway-token requirement, it permits loopback allowed_hosts
-//     entries, and it disarms connectDialRefusal. A generous reading fails OPEN,
-//     so it trusts only an address literal net.ParseIP can read.
+//     decides that, not us, so the prediction can never be sound and NOTHING is
+//     gated on it any more: it is an ADVISORY refusal that catches obvious
+//     mistakes at LoadConfig, and the relaxations hang on the bound socket
+//     instead (boundListenScope, and loopback_bind_authority_test.go). Because
+//     it can now only refuse, it still trusts nothing but an address literal
+//     net.ParseIP can read -- a generous reading here would let an obvious
+//     mistake through to the socket for no gain.
 //
 // Both excluded classes were measured, not theorised. With listen
 // "0x7f000001:45425" trusted as loopback, the socket actually bound
@@ -49,13 +54,20 @@ const (
 	numericHintFragment = "is an inet_aton spelling of 127.0.0.1"
 )
 
-// dialGuardArmed reports whether connectDialRefusal would refuse a loopback
-// peer on this bind. It is the runtime half of the same question the validator
-// answers from config text.
+// dialGuardArmed reports whether the dial-time CONNECT guard would refuse a
+// loopback peer on a gateway carrying this listen string that has adopted no
+// socket and is answering a request that carries no connection address.
+//
+// It must answer TRUE for every string now, loopback literals included, and
+// that is the fix rather than an oversight: the guard moved off the config text
+// and onto the bound socket, so no spelling can disarm it any more. What does
+// disarm it is a loopback SOCKET, pinned in loopback_bind_authority_test.go.
 func dialGuardArmed(listen string) bool {
+	srv := &Server{cfg: &Config{Listen: listen}}
+	req := httptest.NewRequest(http.MethodConnect, "http://127.0.0.1:9200", nil)
 	local := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 14443}
 	remote := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9200}
-	return connectDialRefusal(listen, local, remote) != ""
+	return connectDialRefusal(srv.servingScope(req), local, remote) != ""
 }
 
 // tokenlessValidate runs Validate on a config whose only interesting property
@@ -147,10 +159,13 @@ func TestLoopbackListen_TrustsOnlyAnAddressLiteral(t *testing.T) {
 				t.Errorf("Validate(listen=%q, allowed=[127.0.0.1:9200]) = nil, want a refusal: nothing here proves that bind is loopback-only, so a local target may let a remote CONNECT holder launder itself into a loopback caller", listen)
 			}
 
-			// 4. the dial-time guard, disarmed on loopback-only binds and
-			// only those, so these two must be opposites.
-			if got := dialGuardArmed(listen); got == tc.listenLoopback {
-				t.Errorf("connectDialRefusal armed=%v on listen %q while isLoopbackListen=%v; the guard is disarmed on loopback-only binds and only those", got, listen, tc.listenLoopback)
+			// 4. the dial-time guard, which this string has no say over
+			// any more. It is armed on EVERY row, the loopback literals
+			// included, because no socket has been adopted -- and that
+			// column no longer tracking column 1 is the whole of the
+			// class fix.
+			if !dialGuardArmed(listen) {
+				t.Errorf("the dial-time guard is disarmed for listen %q with no socket adopted; it must hang on a bound socket and never on the config text", listen)
 			}
 
 			// 5. the gateway_auth rule, the third thing the bind answer
@@ -205,7 +220,7 @@ func TestLoopbackListen_InetAtonSpellingsAreNotProofOfALoopbackBind(t *testing.T
 			}
 
 			// Relaxation two: loopback allowed_hosts entries stay refused.
-			why := connectSelfReference("127.0.0.1", "9200", listen)
+			why := connectSelfReference("127.0.0.1", "9200", listen, isLoopbackListen(listen))
 			if why == "" {
 				t.Errorf("connectSelfReference(127.0.0.1, 9200, listen=%q) is empty; the config-time CONNECT layer is disarmed by a numeric-spelled bind", listen)
 			}
@@ -213,9 +228,12 @@ func TestLoopbackListen_InetAtonSpellingsAreNotProofOfALoopbackBind(t *testing.T
 				t.Errorf("refusal = %q, want the spelling hint here too", why)
 			}
 
-			// Relaxation three: the dial-time guard stays armed.
+			// Relaxation three: the dial-time guard stays armed. Nothing
+			// in a config string can disarm it now, which is why a hosts
+			// file pointing that spelling at a routable address cannot
+			// switch off the dial-time layer either.
 			if !dialGuardArmed(listen) {
-				t.Errorf("connectDialRefusal is disarmed on listen %q; a hosts file pointing that spelling at a routable address would switch off the dial-time layer too", listen)
+				t.Errorf("the dial-time guard is disarmed on listen %q with no socket adopted", listen)
 			}
 		})
 	}
@@ -281,7 +299,7 @@ func TestLoopbackListen_RefusesToTrustANameAsProofOfALoopbackBind(t *testing.T) 
 			}
 
 			// Layer one stays armed.
-			why := connectSelfReference("127.0.0.1", "9200", listen)
+			why := connectSelfReference("127.0.0.1", "9200", listen, isLoopbackListen(listen))
 			if why == "" {
 				t.Errorf("connectSelfReference(127.0.0.1, 9200, listen=%q) is empty; the config-time layer is disarmed by a name-spelled bind", listen)
 			}
@@ -289,9 +307,11 @@ func TestLoopbackListen_RefusesToTrustANameAsProofOfALoopbackBind(t *testing.T) 
 				t.Errorf("refusal = %q, want it to tell the operator to write the address", why)
 			}
 
-			// Layer two stays armed.
+			// Layer two stays armed, and no config string can change
+			// that: a hosts file pointing that name at a routable address
+			// cannot switch off the dial-time layer.
 			if !dialGuardArmed(listen) {
-				t.Errorf("connectDialRefusal is disarmed on listen %q; a host file pointing that name at a routable address would switch off the dial-time layer too", listen)
+				t.Errorf("the dial-time guard is disarmed on listen %q with no socket adopted", listen)
 			}
 
 			// And the gateway leg asks for a token, actionably.

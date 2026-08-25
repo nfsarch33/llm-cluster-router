@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A loopback `listen` is now decided from the bound socket, not from the
+  config string.** `listen: "127.0.0.1%evil:14443"` was read here as
+  `127.0.0.1` — `bareHost` stripped the zone before parsing, unconditionally —
+  so the gateway believed it had bound loopback. IPv4 has no zones, so
+  `net.Listen` treated the whole string as a host NAME, resolved it through the
+  hosts file and DNS, and bound `172.29.144.56`. All three relaxations that a
+  loopback bind grants fired on a routable socket: the gateway-token requirement
+  was waived, loopback `connect.allowed_hosts` entries were permitted, and the
+  dial-time `CONNECT` guard was disarmed.
+
+  This was the third round of one defect — `localhost`, then the `inet_aton`
+  spellings, then a zone — and each round had been closed by teaching the
+  predicate about one more spelling, which is what invited the next. The class is
+  eliminated rather than the spelling patched:
+
+  - The gateway **binds first**, reads back `ln.Addr()`, and decides from that.
+    A socket address is spelling-independent and resolver-independent. A wildcard
+    bind (`0.0.0.0`, `::`, an empty host) is judged **not** loopback-only, because
+    it accepts remote peers.
+  - A tokenless configuration, and a loopback `allowed_hosts` entry, are judged
+    **after** the bind and **before** anything is served. If the socket turns out
+    to be reachable from other hosts, startup fails with an error naming the
+    address actually bound and the listener is closed — a request already sitting
+    in the accept backlog is never answered.
+  - The dial-time `CONNECT` guard takes the same post-bind answer. Where no
+    listener was adopted (`Server.Handler` mounted on someone else's
+    `http.Server`), it falls back to the address the connection was accepted on,
+    which is still a kernel-assigned socket address; `listen` is not consulted on
+    the request path at all.
+  - `Server.Serve(ctx, ln)` is new and is where all of this happens.
+    `ListenAndServe` binds `Config.Listen` and calls it.
+  - `bareHost` strips a zone only where a zone is legal — when the address is
+    IPv6, which is the same test Go's own parser applies. `[::1%lo]` and
+    `[::ffff:127.0.0.1%eth0]` keep working, both measured binding loopback.
+  - The config-time predicate stays, demoted to an **advisory** refusal at
+    `LoadConfig` so the obvious mistakes still die where an operator is reading
+    the file. A zone on an IPv4 address gets its own actionable sentence,
+    alongside the existing name and `inet_aton` ones.
+
+  The deliberate asymmetry is unchanged: as a `CONNECT` **target**, generous
+  recognition causes a **refusal** and therefore fails closed, so `localTargetKind`
+  still reads every `inet_aton` spelling and the reserved-name blocklist.
+
+  BREAKING: `listen: "127.0.0.1%eth0:14443"` — and any other zone on an
+  IPv4-looking host — with no `gateway_auth` token now refuses to start, alongside
+  `listen: "localhost:14443"` and `listen: "127.1:14443"`. A tokenless gateway
+  whose socket turns out to be reachable now fails at startup instead of serving.
+
 ### Added
 
 - **BREAKING — the reverse-proxy leg now authenticates its callers.** A shared

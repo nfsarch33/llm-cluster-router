@@ -2,6 +2,7 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -304,26 +305,33 @@ func TestParseIPv4Numeric(t *testing.T) {
 // branch a CI box cannot stage: a peer whose address equals our own end of the
 // socket is this machine, which is what a self-dial to a routable local address
 // looks like.
+//
+// The first argument is a listenScope, taken from the socket the gateway is
+// actually serving, and not the Config.Listen string it used to be. A string
+// had to be predicted, and each round of this defect found another string the
+// prediction read one way and net.Listen read another.
 func TestConnectDialRefusal(t *testing.T) {
 	t.Parallel()
 	tcp := func(s string, port int) net.Addr { return &net.TCPAddr{IP: net.ParseIP(s), Port: port} }
 	cases := []struct {
-		name, listen  string
+		name          string
+		scope         listenScope
 		local, remote net.Addr
 		want          string
 	}{
-		{"loopback peer on a wildcard bind", "0.0.0.0:45209", tcp("127.0.0.1", 51000), tcp("127.0.0.1", 45209), "target_resolves_to_loopback"},
-		{"v6 loopback peer", "0.0.0.0:45209", tcp("::1", 51000), tcp("::1", 45209), "target_resolves_to_loopback"},
-		{"our own routable address", "0.0.0.0:45209", tcp("10.0.0.5", 51000), tcp("10.0.0.5", 45209), "target_resolves_to_gateway_host"},
-		{"a genuine remote peer", "0.0.0.0:45209", tcp("10.0.0.5", 51000), tcp("203.0.113.7", 443), ""},
-		{"loopback peer but a loopback bind", "127.0.0.1:45209", tcp("127.0.0.1", 51000), tcp("127.0.0.1", 9200), ""},
-		{"an unknown peer address", "0.0.0.0:45209", tcp("10.0.0.5", 51000), nil, ""},
+		{"loopback peer on a reachable socket", scopeReachable, tcp("127.0.0.1", 51000), tcp("127.0.0.1", 45209), "target_resolves_to_loopback"},
+		{"v6 loopback peer", scopeReachable, tcp("::1", 51000), tcp("::1", 45209), "target_resolves_to_loopback"},
+		{"our own routable address", scopeReachable, tcp("10.0.0.5", 51000), tcp("10.0.0.5", 45209), "target_resolves_to_gateway_host"},
+		{"a genuine remote peer", scopeReachable, tcp("10.0.0.5", 51000), tcp("203.0.113.7", 443), ""},
+		{"loopback peer but a loopback-only socket", scopeLoopbackOnly, tcp("127.0.0.1", 51000), tcp("127.0.0.1", 9200), ""},
+		{"an unknown peer address", scopeReachable, tcp("10.0.0.5", 51000), nil, ""},
+		{"no socket adopted at all", scopeUnknown, tcp("127.0.0.1", 51000), tcp("127.0.0.1", 45209), "target_resolves_to_loopback"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := connectDialRefusal(tc.listen, tc.local, tc.remote); got != tc.want {
-				t.Errorf("connectDialRefusal(%q) = %q, want %q", tc.listen, got, tc.want)
+			if got := connectDialRefusal(tc.scope, tc.local, tc.remote); got != tc.want {
+				t.Errorf("connectDialRefusal(scope=%v) = %q, want %q", tc.scope, got, tc.want)
 			}
 		})
 	}
@@ -353,7 +361,7 @@ func TestConnect_DialTimeGuardRefusesATargetThatResolvedToLoopback(t *testing.T)
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	rec := connectThrough(srv, target, "203.0.113.9:51000")
+	rec := connectThrough(srv, target, "203.0.113.9:51000", &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 45209})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("CONNECT to a loopback target returned %d, want %d; the gateway must not tunnel into itself", rec.Code, http.StatusForbidden)
 	}
@@ -362,11 +370,16 @@ func TestConnect_DialTimeGuardRefusesATargetThatResolvedToLoopback(t *testing.T)
 	}
 }
 
-// TestConnect_DialTimeGuardIsOffForALoopbackBind keeps the guard from becoming
-// an outage on the one deployment shape it must not touch: a gateway bound to
-// loopback tunnelling to a local service, which is what TestConnectTunnel_
-// EndToEnd exercises and what a developer box runs.
-func TestConnect_DialTimeGuardIsOffForALoopbackBind(t *testing.T) {
+// TestConnect_DialTimeGuardIsOffForALoopbackSocket keeps the guard from
+// becoming an outage on the one deployment shape it must not touch: a gateway
+// serving a loopback socket and tunnelling to a local service, which is what
+// TestConnectTunnel_EndToEnd exercises and what a developer box runs.
+//
+// What disarms it is the SOCKET, so the connection here states the loopback
+// address it was accepted on. The config string below is a loopback literal as
+// well, and counts for nothing: TestServingScope_ReadsASocketAndNeverTheConfig
+// String pins that it is never read.
+func TestConnect_DialTimeGuardIsOffForALoopbackSocket(t *testing.T) {
 	target := echoListener(t)
 
 	t.Setenv("TEST_SELFREF_TOKEN", "connect-token")
@@ -381,9 +394,9 @@ func TestConnect_DialTimeGuardIsOffForALoopbackBind(t *testing.T) {
 
 	// The recorder cannot be hijacked, so the tunnel cannot complete here; what
 	// matters is that the request got PAST the allowlist and the dial guard.
-	rec := connectThrough(srv, target, "127.0.0.1:51000")
+	rec := connectThrough(srv, target, "127.0.0.1:51000", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45209})
 	if rec.Code == http.StatusForbidden {
-		t.Fatal("CONNECT to a local service from a loopback-bound gateway was refused 403; the guard must not fire on this shape")
+		t.Fatal("CONNECT to a local service from a gateway serving a loopback socket was refused 403; the guard must not fire on this shape")
 	}
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d (hijack unsupported, i.e. the dial was accepted)", rec.Code, http.StatusInternalServerError)
@@ -413,12 +426,21 @@ func echoListener(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// connectThrough drives one authorised CONNECT at the handler.
-func connectThrough(srv *Server, target, peer string) *httptest.ResponseRecorder {
+// connectThrough drives one authorised CONNECT at the handler, stating the
+// address the connection was ACCEPTED on as well as the peer it came from.
+//
+// net/http puts the accepted-on address in the request context, and that is
+// what the gateway reads when Handler has been mounted on someone else's server
+// and no listener was adopted. It is a real socket address; Config.Listen is
+// not consulted at all, which is the whole point of the change these tests pin.
+func connectThrough(srv *Server, target, peer string, acceptedOn net.Addr) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodConnect, "http://"+target, nil)
 	req.Host = target
 	req.RemoteAddr = peer
 	req.Header.Set("Proxy-Authorization", "Bearer connect-token")
+	if acceptedOn != nil {
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, acceptedOn))
+	}
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	return rec

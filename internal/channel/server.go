@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -153,6 +154,17 @@ type Server struct {
 	connToken string
 	allowed   map[string]bool
 	httpSrv   *http.Server
+
+	// scope is how far the socket this gateway is serving actually reaches,
+	// and it is the AUTHORITY for every loopback relaxation on this server.
+	// Serve writes it exactly once, from the address the kernel assigned,
+	// before a listener is handed to net/http; handlers only read it. It is
+	// atomic because Handler may already be mounted elsewhere when Serve runs.
+	//
+	// Zero value scopeUnknown means no socket was adopted -- Handler was
+	// mounted on someone else's server -- and servingScope says what happens
+	// then. It never means "loopback".
+	scope atomic.Uint32
 
 	// proxyAuth and proxyToken gate the REVERSE-PROXY leg. They are a
 	// different credential from connToken above, which gates the CONNECT leg
@@ -773,7 +785,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// or an answer that changed after startup. Without it the gateway can be
 	// made to dial itself, and the tunnelled request arrives as a LOCAL caller
 	// holding the gateway_auth loopback exemption.
-	if reason := connectDialRefusal(s.cfg.Listen, upstream.LocalAddr(), upstream.RemoteAddr()); reason != "" {
+	// The scope comes from a SOCKET, never from s.cfg.Listen. A config string
+	// has to be predicted, and three rounds of this defect were three strings
+	// this package predicted one way and net.Listen resolved another.
+	if reason := connectDialRefusal(s.servingScope(r), upstream.LocalAddr(), upstream.RemoteAddr()); reason != "" {
 		deny(http.StatusForbidden, reason)
 		return
 	}
@@ -879,8 +894,113 @@ func errorClass(err error) string {
 	}
 }
 
-// ListenAndServe runs the gateway until ctx is cancelled.
+// servingScope is how far the socket carrying r reaches, and it is the single
+// authority every loopback relaxation on the request path reads.
+//
+// Both branches answer from a kernel-assigned address. Neither parses
+// Config.Listen, and that is deliberate rather than incidental: predicting what
+// net.Listen will do with a config string is what produced this defect three
+// times running, once per new spelling nobody had enumerated.
+//
+//   - Serve adopted a listener, so the whole server's reach is known and is
+//     the answer for every request on it.
+//   - Nothing was adopted -- Handler was mounted on someone else's
+//     http.Server (httptest, an embedder, a socket-activation wrapper) -- so
+//     the fallback is the address THIS connection was accepted on, which
+//     net/http carries in the request context. It is a real socket address
+//     too, just a narrower one, and it is sound for the question being asked:
+//     a connection accepted ON 127.0.0.1 has a peer that is necessarily on
+//     this machine, so there is no remote caller to launder whatever the
+//     listener's own address happens to be.
+//   - Neither available: scopeReachable. Undecidable is not loopback.
+func (s *Server) servingScope(r *http.Request) listenScope {
+	if sc := listenScope(s.scope.Load()); sc != scopeUnknown {
+		return sc
+	}
+	if addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		return boundListenScope(addr)
+	}
+	return scopeReachable
+}
+
+// bindRefusal reports why this server must NOT serve on the socket it just
+// opened, or "" when it may.
+//
+// It is the post-bind half of two rules Config.Validate also states, and it is
+// the half that decides. Validate ran before a socket existed, so all it could
+// do was predict what net.Listen would make of Config.Listen; here the kernel
+// has already answered. Where the two disagree, this one wins, because a
+// relaxation granted on a prediction is a relaxation granted on whatever the
+// platform resolver felt like saying.
+//
+// The two rules, both of which are relaxations that loopback-ness would grant:
+//
+//   - A tokenless posture (proxy_auth loopback_only: no gateway token, no
+//     written-down allow_unauthenticated) authenticates NOBODY, so it is
+//     permissible only while the socket cannot be reached from another host.
+//   - connect.allowed_hosts entries that name this machine are permitted only
+//     on a loopback-only socket, where every CONNECT client is already a local
+//     process and a tunnel to a local service grants it nothing.
+//
+// The third relaxation, the dial-time CONNECT guard, needs no refusal here: it
+// simply stays ARMED, because servingScope reads the same scope.
+func (s *Server) bindRefusal(addr net.Addr, scope listenScope) string {
+	if scope == scopeLoopbackOnly {
+		return ""
+	}
+	bound := addr.String()
+	if s.proxyAuth == ProxyAuthLoopbackOnly {
+		return fmt.Sprintf("gateway_auth: this gateway bound %s, which is reachable from other hosts, and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable, so anyone able to open a TCP connection could spend every key on every enabled route. The bind address is decided here from the socket the kernel actually opened, not from listen %q, because that string is only a prediction of what net.Listen will do with it. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or -- only behind an authenticating terminator -- set gateway_auth.allow_unauthenticated: true", bound, s.cfg.Listen)
+	}
+	if !s.cfg.Connect.Enabled {
+		return ""
+	}
+	for _, h := range s.cfg.Connect.AllowedHosts {
+		host, port, err := net.SplitHostPort(h)
+		if err != nil {
+			// Validate already refuses a malformed entry, and a Config built
+			// in memory that skipped it has no allowlist worth checking.
+			continue
+		}
+		if why := connectSelfReference(host, port, bound, false); why != "" {
+			return fmt.Sprintf("connect: allowed_hosts entry %q %s. This gateway bound %s, which is reachable from other hosts, whatever listen %q predicted. Remove the entry, or run the service it names on a different host", h, why, bound, s.cfg.Listen)
+		}
+	}
+	return ""
+}
+
+// ListenAndServe binds Config.Listen and runs the gateway until ctx is
+// cancelled.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.cfg.Listen)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve runs the gateway on an already-bound listener until ctx is cancelled,
+// and takes ownership of ln: it is closed on refusal and by Shutdown otherwise.
+//
+// The ORDER here is the security property, not an implementation detail. ln is
+// already bound, so ln.Addr() is the address the kernel actually gave us --
+// spelling-independent and resolver-independent. That address is adopted as
+// this server's authoritative scope, the tokenless posture is judged against
+// it, and only if it survives does a listener reach net/http. A refusal closes
+// ln without ever calling Accept, so a connection already sitting in the
+// backlog is reset rather than answered: not one request is served in the
+// window between binding and refusing.
+//
+// Doing it the other way round -- serve, then check -- would have been the same
+// defect in a new place. The point of deciding from the socket is lost if the
+// socket is serving by the time the decision is made.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	scope := boundListenScope(ln.Addr())
+	s.scope.Store(uint32(scope))
+	if why := s.bindRefusal(ln.Addr(), scope); why != "" {
+		_ = ln.Close()
+		return errors.New(why)
+	}
 	s.httpSrv = &http.Server{
 		Addr:              s.cfg.Listen,
 		Handler:           s.Handler(),
@@ -890,9 +1010,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go func() {
 		var err error
 		if s.cfg.TLS.Enabled() {
-			err = s.httpSrv.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+			err = s.httpSrv.ServeTLS(ln, s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
 		} else {
-			err = s.httpSrv.ListenAndServe()
+			err = s.httpSrv.Serve(ln)
 		}
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil

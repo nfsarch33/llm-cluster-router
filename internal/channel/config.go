@@ -610,7 +610,10 @@ func (c *Config) validateConnect() error {
 		if err != nil {
 			return fmt.Errorf("connect: allowed_hosts entry %q must be host:port", h)
 		}
-		if why := connectSelfReference(host, port, c.Listen); why != "" {
+		// The ADVISORY half: isLoopbackListen is a prediction, so this is an
+		// early refusal of what is decidable from the text and nothing more.
+		// Server.bindRefusal re-runs the same rule once the socket exists.
+		if why := connectSelfReference(host, port, c.Listen, isLoopbackListen(c.Listen)); why != "" {
 			return fmt.Errorf("connect: allowed_hosts entry %q %s. Remove the entry, or run the service it names on a different host", h, why)
 		}
 	}
@@ -645,6 +648,11 @@ func (c *Config) validateGatewayAuth() error {
 	if g.ExemptLoopback != nil && !*g.ExemptLoopback {
 		return fmt.Errorf("gateway_auth: exempt_loopback: false requires a token source (token_env/token_file/token_ref); without one it would refuse every caller, loopback included")
 	}
+	// ADVISORY, and only that. isLoopbackListen predicts; it does not decide.
+	// Server.bindRefusal asks the same question of the socket the kernel
+	// actually opened, before a single request is served, and THAT is what a
+	// tokenless configuration is permitted by. This check exists so the common
+	// mistakes die at LoadConfig, where an operator is still reading the file.
 	if !g.AllowUnauthenticated && !isLoopbackListen(c.Listen) {
 		msg := fmt.Sprintf("gateway_auth: listen %q is not a loopback address and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable from other hosts, so anyone able to open a TCP connection could spend every key on every enabled route. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or — only behind an authenticating terminator — set gateway_auth.allow_unauthenticated: true", c.Listen)
 		if hint := loopbackListenHint(c.Listen); hint != "" {
