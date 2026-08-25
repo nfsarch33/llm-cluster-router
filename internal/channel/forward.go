@@ -171,16 +171,38 @@ var hopByHop = map[string]bool{
 //
 // Entries are matched case-insensitively, so spell them however reads best.
 //
+// A BLOCKLIST IS STRUCTURALLY INCOMPLETE, and saying so is the point of this
+// paragraph. What this list can promise is "a caller cannot reach the upstream
+// as another account THROUGH ONE OF THESE HEADERS". It cannot promise "a caller
+// cannot reach the upstream as another account": any header a provider honours
+// that nobody has listed yet is forwarded, because forwarding is the default and
+// this table is the exception to it. An allow-list would invert that and is the
+// only construction that could make the stronger promise — at the cost of
+// breaking every client that sends a header the gateway has not heard of, which
+// on a transparent reverse proxy is most of them. The trade is deliberate; the
+// mitigation is that adding a name here is a one-line data edit, and the
+// obligation is to make that edit when a provider is onboarded rather than to
+// assume the list is finished.
+//
+// Openai-Organization and Openai-Project are the case that proves it. Neither
+// is a credential: they are SPEND DIRECTION. On auth: inject the gateway supplies
+// the key, and a caller that sets them picks which organisation or project
+// inside the key's account is billed — someone else's budget, chosen by the
+// caller, on the gateway's credential. That reached the upstream until it was
+// noticed, purely because "credential" had been read as "thing that
+// authenticates" rather than "thing that decides whose money is spent".
+//
 // Not every entry is independently provable, and that is recorded here so a
 // later reader does not mistake redundancy for coverage. X-Api-Key, Api-Key,
-// X-Goog-Api-Key and Cookie are each load-bearing: delete one and a caller
-// value reaches the provider (each is mutation-killed by
-// credential_strip_test.go). Authorization and Proxy-Authorization are NOT —
-// the first is overwritten by bearerInjector and deleted by leasedInjector, the
-// second is already dropped by the hopByHop table above. They are kept anyway,
-// because those are DIFFERENT layers: a substituted Forwarder, or an edit to
-// the hop-by-hop table, removes them and not this one. Two string comparisons
-// is a cheap price for a guarantee that does not depend on code elsewhere.
+// X-Goog-Api-Key, Cookie, Openai-Organization and Openai-Project are each
+// load-bearing: delete one and a caller value reaches the provider (each is
+// mutation-killed by credential_strip_test.go). Authorization and
+// Proxy-Authorization are NOT — the first is overwritten by bearerInjector and
+// deleted by leasedInjector, the second is already dropped by the hopByHop table
+// above. They are kept anyway, because those are DIFFERENT layers: a substituted
+// Forwarder, or an edit to the hop-by-hop table, removes them and not this one.
+// Two string comparisons is a cheap price for a guarantee that does not depend
+// on code elsewhere.
 var callerCredentialHeaders = []string{
 	"Authorization",       // OpenAI, MiniMax, Qwen — every bearer provider
 	"Proxy-Authorization", // also hop-by-hop; listed so the guarantee does not rest on that
@@ -188,6 +210,8 @@ var callerCredentialHeaders = []string{
 	"Api-Key",             // Azure OpenAI
 	"X-Goog-Api-Key",      // Google Generative Language
 	"Cookie",              // a provider session the caller is already logged into
+	"OpenAI-Organization", // not auth: picks whose budget the gateway's key spends
+	"OpenAI-Project",      // likewise, one level down
 }
 
 // modesSupplyingTheirOwnCredential is the ALLOW-list of auth modes that carry

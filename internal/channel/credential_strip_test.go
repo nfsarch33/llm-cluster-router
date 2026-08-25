@@ -50,6 +50,11 @@ var credStripProbes = []credStripProbe{
 	{header: "Api-Key", value: "azure-" + credStripCallerMarker},
 	{header: "X-Goog-Api-Key", value: "goog-" + credStripCallerMarker},
 	{header: "Cookie", value: "session=" + credStripCallerMarker},
+	// Not credentials — spend direction. On an inject mode the gateway holds
+	// the key, so a caller that sets these chooses which organisation or
+	// project inside the gateway's own account is billed.
+	{header: "OpenAI-Organization", value: "org-" + credStripCallerMarker},
+	{header: "OpenAI-Project", value: "proj_" + credStripCallerMarker},
 }
 
 // credStripUpstream is a recording provider. It returns an accessor rather than
@@ -261,6 +266,35 @@ func TestForward_StripsTheRouteOwnConfiguredKeyHeaderWhateverItIsNamed(t *testin
 	}
 }
 
+// TestCallerCredentialHeaders_IsABlocklistAndCannotBeComplete is the honest
+// bound on everything above.
+//
+// The deny-set forwards by default and strips by exception, so its guarantee is
+// "not through THESE headers", never "not at all". This pins that as a fact
+// rather than leaving it to be discovered: an unlisted spend-direction header
+// reaches the upstream on an inject mode, exactly as Openai-Organization did
+// until it was listed. It exists so a reader who wants the stronger guarantee
+// has to change the construction, not add another name.
+func TestCallerCredentialHeaders_IsABlocklistAndCannotBeComplete(t *testing.T) {
+	t.Parallel()
+	up, seen := credStripUpstream(t)
+	srv := credStripServer(t, up.URL, Route{
+		Name: "blocklist", Auth: AuthInject,
+		KeyFile: writeKeyFile(t, t.TempDir(), "k.key", "gateway-blocklist-not-real\n"),
+	})
+	// A plausible next provider header that nobody has listed yet.
+	const unlisted = "X-Billing-Account"
+	observed := credStripCall(t, srv, seen, map[string]string{unlisted: "acct-" + credStripCallerMarker})
+	if leaks := credStripLeaks(observed); len(leaks) == 0 {
+		t.Errorf("the caller %s did NOT reach the upstream. If that is because the name was added to "+
+			"callerCredentialHeaders, pick another unlisted one; if it is because the deny-set became an "+
+			"allow-list, delete this test and the paragraph in forward.go that it pins", unlisted)
+	}
+	if isCallerCredential(unlisted, "") {
+		t.Errorf("isCallerCredential(%q) = true; this test needs an unlisted header to be about anything", unlisted)
+	}
+}
+
 // TestForward_NonCredentialHeadersStillReachTheUpstream is the over-stripping
 // guard. The gateway is a transparent proxy for everything that is not a
 // credential; a deny-set that swallowed content negotiation or idempotency keys
@@ -302,6 +336,8 @@ func TestCallerCredentialHeaders_CoversTheDocumentedMinimumCaseInsensitively(t *
 		"API-Key",
 		"X-GOOG-api-KEY",
 		"cookie",
+		"openai-organization",
+		"OPENAI-PROJECT",
 	}
 	for _, name := range minimum {
 		if !isCallerCredential(name, "") {
