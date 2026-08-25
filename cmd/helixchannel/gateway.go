@@ -41,6 +41,14 @@ func runGateway(args []string) error {
 	}
 	if *listen != "" {
 		cfg.Listen = *listen
+		// Re-validate: the override replaces the one field gateway_auth's bind
+		// rule reads, so a config that legitimately bound loopback with no token
+		// could otherwise be moved onto a wildcard address from the command line
+		// and skip the check entirely. Validate is idempotent — it re-derives
+		// the same defaults from values already at their defaults.
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
 	}
 
 	auditWriter := io.Writer(os.Stdout)
@@ -79,15 +87,35 @@ func runGateway(args []string) error {
 		sort.Strings(names)
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"listen": cfg.Listen, "routes": names, "connect": cfg.Connect.Enabled,
+			"proxy_auth": string(srv.ProxyAuthMode()),
 		})
 	}
 
-	fmt.Fprintf(os.Stderr, "helixchannel gateway listening on %s routes=%v connect=%t\n",
-		cfg.Listen, srv.RouteNames(), cfg.Connect.Enabled)
+	fmt.Fprintf(os.Stderr, "helixchannel gateway listening on %s routes=%v connect=%t proxy_auth=%s\n",
+		cfg.Listen, srv.RouteNames(), cfg.Connect.Enabled, srv.ProxyAuthMode())
+	warnUnauthenticatedProxyLeg(os.Stderr, srv.ProxyAuthMode(), cfg.Listen)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return srv.ListenAndServe(ctx)
+}
+
+// warnUnauthenticatedProxyLeg prints the loud startup warning for the two
+// postures in which the reverse-proxy leg authenticates nobody.
+//
+// It is deliberately not a debug line an operator has to go looking for. Both
+// states are legitimate — loopback_only is the historical default and open is
+// the fronted-by-a-terminator deployment — and both are indistinguishable, from
+// inside this process, from having forgotten to configure a token. The banner
+// above already carries proxy_auth for a log parser; this is the sentence a
+// human reads.
+func warnUnauthenticatedProxyLeg(w io.Writer, mode channel.ProxyAuthMode, listen string) {
+	switch mode {
+	case channel.ProxyAuthLoopbackOnly:
+		_, _ = fmt.Fprintf(w, "WARNING: no gateway_auth token is configured, so the reverse-proxy leg authenticates NOBODY. Reaching %s is sufficient to spend every key on every enabled route; the bind address is the only boundary. Set gateway_auth.token_env/token_file/token_ref before publishing this socket any wider.\n", listen)
+	case channel.ProxyAuthOpen:
+		_, _ = fmt.Fprintf(w, "WARNING: gateway_auth.allow_unauthenticated is set, so the reverse-proxy leg authenticates NOBODY on %s. Anyone who can open a TCP connection to it can spend every key on every enabled route. This is only safe behind an authenticating terminator that is the sole reachable path to this socket.\n", listen)
+	}
 }
 
 // runProxy serves the loopback client proxy that lets an agent route through

@@ -25,6 +25,7 @@ package channel
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,6 +157,103 @@ type ConnectConfig struct {
 	DialTimeout time.Duration `yaml:"dial_timeout"`
 }
 
+// ProxyAuthMode is the caller-authentication posture of the REVERSE-PROXY leg,
+// derived from GatewayAuthConfig rather than configured directly.
+//
+// It is derived and not typed in by the operator because every one of these
+// four states is already implied by two facts an operator does write down — is
+// a token source named, and is unauthenticated operation explicitly accepted —
+// and a fifth, hand-written spelling of the same thing is a way for the posture
+// a gateway reports to disagree with the posture it enforces.
+type ProxyAuthMode string
+
+const (
+	// ProxyAuthToken requires the gateway token from EVERY caller, loopback
+	// included.
+	ProxyAuthToken ProxyAuthMode = "token"
+	// ProxyAuthTokenLoopbackExempt requires the gateway token from every
+	// caller whose TCP peer is not loopback. It is the default whenever a
+	// token is configured, so a cutover does not break the local clients that
+	// were the only supported deployment before there was a token at all.
+	ProxyAuthTokenLoopbackExempt ProxyAuthMode = "token_loopback_exempt"
+	// ProxyAuthLoopbackOnly is the pre-existing behaviour: NO caller
+	// authentication whatever. Validate refuses to let it bind a non-loopback
+	// address, so the bind address is the boundary and the name says which one.
+	ProxyAuthLoopbackOnly ProxyAuthMode = "loopback_only"
+	// ProxyAuthOpen is ProxyAuthLoopbackOnly with the bind restriction waived
+	// by an explicit allow_unauthenticated. It exists for the one legitimate
+	// shape — an authenticating terminator (mTLS, an OIDC proxy) in front of a
+	// gateway that must therefore bind an address that terminator can reach —
+	// and it is a written-down declaration precisely so that shape and the
+	// accident it is indistinguishable from stop looking the same in a config.
+	ProxyAuthOpen ProxyAuthMode = "open"
+)
+
+// GatewayAuthConfig authenticates callers of the REVERSE-PROXY leg.
+//
+// This is a SEPARATE credential from ConnectConfig's token, and the separation
+// is the point rather than an oversight: the CONNECT token opens a byte tunnel
+// bounded by an exact-match allowlist, whereas this one authorises spending
+// every key on every enabled route. One secret gating both would silently grant
+// whichever power the operator was not thinking about.
+//
+// The token is named the same way every other credential is — token_env,
+// token_file or a scheme-qualified token_ref — so it resolves through the one
+// SecretProvider seam and a vault item shared with a route is fetched once.
+type GatewayAuthConfig struct {
+	// TokenEnv names an environment variable holding the gateway token.
+	TokenEnv string `yaml:"token_env"`
+	// TokenFile is a path holding the gateway token. Surrounding whitespace is
+	// trimmed.
+	TokenFile string `yaml:"token_file"`
+	// TokenRef is a scheme-qualified reference — "env:NAME", "file:/path" or
+	// "op://<vault>/<item>/<field>" — consulted BEFORE TokenEnv and TokenFile.
+	TokenRef string `yaml:"token_ref"`
+
+	// ExemptLoopback serves a caller whose TCP peer is 127.0.0.0/8 or ::1
+	// without a token. It defaults to TRUE, which is why it is a *bool: an
+	// absent key and an explicit `false` must not mean the same thing, and the
+	// default has to be the one that keeps every existing local client working
+	// at cutover.
+	//
+	// The exemption is decided from the accepted connection's peer address and
+	// from nothing else — see isLoopbackPeer, which reads no header.
+	ExemptLoopback *bool `yaml:"exempt_loopback"`
+
+	// AllowUnauthenticated is the explicit acceptance an operator must write
+	// down to bind a non-loopback address with no token. It is not a
+	// convenience: without it, "no token" plus a wide bind is refused at
+	// startup, which is the whole of turning that footgun into an error.
+	AllowUnauthenticated bool `yaml:"allow_unauthenticated"`
+}
+
+// hasToken reports whether any token source is named. A named-but-unresolvable
+// source is a startup error from NewServer, not an absent token.
+func (g GatewayAuthConfig) hasToken() bool {
+	return g.TokenRef != "" || g.TokenEnv != "" || g.TokenFile != ""
+}
+
+// exemptsLoopback reports the effective exemption: absent means exempt.
+func (g GatewayAuthConfig) exemptsLoopback() bool {
+	return g.ExemptLoopback == nil || *g.ExemptLoopback
+}
+
+// Mode reports the posture this configuration selects. It is the single place
+// the four states are derived, so the startup log, /healthz and the request
+// path cannot describe the gateway differently from one another.
+func (g GatewayAuthConfig) Mode() ProxyAuthMode {
+	switch {
+	case g.hasToken() && g.exemptsLoopback():
+		return ProxyAuthTokenLoopbackExempt
+	case g.hasToken():
+		return ProxyAuthToken
+	case g.AllowUnauthenticated:
+		return ProxyAuthOpen
+	default:
+		return ProxyAuthLoopbackOnly
+	}
+}
+
 // TLSConfig terminates TLS on the gateway itself.
 //
 // Needed when the CONNECT leg is exposed publicly: a CONNECT request cannot
@@ -184,6 +282,10 @@ type Config struct {
 	Routes []Route `yaml:"routes"`
 	// Connect configures the CONNECT tunnel leg.
 	Connect ConnectConfig `yaml:"connect"`
+	// GatewayAuth authenticates callers of the reverse-proxy leg. Absent, that
+	// leg authenticates nobody and Validate refuses to bind anything but a
+	// loopback address.
+	GatewayAuth GatewayAuthConfig `yaml:"gateway_auth"`
 	// TLS optionally terminates TLS on the gateway itself.
 	TLS TLSConfig `yaml:"tls"`
 }
@@ -250,7 +352,13 @@ func (c *Config) Validate() error {
 	if (c.TLS.CertFile == "") != (c.TLS.KeyFile == "") {
 		return fmt.Errorf("tls: cert_file and key_file must be set together")
 	}
-	return c.validateConnect()
+	if err := c.validateConnect(); err != nil {
+		return err
+	}
+	// LAST, and it has to stay last: it is the only check that reads `listen`
+	// together with another block, so raising it first would mask the route and
+	// connect mistakes an operator is far likelier to have actually made.
+	return c.validateGatewayAuth()
 }
 
 // validateRouteAuth is the SINGLE entry point for a route's credential, auth
@@ -493,6 +601,58 @@ func (c *Config) validateConnect() error {
 		c.Connect.DialTimeout = 10 * time.Second
 	}
 	return nil
+}
+
+// validateGatewayAuth checks the reverse-proxy leg's caller authentication.
+//
+// Its central rule is the one that turns a deployment accident into a startup
+// error: a gateway with NO caller authentication must not bind an address other
+// hosts can reach. Before this existed, `listen: 0.0.0.0:14443` and no token
+// was a funded, unauthenticated relay to every provider whose key the process
+// held, and nothing in the config, the logs or /healthz said so.
+//
+// The two contradictions it also refuses are refused rather than resolved
+// because each has two plausible readings and picking one silently is how an
+// operator ends up with the posture they did not choose.
+func (c *Config) validateGatewayAuth() error {
+	g := &c.GatewayAuth
+	if err := validateSecretRef(g.TokenRef); err != nil {
+		return fmt.Errorf("gateway_auth: %w", err)
+	}
+	if g.hasToken() && g.AllowUnauthenticated {
+		return fmt.Errorf("gateway_auth: allow_unauthenticated must not be set together with a token source: it declares that the reverse-proxy leg authenticates nobody, which is the opposite of what token_env/token_file/token_ref configure")
+	}
+	if g.hasToken() {
+		return nil
+	}
+	if g.ExemptLoopback != nil && !*g.ExemptLoopback {
+		return fmt.Errorf("gateway_auth: exempt_loopback: false requires a token source (token_env/token_file/token_ref); without one it would refuse every caller, loopback included")
+	}
+	if !g.AllowUnauthenticated && !isLoopbackListen(c.Listen) {
+		return fmt.Errorf("gateway_auth: listen %q is not a loopback address and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable from other hosts, so anyone able to open a TCP connection could spend every key on every enabled route. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or — only behind an authenticating terminator — set gateway_auth.allow_unauthenticated: true", c.Listen)
+	}
+	return nil
+}
+
+// isLoopbackListen reports whether a bind address reaches loopback ONLY.
+//
+// "localhost" is accepted because that is what it resolves to on every platform
+// this ships to. An empty host is NOT: ":14443" and "0.0.0.0:14443" are the
+// same wildcard bind, and the empty spelling is the one that looks harmless.
+// Anything else unparseable — a hostname, an interface name — is treated as
+// non-loopback, because the safe answer to "I could not tell" is the one that
+// asks for a token.
+func isLoopbackListen(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // EnabledRoutes returns only the routes whose feature flag is on.

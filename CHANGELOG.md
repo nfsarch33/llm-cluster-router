@@ -7,6 +7,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+
+- **BREAKING — the reverse-proxy leg now authenticates its callers.** A shared
+  **gateway token**, configured through the same `SecretProvider` seam as every
+  other credential (`gateway_auth.token_env` / `token_file` / `token_ref`) and
+  presented by callers in the **`X-HelixChannel-Token`** header, is compared in
+  constant time before the path is matched and before any key is leased.
+
+  Until now `handleProxy` read no caller credential at all. `authorizeConnect`
+  was called at exactly one site — inside `handleConnect` — so the channel token
+  gated the `CONNECT` tunnel and nothing else. Measured against the running
+  pilot gateway, an anonymous `curl -X POST http://…/minimax/v1/models` with no
+  headers whatever reached MiniMax's production load balancer with the
+  server-held key injected, and the provider's own request-id headers came back
+  in the response. `/healthz` disclosed the route set and the per-route key
+  counts to the same anonymous caller.
+
+  - The gateway token is a **different secret** from `connect.token_*`, and
+    resolving both to the same value is refused at startup. One gates spending
+    every key on every enabled route; the other opens a tunnel bounded by an
+    exact-match host allowlist.
+  - It is **not** the `Authorization` header. Kilo Code's placeholder-bearer
+    contract is unchanged: a placeholder `Authorization` plus a valid
+    `X-HelixChannel-Token` is served, the placeholder is still stripped, and the
+    server-held key is still what reaches the provider. The gateway token itself
+    is stripped before forwarding on **every** mode, `passthrough` included.
+  - **Loopback callers are exempt by default** (`gateway_auth.exempt_loopback`,
+    default `true`), so every existing local client keeps working at cutover.
+    The exemption is decided from the accepted connection's peer address and from
+    no header: a caller cannot claim loopback with `X-Forwarded-For`. Presenting
+    a *wrong* token is refused even from loopback — the exemption waives having
+    to present one, not the check on one that was presented.
+  - **No token configured is still a supported posture, and now says so.** The
+    gateway **refuses to start** with `listen` on anything but a loopback
+    address unless `gateway_auth.allow_unauthenticated: true` is written down
+    (the shape for an authenticating terminator in front). `--listen`
+    re-validates, so the override cannot smuggle a wildcard bind past the check.
+    Both unauthenticated postures print a loud warning at every start.
+  - The posture — `token`, `token_loopback_exempt`, `loopback_only`, `open` — is
+    **derived** from the configuration rather than typed in a fifth place, and is
+    reported on the startup banner (`proxy_auth=…`), in the `--print-routes`
+    envelope, and on `/healthz`.
+  - **`/healthz` liveness stays anonymous and stays `200`** in every posture; the
+    `routes` / `keys` / `connect` inventory is now disclosed only to a caller the
+    proxy leg would serve, gated by the same decision rather than a second rule.
+    The 404 for an unknown prefix lists route names, so it too is now behind the
+    gate.
+  - Refusals answer `401` with
+    `WWW-Authenticate: HelixChannel realm="helixchannel-gateway", header="X-HelixChannel-Token"`
+    and a body naming `gateway_token_required` or `gateway_token_invalid`, and
+    are recorded as `proxy_denied` in the NDJSON audit stream. `401`, not the
+    `CONNECT` leg's `407`: on this leg the gateway is an origin server as far as
+    the client is concerned.
+
+  **Migration.** Non-loopback callers must add one header. Generate a token,
+  distribute it to those clients *first* (nothing rejects it yet), then add the
+  `gateway_auth` block and restart. Operators running a wide bind with no token
+  will find the gateway refuses to start after upgrading — that is the intended
+  failure, and the only moment anyone would have noticed. See
+  `docs/helixchannel.md`, "Authenticating reverse-proxy callers".
+
 - **HelixChannel v18770 — pooled credentials, rotation and one secret seam.**
   Three parallel workstreams (secret provider, pooled auth, rotation) landed as
   a single reconciled design rather than three merges. Highlights:

@@ -77,39 +77,144 @@ If a route's upstream honours an auth header that is not on the list above, add
 it to `callerCredentialHeaders` — that is the seam it exists for — or terminate
 it in front of the gateway.
 
-### The gateway does not authenticate reverse-proxy callers
+### Authenticating reverse-proxy callers
 
 This is the part that decides how you may deploy it, so it is stated before the
 configuration reference rather than in a footnote.
 
-**The reverse-proxy leg authenticates nobody.** `handleProxy` matches a prefix,
-leases a key, applies the gateway's credential and forwards. It reads no caller
-token, and there is no configuration key that makes it read one.
+The reverse-proxy leg takes a **gateway token**: a shared secret presented in the
+`X-HelixChannel-Token` request header and compared in constant time, **before**
+the path is matched and before any key is leased.
 
-The channel token (`connect.token_ref` / `token_env` / `token_file`) is read at
-exactly **one** call site — `authorizeConnect`, inside `handleConnect` — and it
-gates the `CONNECT` tunnel and nothing else. It is not a gateway-wide
-authorisation boundary, and treating it as one is how a gateway ends up on a
-public interface.
+```yaml
+gateway_auth:
+  token_file: /run/secrets/gateway.token   # or token_env: / token_ref:
+  exempt_loopback: true                    # the default
+```
 
-Stated as the code behaves: **anyone who can open a TCP connection to `listen`
-can spend every key on every enabled route.** The deny-set above stops a caller
-billing its *own* account through the gateway; it does nothing to stop an
-unauthenticated caller billing *yours*.
+It is a **different secret from the channel token**, and the split is the point.
+`connect.token_*` is read at exactly one call site — `authorizeConnect`, inside
+`handleConnect` — and gates the `CONNECT` tunnel and nothing else, bounded by an
+exact-match host allowlist. `gateway_auth.token_*` gates the ability to spend
+every key on every enabled route. Pointing both at one source is **refused at
+startup**: a single secret granting both powers grants whichever one the
+operator was not thinking about.
 
-So on the reverse-proxy leg, reachability **is** authorisation:
+It is also **not the `Authorization` header**. Clients of an `inject` route are
+told to configure a placeholder bearer — Kilo Code will not send a request
+without some API key — and the forwarder strips that placeholder before the
+request leaves. Admission must not depend on a value clients were told was
+meaningless. A placeholder `Authorization` **plus** a valid `X-HelixChannel-Token`
+is the supported shape, and the server-held key is still what reaches the
+provider.
 
-- bind `listen` to loopback or to a tailnet address — the configuration example
-  below binds `127.0.0.1` for exactly this reason, not merely because a TLS
-  terminator is expected;
-- if it must be reachable from anywhere wider, put an **authenticating**
-  terminator in front (mTLS, an OIDC-verifying proxy, a signed-header check) and
-  let only that terminator reach the gateway socket;
-- treat a gateway published on a public interface as an open, funded relay to
-  every provider whose key it holds.
+#### Four postures, derived rather than typed
 
-The `CONNECT` leg is the one leg with a caller credential, and its allowlist —
-not the token — is what bounds where a stolen token can go.
+The posture is derived from two facts an operator writes down — is a token
+source named, and is unauthenticated operation explicitly accepted — so the
+posture the gateway *reports* cannot drift from the one it *enforces*. It is
+printed at startup (`proxy_auth=…` on the banner) and served on `/healthz`.
+
+| `proxy_auth` | configuration | reverse-proxy leg |
+| --- | --- | --- |
+| `token_loopback_exempt` | a token source, `exempt_loopback` absent or `true` | token required from every non-loopback caller; loopback served anonymously |
+| `token` | a token source, `exempt_loopback: false` | token required from **every** caller, loopback included |
+| `loopback_only` | no token source | **authenticates nobody**; startup refuses any non-loopback `listen` |
+| `open` | no token source, `allow_unauthenticated: true` | **authenticates nobody**, on any `listen` |
+
+Two rules are worth stating outright because they are not symmetrical:
+
+- The exemption exempts a caller from **having** to present a token. It does not
+  exempt a presented token from being **checked**. A local client configured with
+  a stale token is refused rather than quietly served, so it fails on the bench
+  instead of the day it moves off the box.
+- A gateway token is stripped from the request before it is forwarded, on
+  **every** auth mode including `passthrough`. `passthrough` is exempt from the
+  caller-credential deny-set by design, and without this it would hand the
+  gateway's own admission credential to the provider.
+
+#### The loopback exemption cannot be claimed
+
+The exemption reads `RemoteAddr` — the peer of the accepted TCP connection — and
+**nothing else**. `X-Forwarded-For`, `X-Real-IP` and `Forwarded` are
+caller-supplied strings; honouring any of them would let a remote caller type
+`127.0.0.1` into a header and become local. There is no configuration switch to
+make it trust one. Anything unparseable (a UNIX peer, an empty `RemoteAddr`) is
+**not** loopback: the safe answer is the one that asks for a token.
+
+If the gateway genuinely runs behind a proxy on the same host and you want that
+proxy's callers authenticated, set `exempt_loopback: false` and give the
+terminator a token. Do not reach for a forwarded-header rule; there isn't one.
+
+#### If no token is configured
+
+Nothing is authenticated, exactly as before this existed — and the gateway
+**refuses to start** unless `listen` is a loopback address. `listen: "0.0.0.0:…"`
+or `":14443"` with no `gateway_auth` block is a startup error, not a warning:
+that combination was a funded, unauthenticated relay to every provider whose key
+the process holds, and it looked identical to a correct config. `--listen`
+re-validates, so the override cannot smuggle a wildcard bind past the check.
+
+The one legitimate wide-bind-without-a-token shape is an **authenticating**
+terminator (mTLS, an OIDC-verifying proxy, a signed-header check) that is the
+sole reachable path to the socket. That is what `allow_unauthenticated: true` is
+for. It is refused together with a token source, and it prints a loud warning at
+every start. Writing it down is the whole of the difference between that
+deployment and the accident it is otherwise indistinguishable from.
+
+Note what the bind address does **not** cover: a container that binds loopback
+inside its own netns and is published with `-p 0.0.0.0:14443:…` is reachable from
+the network while `listen` still reads `127.0.0.1`, and its callers arrive from
+the bridge address, not from loopback. Under `loopback_only` they are served. A
+token is the only thing that closes that, and it is the reason the shipped
+example config configures one.
+
+#### `/healthz`
+
+Liveness stays anonymous and stays `200` in every posture — a probe that answers
+`401` is a probe an orchestrator reads as *down*. The **inventory** does not:
+`routes`, `keys` and `connect` are disclosed only to a caller that
+`authorizeProxy` would let through, which is the same decision that gates the
+proxy leg rather than a second rule with its own edge cases. Under `token` and
+`token_loopback_exempt` an unauthenticated stranger sees only:
+
+```json
+{"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt"}
+```
+
+The route table, each route's auth mode, and a live count of how many plans are
+still selectable are reconnaissance, and the per-route counts are an oracle for
+correlating which account served which request. Under `loopback_only` and `open`
+the inventory is served to everyone, because in those postures so is the traffic.
+
+The 404 for an unknown prefix lists the enabled route names, so it is behind the
+same gate: an unauthenticated caller is refused before the path is matched.
+
+#### Migrating
+
+**This is a breaking change for non-loopback callers.** Any client reaching the
+gateway from another host must add one header:
+
+```bash
+curl -H "X-HelixChannel-Token: $(cat /run/secrets/gateway.token)" \
+     https://gateway.example.com/minimax/v1/models
+```
+
+The order that does not drop traffic:
+
+1. Generate a token (`openssl rand -hex 32`) and place it where the gateway can
+   read it — a root-owned file, an env var, or a vault item named by `token_ref`.
+2. Distribute it to every non-loopback client **first**. Nothing rejects it yet.
+3. Add the `gateway_auth` block and restart. Loopback clients are unaffected;
+   the startup banner now reads `proxy_auth=token_loopback_exempt`.
+4. Optionally tighten to `exempt_loopback: false` once local clients carry it too.
+
+Operators who were relying on a wide bind with no token will find the gateway
+**refuses to start** after upgrading. That is the intended failure: it is the
+only moment anyone would have noticed.
+
+The `CONNECT` leg is unchanged by all of this. Its allowlist — not its token —
+is still what bounds where a stolen channel token can go.
 
 ### Redirects are never followed
 
@@ -230,9 +335,14 @@ single-key route.
 ## Configuration
 
 ```yaml
-listen: "127.0.0.1:14445"    # bind loopback when a TLS terminator fronts it
+listen: "127.0.0.1:14445"    # a non-loopback bind REQUIRES gateway_auth below
 timeout: 90s
 audit_log: /var/log/helixchannel/gateway.ndjson   # empty = stdout
+
+gateway_auth:               # caller auth for the reverse-proxy leg
+  token_file: /run/secrets/gateway.token          # or token_env: / token_ref:
+  exempt_loopback: true     # default; peer address only, never a header
+  # allow_unauthenticated: true   # only behind an authenticating terminator
 
 routes:
   - name: minimax
@@ -265,7 +375,7 @@ Adding a provider is one entry. Turning it on is one boolean. Nothing is compile
 
 `enabled: false` routes are not registered at all — requests to their prefix return 404, and `/healthz` lists only what is actually being served.
 
-`/healthz` also reports `keys`: per enabled route, the auth mode, whether the route is pooled, how many server-held credentials back it and how many are selectable right now. It is **counts only** — never a key, prefix, suffix, length or fingerprint, because any per-key hint on an unauthenticated endpoint is an oracle for correlating which account served which request.
+`/healthz` also reports `keys`: per enabled route, the auth mode, whether the route is pooled, how many server-held credentials back it and how many are selectable right now. It is **counts only** — never a key, prefix, suffix, length or fingerprint, because any per-key hint is an oracle for correlating which account served which request. Once a gateway token is configured that inventory is disclosed only to callers the proxy leg would serve; liveness stays anonymous. See [Authenticating reverse-proxy callers](#authenticating-reverse-proxy-callers).
 
 Reporting the mode alongside the count is the point. A bare number cannot tell `"this route holds no credential by design"` (a `passthrough` route, where the caller holds it) from `"this route holds no credential by accident"` — both render as `0`. `degraded: true` means a pool whose every key is currently retired or drained, which is a page; `keys: 0, pooled: false` on a passthrough route is not.
 
@@ -315,21 +425,39 @@ The CONNECT leg cannot be relayed by an ordinary HTTP reverse proxy. Give it its
 ## Verifying
 
 ```bash
-# Live route set — reflects the enabled flags, not a hardcoded string
+# Anonymous liveness — 200 in every posture, and it names the posture
 curl -s https://gateway.example.com/healthz
-# {"status":"ok","service":"helixchannel-gateway","routes":["minimax","qwen"],
+# {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt"}
+
+# The inventory needs the gateway token (or a loopback peer, when exempt).
+# It reflects the enabled flags, not a hardcoded string.
+GW=$(cat /run/secrets/gateway.token)
+curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/healthz
+# {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt",
+#  "routes":["minimax","qwen"],
 #  "keys":{"minimax":{"mode":"inject","pooled":false,"keys":1,"available":1,"degraded":false},
 #          "qwen":{"mode":"inject","pooled":true,"keys":3,"available":2,"degraded":false}},
 #  "connect":true}
 
-# A route end-to-end. No client credential is needed or wanted: the gateway
+# Anonymous from a non-loopback peer: refused before the route is matched.
+curl -si https://gateway.example.com/minimax/v1/models | head -3
+# HTTP/1.1 401 Unauthorized
+# WWW-Authenticate: HelixChannel realm="helixchannel-gateway", header="X-HelixChannel-Token"
+# {"error":"gateway_token_required",...}
+
+# A route end-to-end. No PROVIDER credential is needed or wanted: the gateway
 # supplies its own. On inject and header modes — single-key and pooled alike —
 # an inbound Authorization, Proxy-Authorization, X-Api-Key, Api-Key,
 # X-Goog-Api-Key or Cookie is DROPPED before the request is forwarded, so a
 # placeholder a client insists on sending never leaves the gateway. Only
-# passthrough forwards it.
-curl -s https://gateway.example.com/minimax/v1/models
+# passthrough forwards it. The gateway token rides in its own header and is
+# stripped on every mode.
+curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/minimax/v1/models
+
+# The Kilo Code shape: a placeholder bearer AND the gateway token. The
+# placeholder is stripped, the server key reaches MiniMax, the request is served.
 curl -s https://gateway.example.com/minimax/v1/models \
+  -H "X-HelixChannel-Token: $GW" \
   -H "Authorization: Bearer placeholder-is-stripped-not-forwarded"
 
 # The CONNECT leg, and that the certificate is the provider's
@@ -386,7 +514,7 @@ correct and unchanged lines stay unchanged.
 
 ## Threat model
 
-**Protects against:** an upstream exfiltrating the gateway's own credential by answering `3xx` — no redirect is followed on any mode, so no header is ever replayed to a host the route did not name (see [Redirects are never followed](#redirects-are-never-followed)); provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account through one of the **named** headers on the deny-set — `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Cookie`, plus whatever the route names in `key_header` — on an `inject` or `header` route.
+**Protects against:** an unauthenticated caller spending the gateway's keys, once `gateway_auth` is configured — the reverse-proxy leg refuses before the route is matched, the compare is constant-time, and the loopback exemption is decided from the TCP peer address alone so no header can claim it (see [Authenticating reverse-proxy callers](#authenticating-reverse-proxy-callers)); an upstream exfiltrating the gateway's own credential by answering `3xx` — no redirect is followed on any mode, so no header is ever replayed to a host the route did not name (see [Redirects are never followed](#redirects-are-never-followed)); provider keys spreading across client machines; credential theft from a laptop; passive observation or tampering on the path between agent and provider; a caller reaching the upstream as a different account through one of the **named** headers on the deny-set — `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Cookie`, plus whatever the route names in `key_header` — on an `inject` or `header` route.
 
 That last one is a **blocklist**, and its scope is exactly the eight names in `callerCredentialHeaders` plus the route's own `key_header`. It is not "a caller cannot reach the upstream as another account"; it is "a caller cannot reach the upstream as another account *through one of these headers*". A provider that also honours a credential in a header nobody has listed yet still receives it. That is a property of the construction, not a gap waiting to be closed by one more name: forwarding is the default and the list is the exception to it, so only an allow-list could make the stronger promise, and an allow-list on a transparent reverse proxy breaks every client that sends a header the gateway has not heard of.
 
@@ -394,7 +522,8 @@ Two of the eight are not credentials at all. `OpenAI-Organization` and `OpenAI-P
 
 **Does not protect against:**
 
-- **An unauthenticated caller on the reverse-proxy leg.** There is no caller authentication there to defeat: reaching the socket is sufficient to spend every key on every enabled route. See [The gateway does not authenticate reverse-proxy callers](#the-gateway-does-not-authenticate-reverse-proxy-callers). This is the single most important line in this section.
+- **An unauthenticated caller on the reverse-proxy leg when no `gateway_auth` token is configured** — `proxy_auth: loopback_only` or `open`. In those postures reaching the socket is still sufficient to spend every key on every enabled route; `loopback_only` cannot bind a non-loopback address, and `open` is the operator's written-down acceptance that something in front is doing the authenticating. A container that binds loopback and is published with `-p` is reachable from the network in `loopback_only`, and its callers are not loopback peers. Configure a token. See [Authenticating reverse-proxy callers](#authenticating-reverse-proxy-callers).
+- **A stolen gateway token**, which is a bearer secret with no allowlist behind it: unlike the `CONNECT` token, whose blast radius is bounded by `allowed_hosts`, a gateway token holder can reach every enabled route. Rotate it by changing the source and restarting; there is deliberately no second, overlapping token to make that a zero-downtime operation.
 - A compromised gateway host — it holds the keys.
 - A client with a valid channel token on the `CONNECT` leg, within its allowlisted scope. The allowlist is what bounds a stolen token, which is why it is required and why it should stay short.
 - A caller presenting a credential in some **other** header that the upstream also accepts and that is not on the blocklist, since every remaining non-hop-by-hop header is forwarded (see [What "stripped" does and does not buy you](#what-stripped-does-and-does-not-buy-you)).

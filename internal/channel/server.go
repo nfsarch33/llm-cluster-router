@@ -153,6 +153,13 @@ type Server struct {
 	connToken string
 	allowed   map[string]bool
 	httpSrv   *http.Server
+
+	// proxyAuth and proxyToken gate the REVERSE-PROXY leg. They are a
+	// different credential from connToken above, which gates the CONNECT leg
+	// and nothing else; both are written exactly once, by NewServer, and only
+	// read thereafter.
+	proxyAuth  ProxyAuthMode
+	proxyToken string
 }
 
 // serverOptions are the injectable construction dependencies.
@@ -256,6 +263,38 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) 
 			s.allowed[strings.ToLower(h)] = true
 		}
 	}
+
+	// The gateway token resolves through the SAME SecretProvider as every route
+	// credential and the CONNECT token, so an operator names it the same way
+	// and a vault item shared with a route is fetched once. Eagerly, like the
+	// rest: a gateway that cannot read its own admission credential must fail
+	// at startup rather than answer 401 to every caller once traffic arrives.
+	s.proxyAuth = cfg.GatewayAuth.Mode()
+	if cfg.GatewayAuth.hasToken() {
+		tok, err := resolveFirst(sp, secretRefs(cfg.GatewayAuth.TokenRef, cfg.GatewayAuth.TokenEnv, cfg.GatewayAuth.TokenFile))
+		if err != nil {
+			return nil, fmt.Errorf("gateway_auth: %w", err)
+		}
+		// Unconditional, and stated plainly because the whitespace-credential
+		// class has now cost this codebase twice: a token mode whose token is
+		// blank would reach ConstantTimeCompare("", "") == 1 and authorise an
+		// empty header. resolveFirst already refuses a blank, so this is a
+		// second refusal of the same fact rather than an independent property —
+		// but the failure it prevents is an unauthenticated funded relay, and
+		// the cost is one comparison.
+		if tok = strings.TrimSpace(tok); tok == "" {
+			return nil, fmt.Errorf("gateway_auth: %w", ErrSecretEmpty)
+		}
+		// The two tokens must be DIFFERENT secrets. Pointing both at one source
+		// is the exact overload the split exists to prevent: it would silently
+		// grant every holder of a tunnel credential the ability to spend every
+		// key on every route, and vice versa. Refusing at startup is the only
+		// moment anyone would notice.
+		if s.connToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(s.connToken)) == 1 {
+			return nil, fmt.Errorf("gateway_auth: the gateway token and the connect token resolve to the same secret; they gate different powers (spending every route key vs opening an allowlisted tunnel) and must be distinct")
+		}
+		s.proxyToken = tok
+	}
 	return s, nil
 }
 
@@ -296,6 +335,11 @@ func (s *Server) RouteNames() []string {
 	}
 	return out
 }
+
+// ProxyAuthMode reports the caller-authentication posture of the reverse-proxy
+// leg, so the startup banner and /healthz state the same fact the request path
+// enforces instead of each restating the configuration for itself.
+func (s *Server) ProxyAuthMode() ProxyAuthMode { return s.proxyAuth }
 
 // KeyInventory reports, per enabled route, how many server-held credentials
 // back it and how many are selectable right now. See the KeyInventory type for
@@ -345,21 +389,56 @@ func (s *Server) Handler() http.Handler {
 // key inventory extends the same argument to credentials: a route with every
 // key drained is serving 503s, and a health endpoint that cannot say so is
 // answering from a literal again.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+// The inventory half is gated by EXACTLY the decision that gates the proxy leg
+// itself, not by a second rule of its own. A caller that may spend every key on
+// the route learns nothing new from being told how many there are; a caller that
+// may not should not be handed the route table, the auth mode of each route and
+// a live per-route count of how many plans are still selectable, which together
+// are a reconnaissance surface and an oracle for correlating which account
+// served which request.
+//
+// Liveness stays anonymous and stays 200 in every mode. A probe that answers 401
+// is a probe an orchestrator reads as "down", which would turn this change into
+// an outage on every deployment with a health check in front of it — and the
+// status field is the one part of this response that was never sensitive.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	body := map[string]any{
+		"status":     "ok",
+		"service":    "helixchannel-gateway",
+		"proxy_auth": string(s.proxyAuth),
+	}
+	if s.authorizeProxy(r) == proxyAuthOK {
+		body["routes"] = s.RouteNames()
+		body["keys"] = s.KeyInventory()
+		body["connect"] = s.cfg.Connect.Enabled
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  "ok",
-		"service": "helixchannel-gateway",
-		"routes":  s.RouteNames(),
-		"keys":    s.KeyInventory(),
-		"connect": s.cfg.Connect.Enabled,
-	})
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	requestID := uuid.NewString()
+
+	// Caller authentication is the FIRST thing that happens: before the route
+	// match, before any lease, before any upstream contact. Until this existed,
+	// an anonymous POST to an enabled prefix reached the provider with the
+	// server-held key injected, and the only thing standing between a listening
+	// socket and a funded relay was where that socket was bound.
+	//
+	// It also runs before s.match because writeNotFound's 404 body lists every
+	// enabled route name: matching first would disclose the route table to a
+	// caller not allowed to use any of it.
+	if refusal := s.authorizeProxy(r); refusal != proxyAuthOK {
+		s.denyUnauthenticated(w, r, requestID, start, refusal)
+		return
+	}
+	// The gateway token authenticates THIS hop and has no meaning upstream, so
+	// it is removed on every mode — including passthrough, which is exempt from
+	// the forwarder's caller-credential strip by design and would otherwise
+	// hand the gateway's own admission credential to the provider.
+	r.Header.Del(GatewayTokenHeader)
 
 	rt := s.match(r.URL.Path)
 	if rt == nil {

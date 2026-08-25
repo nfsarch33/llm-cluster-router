@@ -17,6 +17,35 @@ listen: "0.0.0.0:14443"   # bind loopback instead when a TLS terminator runs on 
 timeout: 90s
 audit_log: ""             # empty = stdout (captured by the container/journal)
 
+# Caller authentication for the REVERSE-PROXY leg (every route below).
+#
+# Callers present it in the X-HelixChannel-Token header. It is NOT the
+# Authorization header, so a client configured with the placeholder bearer that
+# Kilo Code insists on keeps working unchanged, and the placeholder is still
+# stripped before the request leaves.
+#
+# It is a SEPARATE secret from connect.token_* at the bottom of this file: that
+# one opens an allowlisted byte tunnel, this one authorises spending every key on
+# every enabled route. Pointing both at one source is refused at startup.
+#
+# A caller whose TCP peer is 127.0.0.0/8 or ::1 is served without it, so local
+# clients keep working at cutover. That decision reads the accepted connection's
+# peer address and NO header — X-Forwarded-For cannot claim it. Set
+# exempt_loopback: false to require the token from local callers too.
+#
+# Deleting this block leaves the reverse-proxy leg authenticating NOBODY, and the
+# gateway then REFUSES TO START on the non-loopback `listen` above. That is not a
+# formality: without it, anyone able to open a TCP connection to this socket can
+# spend every key on every enabled route.
+gateway_auth:
+  token_file: /run/secrets/gateway.token
+  # token_ref: op://Infra/helixchannel/gateway-token   # takes precedence
+  # token_env: HELIXCHANNEL_GATEWAY_TOKEN
+  exempt_loopback: true
+  # allow_unauthenticated: true   # ONLY behind an authenticating terminator
+  #   (mTLS, an OIDC proxy) that is the sole reachable path to this socket. It
+  #   waives the loopback-bind rule and is refused together with a token source.
+
 routes:
   # MiniMax — the pilot upstream. Clients send a placeholder bearer; the
   # gateway swaps in the real key, so the key never leaves the server.
