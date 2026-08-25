@@ -474,15 +474,23 @@ func fuzzReportedTokens(literal string) (int64, bool) {
 	if _, err := dec.Token(); err != io.EOF {
 		return 0, false
 	}
+	// An integer literal is read as an INTEGER. Going through float64 loses
+	// precision above 2^53 and rounds UP, which made the oracle itself claim an
+	// under-charge on "72100000000001020" -- the extractor charged exactly what
+	// was reported and float64 said the report had been 72100000000001024.
+	if iv, err := n.Int64(); err == nil {
+		return iv, true
+	}
 	fv, err := n.Float64()
 	if err != nil || math.IsNaN(fv) || math.IsInf(fv, 0) {
 		return 0, false
 	}
-	fv = math.Ceil(fv)
-	if fv > math.MaxInt64 || fv < math.MinInt64 {
+	// Outside the exactly-representable range there is no reliable comparison to
+	// make, so the oracle declines rather than guessing.
+	if math.Abs(fv) >= 1<<53 {
 		return 0, false
 	}
-	return int64(fv), true
+	return int64(math.Ceil(fv)), true
 }
 
 // FuzzUsageExtraction feeds arbitrary bytes, and arbitrary token literals, to
@@ -509,6 +517,7 @@ func FuzzUsageExtraction(f *testing.F) {
 	f.Add("0.9", uint8(0), []byte(nil))                       // rounds up to 1, must not charge 0
 	f.Add("00012", uint8(0), []byte(nil))                     // leading zeros
 	f.Add("9223372036854775808", uint8(0), []byte(nil))       // one past MaxInt64
+	f.Add("72100000000001020", uint8(0), []byte(nil))         // past 2^53: exact, but not in a float64
 	f.Add("1_000", uint8(0), []byte(nil))                     // underscore separator
 	f.Add("\"12\"", uint8(0), []byte(nil))                    // quoted number
 	f.Add("12", uint8(0), []byte(`{"total_tokens":1}`))       // an earlier marker in the body
@@ -646,6 +655,7 @@ func FuzzCredentialHeaderStrip(f *testing.F) {
 	f.Add("X-Forwarded-For", "203.0.113.9", uint8(0))                  // an ordinary header must survive
 	f.Add("", "", uint8(0))
 	f.Add("Authorization ", "Bearer caller", uint8(0)) // trailing space: not a legal name
+	f.Add("Authorization", " ", uint8(3))              // an all-whitespace value is "" on the wire
 
 	f.Fuzz(func(t *testing.T, name, value string, sel uint8) {
 		p := postures[int(sel)%len(postures)]
@@ -679,6 +689,14 @@ func FuzzCredentialHeaderStrip(f *testing.F) {
 			t.Errorf("posture %s: Proxy-Authorization reached the upstream as %q: it is hop-by-hop and authenticates the caller to the GATEWAY, never the gateway to the provider", p.name, vs)
 		}
 
+		// Comparisons are made on the TRIMMED value, because RFC 9110 field
+		// values carry no leading or trailing whitespace: net/http strips it on
+		// the way out and again on the way in, so " sk-caller " is received as
+		// "sk-caller". Trimming both sides keeps the strip assertion strictly
+		// stronger (a value that survives in any spelling is caught) and keeps
+		// the passthrough assertion from blaming the gateway for the wire.
+		wantValue := strings.TrimSpace(value)
+
 		if p.strips {
 			denied := p.keyHeader != "" && strings.EqualFold(name, p.keyHeader)
 			for _, d := range fuzzDeniedHeaders {
@@ -687,13 +705,13 @@ func FuzzCredentialHeaderStrip(f *testing.F) {
 					break
 				}
 			}
-			if denied {
+			if denied && wantValue != "" {
 				canon := http.CanonicalHeaderKey(name)
 				for _, v := range got.Values(canon) {
-					if v != value {
+					if strings.TrimSpace(v) != wantValue {
 						continue
 					}
-					if canon == p.wantHeader && value == p.wantValue {
+					if canon == p.wantHeader && wantValue == p.wantValue {
 						// Indistinguishable from the gateway's own credential.
 						continue
 					}
@@ -708,12 +726,12 @@ func FuzzCredentialHeaderStrip(f *testing.F) {
 		}
 
 		// Passthrough: the exemption is the point of the mode, so assert it is
-		// still there. Empty values are excluded because whether an empty header
-		// survives a round trip is a net/http question, not a gateway one.
-		if strings.EqualFold(name, "Authorization") && value != "" {
+		// still there. A value that is empty once trimmed carries no credential
+		// and cannot be traced through the wire, so it is excluded.
+		if strings.EqualFold(name, "Authorization") && wantValue != "" {
 			found := false
 			for _, v := range got.Values("Authorization") {
-				if v == value {
+				if strings.TrimSpace(v) == wantValue {
 					found = true
 					break
 				}
