@@ -488,8 +488,14 @@ func TestConfigValidate_RefusesAWideBindWithNoGatewayToken(t *testing.T) {
 		// address would silently waive this very rule.
 		{"localhost, no token", "localhost:14443", GatewayAuthConfig{}, true},
 		{"localhost with a token", "localhost:14443", GatewayAuthConfig{TokenEnv: "GW"}, false},
-		{"loopback in an inet_aton spelling, no token", "127.1:14443", GatewayAuthConfig{}, false},
-		{"loopback in hex, no token", "0x7f000001:14443", GatewayAuthConfig{}, false},
+		// Nor is an inet_aton spelling. net.Listen does not parse
+		// "127.1" or "0x7f000001" as literals either; it hands them to
+		// the platform resolver, so what gets bound is a hosts-file or
+		// DNS answer. Trusting one was measured binding 10.255.255.254
+		// while the predicate said loopback.
+		{"loopback in an inet_aton spelling, no token", "127.1:14443", GatewayAuthConfig{}, true},
+		{"loopback in hex, no token", "0x7f000001:14443", GatewayAuthConfig{}, true},
+		{"loopback in hex with a token", "0x7f000001:14443", GatewayAuthConfig{TokenEnv: "GW"}, false},
 		{"wildcard with a token", "0.0.0.0:14443", GatewayAuthConfig{TokenFile: "/run/secrets/gw"}, false},
 		{"wildcard with token_env", "0.0.0.0:14443", GatewayAuthConfig{TokenEnv: "GW"}, false},
 		{"wildcard with token_ref", "0.0.0.0:14443", GatewayAuthConfig{TokenRef: gwAuthTokenRef}, false},

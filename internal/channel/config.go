@@ -647,7 +647,7 @@ func (c *Config) validateGatewayAuth() error {
 	}
 	if !g.AllowUnauthenticated && !isLoopbackListen(c.Listen) {
 		msg := fmt.Sprintf("gateway_auth: listen %q is not a loopback address and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable from other hosts, so anyone able to open a TCP connection could spend every key on every enabled route. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or — only behind an authenticating terminator — set gateway_auth.allow_unauthenticated: true", c.Listen)
-		if hint := loopbackNameHint(c.Listen); hint != "" {
+		if hint := loopbackListenHint(c.Listen); hint != "" {
 			msg += ". " + hint
 		}
 		return errors.New(msg)

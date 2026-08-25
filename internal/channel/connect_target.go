@@ -53,11 +53,7 @@ var reservedLoopbackNames = map[string]bool{
 // parseIPv4Numeric settles the inet_aton spellings ParseIP refuses. The NAME
 // forms are the blocklist described above.
 func localTargetKind(host string) string {
-	h := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
-	// A zone ("::1%lo") is not part of the address; ParseIP rejects it.
-	if i := strings.IndexByte(h, '%'); i >= 0 {
-		h = h[:i]
-	}
+	h := bareHost(host)
 	if h == "" {
 		// net.Dial with an empty host dials the local system. ":443" is the
 		// spelling of that which looks like a typo rather than a target.
@@ -183,12 +179,22 @@ func sameHost(a, b string) bool {
 	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
 }
 
-// hostIP parses a host string as an address in any spelling this file decides.
-func hostIP(host string) (net.IP, bool) {
+// bareHost strips the brackets an IPv6 host wears inside an address string and
+// any zone suffix, leaving the part net.ParseIP can read. A zone ("::1%lo") is
+// not part of the address and ParseIP rejects it, but net.Listen and net.Dial
+// both split it off and parse the rest as a literal, so dropping it here keeps
+// this file's answer and the OS's answer aligned.
+func bareHost(host string) string {
 	h := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	if i := strings.IndexByte(h, '%'); i >= 0 {
 		h = h[:i]
 	}
+	return h
+}
+
+// hostIP parses a host string as an address in any spelling this file decides.
+func hostIP(host string) (net.IP, bool) {
+	h := bareHost(host)
 	if ip := net.ParseIP(h); ip != nil {
 		return ip, true
 	}
@@ -197,58 +203,100 @@ func hostIP(host string) (net.IP, bool) {
 
 // isLoopbackListen reports whether a bind address reaches loopback ONLY.
 //
-// It is the third caller of this file's one decision procedure and takes the
-// SAME parse as localTargetKind and sameHost, so "127.0.0.1", "127.1",
-// "0x7f000001", "2130706433", "::1" and "::ffff:127.0.0.1" get one answer
-// everywhere: the config-time validator, the dial-time guard and this predicate
-// cannot disagree about what loopback means.
+// It deliberately does NOT share this file's CONNECT-target procedure, and the
+// asymmetry is the point rather than an oversight. Both questions say
+// "loopback"; they are not the same question:
 //
-// They used to. This predicate was net.ParseIP alone, which rejects every
-// inet_aton spelling, so a genuine loopback-only deployment that wrote
-// "listen: 127.1:14443" had its own loopback allowed_hosts entries refused at
-// startup — an availability bug on the one path (fresh-host bring-up) where an
-// inexplicable refusal costs the most.
+//   - As a CONNECT TARGET, loopback-ness is decided by OUR code and nothing
+//     else, and answering yes REFUSES the entry. A generous reading therefore
+//     fails CLOSED, which is exactly why localTargetKind implements inet_aton's
+//     whole grammar and keeps a blocklist of reserved names.
+//   - As the LISTEN address, the OS resolver decides what actually gets bound.
+//     Our parse is only a PREDICTION, and answering yes RELAXES three separate
+//     things: it waives the gateway-token requirement, it permits loopback
+//     allowed_hosts entries, and it disarms connectDialRefusal. A generous
+//     reading therefore fails OPEN.
 //
-// NAMES are deliberately NOT accepted here, "localhost" included, and this is
-// the one place a caller reads the shared procedure's answer differently from
-// connectSelfReference. The two face opposite directions:
+// So this predicate trusts only what it can decide soundly on its own: an
+// address LITERAL as net.ParseIP reads it, zone stripped. Everything a resolver
+// would get a say in is non-loopback here and needs a token.
 //
-//   - As a CONNECT TARGET, a reserved loopback name makes the entry REFUSED.
-//     Trusting the spelling fails closed, so the blocklist is worth having.
-//   - As the LISTEN address, loopback-ness is what RELAXES things. It waives
-//     the gateway-token requirement, it permits loopback allowed_hosts entries,
-//     and it disarms connectDialRefusal outright. Every use of this predicate
-//     relaxes something when it returns true, so trusting the spelling fails
-//     OPEN: a host whose /etc/hosts pointed localhost at a routable address
-//     would silently switch all three off, and nothing in the config text would
-//     say so.
+// Two classes are excluded on purpose, and each was accepted here at some point:
 //
-// The safe answer to "I cannot tell without a resolver" is therefore false —
-// the answer that asks for a token. Resolving the name here is not the way out:
-// a validator that consults a resolver makes startup depend on whoever answers
-// it, and lets a poisoned answer decide the gateway's posture.
+//   - NAMES, "localhost" included. A name is decidable only by resolving it,
+//     and a validator that consults a resolver makes startup depend on whoever
+//     answers it. A host whose /etc/hosts pointed localhost at a routable
+//     address would otherwise switch all three relaxations off silently.
+//   - inet_aton NUMERIC spellings: "127.1", "127.0.1", "2130706433",
+//     "0x7f000001", "0177.0.0.1". These read as 127.0.0.1 to a C resolver, so
+//     localTargetKind must recognise them as targets — but net.Listen does not
+//     parse them as literals either. It hands them to the platform resolver,
+//     hosts file and DNS included, so what gets bound is a resolver's answer.
+//     Trusting them was measured binding 10.255.255.254 while this function
+//     said loopback: tokenless startup accepted, an anonymous caller served
+//     200, the upstream key spent.
 //
-// The cost is a behaviour change: "listen: localhost:14443" is now a
-// non-loopback bind, so it needs a gateway_auth token or the address spelling
-// "127.0.0.1:14443". loopbackNameHint makes every refusal that causes say so.
+// Recognising the numeric forms here also bought nothing in a shipped artifact.
+// Every container build sets CGO_ENABLED=0, and the pure-Go resolver never reads
+// an inet_aton spelling as an ADDRESS — it looks the string up as a NAME. All six
+// were measured failing to bind at all on a host with no such entry ("listen tcp:
+// lookup 127.1: no such host"; 0x7f000001 went as far as DNS). So the generous
+// parse rescued no real loopback deployment; it replaced a legible config-time
+// refusal with an obscure runtime failure, and on a host that DOES answer for the
+// string it handed the socket — and all three relaxations — to whoever answered.
+//
+// The cost is that "listen: localhost:14443" and "listen: 127.1:14443" need a
+// gateway_auth token or the literal spelling. loopbackListenHint makes every
+// refusal that causes say which word to change.
 func isLoopbackListen(addr string) bool {
 	host, _ := splitHostPortLenient(addr)
-	ip, ok := hostIP(host)
-	return ok && ip.IsLoopback()
+	ip := net.ParseIP(bareHost(host))
+	return ip != nil && ip.IsLoopback()
 }
 
-// loopbackNameHint returns the sentence that turns a refusal caused by a
-// name-spelled loopback bind into something an operator can act on, or "" when
-// the bind is not that. It carries no leading or trailing punctuation: callers
-// join it. A startup refusal on a fresh host is only useful if the message
-// names the word to change.
+// loopbackListenHint returns the sentence that turns a refusal caused by a bind
+// this package cannot decide soundly into something an operator can act on, or
+// "" when the refusal is not about a spelling. It carries no leading or
+// trailing punctuation: callers join it. A startup refusal on a fresh host is
+// only useful if the message names the word to change.
+func loopbackListenHint(listen string) string {
+	if hint := loopbackNameHint(listen); hint != "" {
+		return hint
+	}
+	return loopbackNumericHint(listen)
+}
+
+// loopbackNameHint covers a bind that NAMES loopback: "localhost" and the rest
+// of the reserved blocklist.
 func loopbackNameHint(listen string) string {
 	host, _ := splitHostPortLenient(listen)
-	if _, ok := hostIP(host); ok || !isReservedLoopbackName(host) {
+	if !isReservedLoopbackName(host) {
 		return ""
 	}
 	return "listen " + strconv.Quote(listen) +
 		" NAMES loopback but does not spell it, and a host name is not accepted as proof of a loopback-only bind: deciding one would mean resolving it at startup, which lets whoever answers the resolver choose this gateway's security posture. Write the address instead — 127.0.0.1 or [::1] — if the bind really is loopback-only"
+}
+
+// loopbackNumericHint covers a bind written in one of inet_aton's numeric
+// spellings of a loopback address.
+//
+// It is a separate sentence because the operator's mistake is a different one:
+// they did write an address, and it does mean 127.0.0.1 to a C resolver. What
+// they may not know is that Go will not parse it as a literal, so net.Listen
+// treats it exactly as it treats a name — which is why this package cannot
+// treat it as proof of anything.
+func loopbackNumericHint(listen string) string {
+	host, _ := splitHostPortLenient(listen)
+	h := bareHost(host)
+	if net.ParseIP(h) != nil {
+		return ""
+	}
+	ip, ok := parseIPv4Numeric(h)
+	if !ok || !ip.IsLoopback() {
+		return ""
+	}
+	return "listen " + strconv.Quote(listen) + " is an inet_aton spelling of " + ip.String() +
+		", which Go does not parse as an address literal: net.Listen hands it to the platform resolver — hosts file and DNS included — so what this bind actually opens is a resolver's answer rather than anything decidable from the config text, and it is refused as proof of a loopback-only bind for the same reason a name is. Write the address in full — 127.0.0.1 — if the bind really is loopback-only. (A CGO_ENABLED=0 build, which is every container image here, does not read this as an address at all — it looks the string up as a name — so this spelling would fail to bind rather than reach loopback.)"
 }
 
 // splitHostPortLenient splits "host:port", tolerating the empty host that
@@ -299,7 +347,7 @@ func connectSelfReference(host, port, listen string) string {
 		}
 		why := "names " + kind + ", and listen " + strconv.Quote(listen) +
 			" is not loopback-only, so the gateway would dial itself: the tunnelled request arrives on the loopback interface and is served as a LOCAL caller, handing a remote holder of the connect token the gateway_auth loopback exemption"
-		if hint := loopbackNameHint(listen); hint != "" {
+		if hint := loopbackListenHint(listen); hint != "" {
 			why += ". " + hint
 		}
 		return why
@@ -362,9 +410,5 @@ func addrIP(a net.Addr) net.IP {
 		return t.IP
 	}
 	host, _ := splitHostPortLenient(a.String())
-	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
-	if i := strings.IndexByte(host, '%'); i >= 0 {
-		host = host[:i]
-	}
-	return net.ParseIP(host)
+	return net.ParseIP(bareHost(host))
 }
