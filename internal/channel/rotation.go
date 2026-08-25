@@ -24,6 +24,15 @@ type KeyState struct {
 	InFlight int64
 	// Errors is the number of leases settled as failures this window.
 	Errors int64
+	// Reclaimed is how many reservations on this key were never settled and had
+	// their in-flight slot taken back after the store's lease timeout.
+	//
+	// It is a LIFETIME count, not a per-window one like every other counter
+	// here, and that is deliberate: it is the only evidence that some caller is
+	// leaking leases, and a leak whose evidence resets every window is a leak
+	// nobody finds. Non-zero means a bug in a caller of RotationStore.Next, not
+	// a condition of the upstream.
+	Reclaimed int64
 	// Estimated is true when at least one sample this window carried no
 	// upstream token count and was charged Budget.EstimateTokens instead.
 	// Cross-key token comparisons are untrustworthy when it is set.

@@ -444,13 +444,36 @@ any of them settles, so a per-window plan is overspendable by the concurrency
 factor. Sequential traffic is exact either way, which is why this only ever bites
 in production.
 
-The request cap is therefore **exact**: the number of requests admitted in a
-window can never exceed `requests`. The token cap is a **bound on the estimate**:
-before a response exists, `estimate_tokens` is the only figure available to
-project an outstanding lease by, so a response reporting more than the estimate
-can still overshoot at settlement, where the hard cap catches it as before.
-Admission enforces the hard cap only — the soft cap remains the planned early
-exit that decides when a key leaves rotation under normal traffic.
+The request cap is therefore **exact** for every lease that settles: the number
+of requests admitted in a window can never exceed `requests`. The token cap is a
+**bound on the estimate**: before a response exists, `estimate_tokens` is the
+only figure available to project an outstanding lease by, so a response
+reporting more than the estimate can still overshoot at settlement, where the
+hard cap catches it as before. Admission enforces the hard cap only — the soft
+cap remains the planned early exit that decides when a key leaves rotation under
+normal traffic.
+
+### Unsettled leases are reclaimed after 30 minutes
+
+Counting leases in flight has a corollary: a reservation that is never settled
+holds a slot, and window rollover cannot take it back — rollover has no way to
+tell a leaked slot from a request that is still running, and zeroing in-flight
+counts would strand every live lease. Left alone, N leaks against a cap of N
+retire a key for the lifetime of the process, with `/healthz` reporting it
+selectable, available and not degraded throughout.
+
+The gateway itself does not leak: `handleProxy` defers `Settle` on every path,
+including panics. The exposure is `RotationStore.Next`, which is exported and
+documented for direct use and hands back a bare index with no lease to settle.
+
+So a reservation left outstanding longer than the **lease timeout** — 30 minutes
+by default, `WithLeaseTimeout` to change it — has its slot returned. The value is
+a deliberate over-estimate of the longest legitimate request: reclaiming a slot
+whose request is genuinely still running lets that one request be re-admitted,
+which is the only case in which the request cap is not exact. `Reclaimed` in a
+key's snapshot counts these for the store's lifetime, and is not reset by a
+rollover: a non-zero value is a bug in a caller of `Next`, not a condition of the
+upstream, and a leak whose evidence clears every window is a leak nobody finds.
 
 The window is **tumbling** and rollover is **lazy** — evaluated from the clock on
 every call. The gateway therefore starts no timer goroutine for rotation, and a

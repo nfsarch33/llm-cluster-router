@@ -70,9 +70,22 @@ type RotationStore interface {
 	// request on route, or -1 when every key is retired or drained.
 	//
 	// A non-negative result RESERVES an in-flight slot. The caller MUST settle
-	// it with exactly one RecordUsage (or RecordSample) call, or the key looks
-	// permanently busy to leastUsedPolicy. Prefer Store.Acquire, whose lease
-	// makes both double-settlement and non-settlement impossible.
+	// it with exactly one RecordUsage (or RecordSample) call.
+	//
+	// Failing to is worse than it used to be, and worse than it looks. An
+	// unsettled slot skews leastUsedPolicy, which was the old consequence; it
+	// also counts against the HARD request cap in admission control, so a key
+	// whose cap is N stops accepting reservations after N leaks — and window
+	// rollover cannot clear it, because rollover has no way to distinguish a
+	// leaked slot from a request that is still running. /healthz reports such
+	// a key selectable and available throughout.
+	//
+	// The store therefore reclaims a reservation left unsettled for longer than
+	// its lease timeout (DefaultLeaseTimeout, WithLeaseTimeout), which bounds
+	// the damage to that window rather than the process lifetime. It does not
+	// make leaking free: see admissibleLocked for what a reclaim costs the
+	// exactness of the request cap. Prefer Store.Acquire, whose lease makes
+	// both double-settlement and non-settlement impossible.
 	Next(route string) (idx int)
 
 	// RecordUsage settles a reservation as a completed request: it releases
@@ -230,6 +243,25 @@ const (
 	// DefaultQuotaCooldown parks a key that reported an upstream quota error
 	// when the route has no accounting window to fall back on.
 	DefaultQuotaCooldown = 5 * time.Minute
+
+	// DefaultLeaseTimeout is how long a reservation may stay unsettled before
+	// the store reclaims its in-flight slot.
+	//
+	// It exists because an unsettled reservation used to be permanent. Window
+	// rollover zeroes requests, tokens and errors but MUST NOT zero in-flight
+	// counts — a live lease has to find its slot when it settles — so a leaked
+	// slot survived every rollover, and since admission control counts
+	// in-flight against the hard request cap, a key with N leaked slots against
+	// a cap of N was unreservable for the lifetime of the process while
+	// /healthz still reported it selectable and available.
+	//
+	// The value is a deliberate over-estimate of the longest legitimate
+	// request. A long streaming completion is minutes, not tens of minutes, so
+	// 30 minutes reclaims a genuine leak inside one operational window while
+	// leaving an unfinished request's slot alone. Routes with slower upstreams
+	// raise it with WithLeaseTimeout; see admissibleLocked for what a reclaim
+	// costs when the request it belonged to is in fact still running.
+	DefaultLeaseTimeout = 30 * time.Minute
 )
 
 // Store is the default RotationStore: per-route, per-key accounting over a
@@ -252,6 +284,7 @@ type Store struct {
 	fallback      RotationPolicy
 	budget        Budget
 	maxRetryAfter time.Duration
+	leaseTimeout  time.Duration
 	observer      RetireObserver
 	now           func() time.Time
 }
@@ -265,15 +298,101 @@ type routeState struct {
 
 // keyState is the mutable per-key record behind a KeyState snapshot.
 type keyState struct {
-	requests     int64
-	tokens       int64
-	inFlight     int64
+	requests int64
+	tokens   int64
+	// leases holds one entry per outstanding reservation, carrying the instant
+	// it was taken, oldest first. It replaced a bare counter so a reservation
+	// can be AGED: a count alone cannot distinguish a request that is still
+	// running from one whose caller never settled it, and the store needs that
+	// distinction to reclaim the second without stealing the first.
+	//
+	// Ordering follows from every entry being appended with the store's clock,
+	// which is non-decreasing. A clock that steps backwards only makes
+	// reclamation later, never wrong.
+	leases []time.Time
+	// orphaned counts reservations whose slot was already reclaimed and whose
+	// settlement has therefore already been accounted for. See releaseLocked.
+	orphaned int64
+	// reclaimed is the LIFETIME count of reclaimed reservations on this key —
+	// deliberately not zeroed by a window rollover, unlike every other counter
+	// here. A non-zero value means some caller took a lease and never settled
+	// it, which is a bug in that caller; hiding it every window would leave the
+	// only symptom being capacity that quietly evaporates.
+	reclaimed    int64
 	errors       int64
 	estimated    bool
 	drained      bool
 	softRetired  bool
 	retiredUntil time.Time
 	retireReason RetireReason
+}
+
+// inFlight is the number of reservations outstanding right now.
+func (k *keyState) inFlight() int64 { return int64(len(k.leases)) }
+
+// releaseLocked returns ONE reservation's slot on settlement.
+//
+// A settlement carries no lease identity — RotationStore.RecordUsage takes a
+// route and an index, and a caller using Next directly has nothing else to give
+// — so which outstanding reservation this is cannot be known. The rule is
+// therefore chosen to fail in the safe direction: if any slot on this key has
+// already been reclaimed, this settlement is charged against THAT and the live
+// reservations are left alone. The alternative, popping a live entry, would
+// under-count what is outstanding and let admission control admit one request
+// too many, which is the precise failure admission control exists to prevent.
+//
+// The cost of guessing wrong the other way — a live lease settling while an
+// orphan is outstanding — is that the store over-counts by one until the orphan
+// ages out. Over-counting refuses a request that could have been served; that
+// is recoverable, and it is bounded by the lease timeout.
+func releaseLocked(k *keyState) {
+	if k.orphaned > 0 {
+		k.orphaned--
+		return
+	}
+	if len(k.leases) > 0 {
+		k.leases = k.leases[1:]
+	}
+}
+
+// reclaimStaleLocked returns the slots of reservations that have outlived
+// s.leaseTimeout.
+//
+// Only a LEADING run is examined, which is exact while the clock is
+// non-decreasing and conservative otherwise.
+func (s *Store) reclaimStaleLocked(k *keyState, now time.Time) {
+	if s.leaseTimeout <= 0 || len(k.leases) == 0 {
+		return
+	}
+	cutoff := now.Add(-s.leaseTimeout)
+	n := 0
+	for n < len(k.leases) && !k.leases[n].After(cutoff) {
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	k.leases = k.leases[n:]
+	k.orphaned += int64(n)
+	k.reclaimed += int64(n)
+}
+
+// advanceLocked brings one route's state up to date with now.
+//
+// It is the single entry point every locked path uses, so no read of key state
+// can observe a reservation that has already expired.
+//
+// Reclamation is written before the rollover, but that order is IMMATERIAL
+// today: rollLocked does not read leases, so swapping the two lines kills no
+// test. It is recorded here as an equivalent mutant rather than left looking
+// load-bearing. First is still the right place for it — a future rollover that
+// does consult in-flight state should see reclaimed capacity, not a leak's
+// ghost.
+func (s *Store) advanceLocked(rs *routeState, now time.Time) {
+	for i := range rs.keys {
+		s.reclaimStaleLocked(&rs.keys[i], now)
+	}
+	s.rollLocked(rs, now)
 }
 
 // StoreOption configures a Store.
@@ -299,6 +418,12 @@ func WithMaxRetryAfter(d time.Duration) StoreOption { return func(s *Store) { s.
 // they can assert retirement reasons without touching a global registry.
 func WithRetireObserver(o RetireObserver) StoreOption { return func(s *Store) { s.observer = o } }
 
+// WithLeaseTimeout sets how long an unsettled reservation keeps its in-flight
+// slot before the store reclaims it. Zero or negative means
+// DefaultLeaseTimeout; there is deliberately no way to disable reclamation,
+// because that is the setting that made a leak permanent.
+func WithLeaseTimeout(d time.Duration) StoreOption { return func(s *Store) { s.leaseTimeout = d } }
+
 // NewStore builds a Store. keys maps route name to that route's key count.
 func NewStore(keys map[string]int, opts ...StoreOption) *Store {
 	s := &Store{
@@ -320,6 +445,9 @@ func NewStore(keys map[string]int, opts ...StoreOption) *Store {
 	}
 	if s.maxRetryAfter <= 0 {
 		s.maxRetryAfter = DefaultMaxRetryAfter
+	}
+	if s.leaseTimeout <= 0 {
+		s.leaseTimeout = DefaultLeaseTimeout
 	}
 	if s.budget.SoftRatio <= 0 || s.budget.SoftRatio > 1 {
 		s.budget.SoftRatio = DefaultSoftRatio
@@ -407,7 +535,7 @@ func (s *Store) reserve(route string) (int, admissionRefusal) {
 		return -1, refusalDrained
 	}
 	now := s.now()
-	s.rollLocked(rs, now)
+	s.advanceLocked(rs, now)
 
 	// selectable is counted separately from admissible so a refusal can say
 	// which of the two filters emptied the candidate set. It is read from the
@@ -440,7 +568,7 @@ func (s *Store) reserve(route string) (int, admissionRefusal) {
 		pos = 0
 	}
 	idx := states[pos].Index
-	rs.keys[idx].inFlight++
+	rs.keys[idx].leases = append(rs.keys[idx].leases, now)
 	return idx, refusalNone
 }
 
@@ -463,9 +591,15 @@ func (s *Store) reserve(route string) (int, admissionRefusal) {
 //
 // Exactness, honestly stated:
 //
-//   - Requests is EXACT. requests+inFlight is invariant across a settlement and
-//     rises only on reservation, so the count admitted per window can never
-//     exceed the cap.
+//   - Requests is EXACT for every lease that settles within the lease timeout.
+//     requests+inFlight is invariant across a settlement and rises only on
+//     reservation, so the count admitted per window cannot exceed the cap.
+//     A reservation RECLAIMED while its request is in fact still running is the
+//     one exception: its slot is readmitted, and the cap can then be exceeded
+//     by the number of such reclamations. That is the price of not letting a
+//     leaked slot cost a key its capacity forever, and it is why
+//     DefaultLeaseTimeout is set well beyond any real request rather than
+//     tuned tight.
 //   - Tokens is a BOUND on the estimate, not a guarantee. Before a response
 //     exists, Budget.EstimateTokens is the only figure available to project an
 //     in-flight lease by; a response that reports MORE than the estimate can
@@ -480,10 +614,10 @@ func (s *Store) admissibleLocked(k *keyState, now time.Time) bool {
 	if b.Window <= 0 {
 		return true
 	}
-	if b.Requests > 0 && k.requests+k.inFlight >= b.Requests {
+	if b.Requests > 0 && k.requests+k.inFlight() >= b.Requests {
 		return false
 	}
-	if b.Tokens > 0 && k.tokens+k.inFlight*b.EstimateTokens >= b.Tokens {
+	if b.Tokens > 0 && k.tokens+k.inFlight()*b.EstimateTokens >= b.Tokens {
 		return false
 	}
 	return true
@@ -507,7 +641,7 @@ func (s *Store) RecordSample(route string, idx int, sample UsageSample) {
 	s.mu.Lock()
 	if rs, ok := s.routes[route]; ok && idx >= 0 && idx < len(rs.keys) {
 		now := s.now()
-		s.rollLocked(rs, now)
+		s.advanceLocked(rs, now)
 		events = s.settleLocked(&rs.keys[idx], sample)
 	}
 	s.mu.Unlock()
@@ -518,9 +652,7 @@ func (s *Store) RecordSample(route string, idx int, sample UsageSample) {
 // settleLocked applies one sample to one key and reports any retirement it
 // caused. The caller emits those events after releasing the lock.
 func (s *Store) settleLocked(k *keyState, sample UsageSample) []RetireReason {
-	if k.inFlight > 0 {
-		k.inFlight--
-	}
+	releaseLocked(k)
 	if sample.Outcome == OutcomeFailed {
 		k.errors++
 		return nil
@@ -579,7 +711,7 @@ func (s *Store) RetireWithReason(route string, idx int, until time.Time, reason 
 	s.mu.Lock()
 	if rs, ok := s.routes[route]; ok && idx >= 0 && idx < len(rs.keys) {
 		now := s.now()
-		s.rollLocked(rs, now)
+		s.advanceLocked(rs, now)
 		events = retireLocked(&rs.keys[idx], now, until, reason)
 	}
 	s.mu.Unlock()
@@ -628,7 +760,7 @@ func (s *Store) retireForWindow(route string, idx int, reason RetireReason) {
 	s.mu.Lock()
 	if rs, ok := s.routes[route]; ok && idx >= 0 && idx < len(rs.keys) {
 		now := s.now()
-		s.rollLocked(rs, now)
+		s.advanceLocked(rs, now)
 		until := now.Add(DefaultQuotaCooldown)
 		if s.budget.Window > 0 {
 			until = rs.windowStart.Add(s.budget.Window)
@@ -651,7 +783,7 @@ func (s *Store) RetryAfter(route string) (time.Duration, bool) {
 		return 0, false
 	}
 	now := s.now()
-	s.rollLocked(rs, now)
+	s.advanceLocked(rs, now)
 
 	best := time.Duration(-1)
 	for i := range rs.keys {
@@ -708,7 +840,7 @@ func (s *Store) Snapshot(route string) []KeyState {
 		return nil
 	}
 	now := s.now()
-	s.rollLocked(rs, now)
+	s.advanceLocked(rs, now)
 	out := make([]KeyState, len(rs.keys))
 	for i := range rs.keys {
 		out[i] = s.keyStateLocked(rs, i, now)
@@ -719,10 +851,13 @@ func (s *Store) Snapshot(route string) []KeyState {
 // rollLocked advances a tumbling window that has expired, zeroing the window
 // counters.
 //
-// In-flight counts are deliberately carried across the boundary: a live lease
-// must still find its slot when it settles. An explicit retirement whose
-// deadline outlives the boundary is carried too — a one-hour provider cooldown
-// is not a five-minute accounting artefact.
+// In-flight reservations are deliberately carried across the boundary: a live
+// lease must still find its slot when it settles. That is also why a leaked one
+// used to be permanent — nothing here has any way to tell the two apart, which
+// is the job of reclaimStaleLocked, and advanceLocked runs it FIRST so what
+// survives this boundary is only what is plausibly still running. An explicit
+// retirement whose deadline outlives the boundary is carried too — a one-hour
+// provider cooldown is not a five-minute accounting artefact.
 func (s *Store) rollLocked(rs *routeState, now time.Time) {
 	w := s.budget.Window
 	if w <= 0 {
@@ -749,7 +884,8 @@ func (s *Store) keyStateLocked(rs *routeState, i int, now time.Time) KeyState {
 		Index:        i,
 		Requests:     k.requests,
 		Tokens:       k.tokens,
-		InFlight:     k.inFlight,
+		InFlight:     k.inFlight(),
+		Reclaimed:    k.reclaimed,
 		Errors:       k.errors,
 		Estimated:    k.estimated,
 		Selectable:   selectableAt(k, now),
