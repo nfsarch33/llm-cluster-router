@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy/observability"
 )
 
 // TestDemoMockUpstream_HandlesHTTPRequest verifies the in-process
@@ -224,21 +227,27 @@ func TestDualListenerDemo_ExposesMetricsEndpoint(t *testing.T) {
 	metricsListenAddr = metricsAddr
 	t.Cleanup(func() { metricsListenAddr = prev })
 
+	// The demo serves the package-level observability vectors, and
+	// Prometheus omits a family with no child series from its exposition
+	// output entirely. Materialise one series in each family the
+	// assertions below look for, rather than inheriting one from whichever
+	// test in this binary happened to accept a connection first — under
+	// -shuffle=on there may be no such test yet. What is under test here
+	// is that /metrics is bound and serves the shared registry, not that
+	// the demo itself increments anything.
+	observability.ConnectionsTotal.WithLabelValues("aes-mtls", "ok").Inc()
+	observability.BytesTotal.WithLabelValues("aes-mtls", "in").Add(1)
+
 	done := make(chan error, 1)
 	go func() { done <- runDualListenerDemo(ctx, aesAddr, socksAddr, "demo-body") }()
-	time.Sleep(80 * time.Millisecond)
 
-	// Hit /metrics.
-	resp, err := http.Get("http://" + metricsAddr + "/metrics")
+	// Poll for the listener rather than sleeping a guessed interval: a
+	// fixed sleep is either slower than it needs to be or shorter than a
+	// loaded machine needs, and only one of those two failures is visible.
+	out, err := pollMetrics(t, metricsAddr)
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	out := string(body)
 	if !strings.Contains(out, "llm_cluster_router_connections_total") {
 		t.Errorf("/metrics missing connections series:\n%s", out)
 	}
@@ -252,6 +261,33 @@ func TestDualListenerDemo_ExposesMetricsEndpoint(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("runDualListenerDemo did not return within 2s after cancel")
 	}
+}
+
+// pollMetrics fetches /metrics from addr, retrying until the demo's
+// metrics server has bound its listener or the deadline expires. It
+// fails the test on any non-200 status.
+func pollMetrics(t *testing.T, addr string) (string, error) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/metrics")
+		if err != nil {
+			lastErr = err
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("status = %d, want 200", resp.StatusCode)
+		}
+		if readErr != nil {
+			return "", fmt.Errorf("read body: %w", readErr)
+		}
+		return string(body), nil
+	}
+	return "", fmt.Errorf("metrics endpoint never became reachable: %w", lastErr)
 }
 
 // TestStartMetricsServer_HonoursCtxShutdown verifies the metrics

@@ -28,6 +28,13 @@ import (
 // MUST NOT have changed. We assert this by reading the registry's
 // Gather output and counting per-label increments.
 func TestMetricExactlyOneChannel(t *testing.T) {
+	// readCounter below matches on the `listener` label alone, so it
+	// returns whichever {listener="socks5",outcome=...} series Gather
+	// happens to emit first. Clearing the vectors leaves exactly the one
+	// series this test creates, which makes that match unambiguous and
+	// the delta independent of test order.
+	Reset()
+
 	// Use an isolated registry so the test is hermetic against
 	// production wiring.
 	reg := prometheus.NewRegistry()
