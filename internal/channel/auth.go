@@ -255,6 +255,16 @@ func newAuthenticatorFor(r Route, sp SecretProvider, st *Store) (Authenticator, 
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", r.Name, err)
 		}
+		// A BACKSTOP, not a layer, and the difference is worth stating because
+		// it was mistaken for one: resolveFirst returns either an error or a
+		// value that is already trimmed and non-empty, so nothing a
+		// SecretProvider can return reaches this line blank. No test can kill
+		// it on its own, and one that appears to is really killing
+		// resolveFirst's guard. What pins it is the PRECONDITION, in
+		// TestResolveFirst_NeverHandsBackAValueThatStillNeedsTrimming: if that
+		// test ever fails, this check has become reachable and needs one of
+		// its own. It stays because "Bearer " on the wire is severe enough not
+		// to rest on one upstream check staying correct.
 		if strings.TrimSpace(key) == "" {
 			return nil, fmt.Errorf("route %q: %w", r.Name, ErrSecretEmpty)
 		}

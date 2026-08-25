@@ -578,7 +578,14 @@ func secretRefs(ref, envName, filePath string) []string {
 // An empty refs slice yields ErrNoSecretSource. When every candidate fails the
 // per-candidate errors are combined with errors.Join, so errors.Is finds each
 // distinct cause and the operator sees every source that was tried and why.
-// It never returns ("", nil).
+//
+// It never returns ("", nil), and never a value that still needs trimming.
+// That is a CONTRACT, not an incidental property: the checks in
+// newAuthenticatorFor and in NewServer's CONNECT block are unreachable while it
+// holds, so weakening this one silently promotes two backstops into the only
+// remaining layer. The blank test below is one of only two blank guards a
+// contract-breaking SecretProvider can actually reach — the other is in
+// resolveKeyPool — and both are mutation-pinned in secret_seam_test.go.
 func resolveFirst(sp SecretProvider, refs []string) (string, error) {
 	if len(refs) == 0 {
 		return "", ErrNoSecretSource
@@ -689,8 +696,13 @@ func resolveKeyPool(r Route, sp SecretProvider) ([]string, error) {
 				return nil, fmt.Errorf("route %q: %s: %w", r.Name, label, err)
 			}
 			if v = strings.TrimSpace(v); v == "" {
-				// Defence in depth: a provider that breaks the non-empty
-				// contract must not put a blank key in a pool slot.
+				// The ONLY blank guard on the pooled path: there is no
+				// resolveFirst in front of it, and leasedInjector accepts any
+				// non-empty key, so a provider that breaks the non-empty
+				// contract reaches the wire through here or not at all.
+				// Reachable, independently killable, and pinned that way by
+				// TestResolveKeyPool_BlankFromACustomProviderIsRejected and
+				// TestNewServer_PooledRouteRefusesABlankCredentialFromACustomProvider.
 				return nil, fmt.Errorf("route %q: %s: %w", r.Name, label,
 					secretErr(ref, ErrSecretEmpty, "provider returned an empty value"))
 			}

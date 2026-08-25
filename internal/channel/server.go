@@ -231,9 +231,19 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) 
 		if err != nil {
 			return nil, fmt.Errorf("connect: %w", err)
 		}
-		// Belt and braces: connToken can never be "" on a running server,
-		// because an empty token would make ConstantTimeCompare authorise an
-		// empty bearer. authorizeConnect guards the same fact independently.
+		// A BACKSTOP, not a layer: resolveFirst returns either an error or a
+		// value that is already trimmed and non-empty, so no SecretProvider —
+		// including a third-party one supplied through WithSecretProvider —
+		// can put a blank in front of this line. It cannot be killed by a test
+		// on its own; its precondition is pinned by
+		// TestResolveFirst_NeverHandsBackAValueThatStillNeedsTrimming, which
+		// fails the moment that stops being true.
+		//
+		// It stays because connToken can never be "" on a running server:
+		// an empty token would make ConstantTimeCompare authorise an empty
+		// bearer, turning the gateway into an allowlisted open relay.
+		// authorizeConnect guards the same fact independently, and that guard
+		// IS reachable and IS tested.
 		if tok = strings.TrimSpace(tok); tok == "" {
 			return nil, fmt.Errorf("connect: %w", ErrSecretEmpty)
 		}

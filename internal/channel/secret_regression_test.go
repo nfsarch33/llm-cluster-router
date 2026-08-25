@@ -22,8 +22,7 @@ import (
 // envProvider.Resolve and fileProvider.Resolve trim BEFORE testing emptiness —
 // and every credential in the package now flows through that seam.
 //
-// This file is the ONE place that pins the defect. It is deliberately the whole
-// story, at every layer that can still close it independently:
+// This file pins the defect as the ENVIRONMENT delivers it:
 //
 //	L1  the provider          — "   " is a MISS, never an empty value
 //	L2  NewServer             — a blank resolution refuses to construct a Server
@@ -37,6 +36,20 @@ import (
 // subtle.ConstantTimeCompare([]byte(""), []byte("")) returning 1, turning the
 // gateway into an allowlisted open relay — is severe enough that it must not
 // depend on a single upstream check staying correct.
+//
+// WHAT THIS FILE DOES NOT PIN, and did once claim to.
+//
+// Every blank here is injected through a Resolver built over envProvider, and
+// envProvider.Resolve trims before it tests emptiness. So L1 consumes the blank
+// and answers ErrSecretEmpty, and the guards further down the call chain — L2's
+// two trims and L6 — never see a blank value at all. Delete any of them and
+// this file stays green: L1 is the only layer these tests can kill.
+//
+// The guards below L1 exist for the case an environment variable cannot
+// produce: a SecretProvider supplied through the exported WithSecretProvider
+// option that breaks the non-empty contract. That is secret_seam_test.go's job,
+// and it also records which of those guards are independently killable and
+// which are backstops that no test can kill alone.
 // -----------------------------------------------------------------------------
 
 func connectConfig(tokenEnv, tokenFile string) *Config {
