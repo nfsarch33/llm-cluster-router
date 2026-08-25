@@ -545,11 +545,16 @@ rotation:
   max_retry_after: 1h        # clamps the Retry-After on a 503; 0 selects 1h
   budget:
     window: 1h               # tumbling per-key accounting window; 0 disables ALL caps
-    tokens: 2000000          # hard per-key cap; 0 = uncapped
-    requests: 0              # hard per-key cap; 0 = uncapped
+    requests: 5000           # hard per-key cap; 0 = uncapped — the default shape
     soft_ratio: 0.8          # retire at 80% of the cap; 0 selects the default
-    estimate_tokens: 1500    # charged when a response reports no usage
+    # tokens: 2000000        # SUPPORTED but ADVISORY; warned about at startup
+    # estimate_tokens: 1500  # REQUIRED when tokens is set (see below)
 ```
+
+**Budget by requests.** A request cap is exact under concurrency; a token cap
+bounds the estimate and can overshoot it by `tokens / estimate_tokens`. Both are
+supported and neither is going away — see
+[Request budgets are exact; token budgets are advisory](#request-budgets-are-exact-token-budgets-are-advisory).
 
 A **single-key** route is unaffected by all of this. It resolves to the same
 bearer injector as before, no accounting store is built for it, its outbound
@@ -589,14 +594,65 @@ any of them settles, so a per-window plan is overspendable by the concurrency
 factor. Sequential traffic is exact either way, which is why this only ever bites
 in production.
 
-The request cap is therefore **exact** for every lease that settles: the number
-of requests admitted in a window can never exceed `requests`. The token cap is a
-**bound on the estimate**: before a response exists, `estimate_tokens` is the
-only figure available to project an outstanding lease by, so a response
-reporting more than the estimate can still overshoot at settlement, where the
-hard cap catches it as before. Admission enforces the hard cap only — the soft
-cap remains the planned early exit that decides when a key leaves rotation under
-normal traffic.
+Admission enforces the hard cap only — the soft cap remains the planned early
+exit that decides when a key leaves rotation under normal traffic.
+
+### Request budgets are exact; token budgets are advisory
+
+The two caps are not two spellings of one feature.
+
+| | `budget.requests` | `budget.tokens` |
+|---|---|---|
+| what admission counts | settled requests **plus** leases in flight | tokens charged **plus** `estimate_tokens` per lease in flight |
+| what a lease costs at settlement | exactly 1 — known before it is admitted | whatever the upstream reports — unknown until it is over |
+| worst case in a window | **exact**: never more than the cap | cap plus the overshoot of every admitted lease |
+| measured | exact across a 12-combination pool-size × cap sweep at burst 60: zero overspend, zero leaked in-flight, charged always equal to upstream hits | **50x** overspend on the numbers below |
+
+A request cap is exact because `requests + inFlight` is invariant across a
+settlement and rises only on reservation, and because a request's cost is known
+before it is admitted: it is one request.
+
+A token cap has no such figure. Before a response exists, `estimate_tokens` is
+the only thing admission can project an outstanding lease by, so the cap admits
+`ceil(tokens / estimate_tokens)` leases at once and each of them then settles
+whatever the upstream actually reported.
+
+**Measured.** `tokens: 1000` per key, `estimate_tokens: 100`, real usage 5000
+tokens per response. Admission admits `1000/100 = 10` concurrent leases; each
+settles 5000; **50000 is charged against a 1000-token cap** — a 50x overshoot.
+Driven sequentially the same numbers charge 5000, because the first settlement
+drains the key. Concurrency therefore multiplies the overshoot one request
+already carries by exactly `tokens / estimate_tokens`.
+
+Token budgets are **supported and are not deprecated**. They are **advisory**:
+the hard cap still stops the key at settlement, so the plan is bounded — just
+not by the number written in the config. Configure one and the gateway says so
+at startup, naming the ratio for that route's own numbers:
+
+```
+WARNING: route "minimax-pool" budgets by TOKENS (rotation.budget.tokens=1000,
+estimate_tokens=100, window=1h0m0s), and a token cap bounds the ESTIMATE, not the
+charge. Admission projects every unsettled lease at estimate_tokens, so this cap
+admits up to 10 requests at once (tokens/estimate_tokens = 10) and a concurrent
+burst charges the plan up to 10x whatever ONE response overshoots its estimate
+by. ...
+```
+
+Every shipped configuration budgets by requests. `deploy/helixchannel/gateway.example.yml`
+is the only example config, and it is what a node is deployed from; an example
+that budgets by tokens is a default an operator inherits without ever making the
+decision.
+
+> **Follow-up, not implemented (deliberately).** The known path to an exact
+> token cap is **reserved-token accounting**: a lease reserves `estimate_tokens`
+> against the cap when it is admitted and *reconciles* that reservation at
+> settlement — releasing the reserved figure and charging the real one — so the
+> projection is self-correcting and a window's overshoot is bounded by what a
+> single in-flight request exceeds its estimate by rather than by
+> `ceil(cap/estimate)` of them. It changes the store's accounting model and
+> every caller that settles a lease. The operator chose request budgets over it
+> for now; this note is the record of that choice, so that "token caps are
+> advisory" reads as a decision rather than as an unnoticed defect.
 
 ### Unsettled leases are reclaimed after 30 minutes
 
@@ -710,6 +766,11 @@ startup, so the silent-skew configuration cannot be deployed. A usage object
 that falls outside the retained tail is treated the same way — an estimate,
 never a zero.
 
+The estimate is also what makes a token cap inexact rather than merely
+approximate, since it is what admission projects an unsettled lease by; a
+configured token budget is warned about at startup for that reason. See
+[Request budgets are exact; token budgets are advisory](#request-budgets-are-exact-token-budgets-are-advisory).
+
 A request that fails before producing a response (dial error, timeout, client
 disconnect) releases its lease and increments an error counter but charges no
 requests and no tokens: a dead upstream must not make a healthy key look like
@@ -747,8 +808,11 @@ marked authoritative.
 
 ### `auth: header` with a budget
 
-Header-auth upstreams report no `usage.total_tokens`, so **every** sample on such
-a route is an estimate. Budget those routes by `requests`, not by `tokens`.
+Every route should budget by `requests`. On a header route the alternative is
+not merely inexact but meaningless: header-auth upstreams report no
+`usage.total_tokens`, so **every** sample is an estimate and a token cap would be
+spent entirely in `estimate_tokens` increments that no upstream figure ever
+corrects.
 
 `policy: least_tokens` is **rejected at config load** on an `auth: header` route:
 with every sample estimated it would behave exactly as `least_used` while
