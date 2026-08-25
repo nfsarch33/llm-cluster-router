@@ -175,7 +175,10 @@ too. What "names this machine" covers:
 The name row is the honest limit: any name at all can have a `127.0.0.1` A record,
 and deciding that here would mean a DNS lookup during startup — which makes
 booting depend on a resolver and lets a poisoned answer decide whether the gateway
-runs. Config validation resolves nothing. It also cannot tell one of the host's
+runs. Config validation resolves nothing. It is also a **target-side** answer only:
+as the *bind* address those same names decide nothing at all, because there the
+answer relaxes rather than restricts — see
+[What counts as a loopback `listen`](#what-counts-as-a-loopback-listen). It also cannot tell one of the host's
 own routable addresses from a neighbour's under a wildcard bind, because that
 needs an interface enumeration that is stale the moment an address is added.
 
@@ -209,6 +212,37 @@ the network while `listen` still reads `127.0.0.1`, and its callers arrive from
 the bridge address, not from loopback. Under `loopback_only` they are served. A
 token is the only thing that closes that, and it is the reason the shipped
 example config configures one.
+
+#### What counts as a loopback `listen`
+
+One decision procedure answers this, and the same one decides a `CONNECT`
+target, so the startup validator, the dial-time guard and the bind predicate
+cannot disagree about what loopback means. All of these are loopback binds:
+
+`127.0.0.1`, anywhere in `127.0.0.0/8`, `::1`, `::ffff:127.0.0.1`, `[::1%lo]`,
+and every `inet_aton` spelling of them — `127.1`, `127.0.1`, `2130706433`,
+`0x7f000001`, `0177.0.0.1`, `017700000001`. (Before this, the bind predicate was
+`net.ParseIP` alone, which takes no numeric spelling: `listen: 127.1:14443` was
+read as a *wide* bind, and a genuinely loopback-only deployment had its own
+loopback `allowed_hosts` entries refused at startup.)
+
+**A host NAME is not a loopback bind — `localhost` included.** This is a change,
+and it is deliberate. A name can only be decided by resolving it, and resolving
+it here would make startup depend on whoever answers the resolver; but unlike
+the target side, where a reserved name being loopback makes the entry *refused*,
+loopback-ness of the **bind** is what relaxes things. It waives the gateway-token
+requirement, it permits loopback `allowed_hosts` entries, and it disarms the
+dial-time guard outright. Trusting the spelling therefore fails **open**: a host
+whose `/etc/hosts` pointed `localhost` at a routable address would switch all
+three off, and nothing in the config text would say so. The safe answer to "I
+cannot tell without a resolver" is the one that asks for a token.
+
+So `listen: "localhost:14443"` with no `gateway_auth` block is now a startup
+error. Two fixes, and the message names both:
+
+- spell the address — `listen: "127.0.0.1:14443"` (or `"[::1]:14443"`); or
+- configure `gateway_auth.token_env` / `token_file` / `token_ref`, which is
+  correct whatever the name resolves to.
 
 #### `/healthz`
 

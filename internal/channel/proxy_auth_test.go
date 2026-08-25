@@ -482,7 +482,14 @@ func TestConfigValidate_RefusesAWideBindWithNoGatewayToken(t *testing.T) {
 		{"loopback v4, no token", "127.0.0.1:14443", GatewayAuthConfig{}, false},
 		{"anywhere in 127/8, no token", "127.0.0.53:14443", GatewayAuthConfig{}, false},
 		{"loopback v6, no token", "[::1]:14443", GatewayAuthConfig{}, false},
-		{"localhost, no token", "localhost:14443", GatewayAuthConfig{}, false},
+		// A NAME is not proof of a loopback-only bind, "localhost"
+		// included: see isLoopbackListen. Deciding it would mean resolving
+		// it at startup, and a host file that pointed it at a routable
+		// address would silently waive this very rule.
+		{"localhost, no token", "localhost:14443", GatewayAuthConfig{}, true},
+		{"localhost with a token", "localhost:14443", GatewayAuthConfig{TokenEnv: "GW"}, false},
+		{"loopback in an inet_aton spelling, no token", "127.1:14443", GatewayAuthConfig{}, false},
+		{"loopback in hex, no token", "0x7f000001:14443", GatewayAuthConfig{}, false},
 		{"wildcard with a token", "0.0.0.0:14443", GatewayAuthConfig{TokenFile: "/run/secrets/gw"}, false},
 		{"wildcard with token_env", "0.0.0.0:14443", GatewayAuthConfig{TokenEnv: "GW"}, false},
 		{"wildcard with token_ref", "0.0.0.0:14443", GatewayAuthConfig{TokenRef: gwAuthTokenRef}, false},

@@ -24,6 +24,7 @@
 package channel
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -645,30 +646,13 @@ func (c *Config) validateGatewayAuth() error {
 		return fmt.Errorf("gateway_auth: exempt_loopback: false requires a token source (token_env/token_file/token_ref); without one it would refuse every caller, loopback included")
 	}
 	if !g.AllowUnauthenticated && !isLoopbackListen(c.Listen) {
-		return fmt.Errorf("gateway_auth: listen %q is not a loopback address and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable from other hosts, so anyone able to open a TCP connection could spend every key on every enabled route. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or — only behind an authenticating terminator — set gateway_auth.allow_unauthenticated: true", c.Listen)
+		msg := fmt.Sprintf("gateway_auth: listen %q is not a loopback address and no gateway token is configured; the reverse-proxy leg would authenticate nobody while reachable from other hosts, so anyone able to open a TCP connection could spend every key on every enabled route. Set gateway_auth.token_env/token_file/token_ref, bind a loopback address, or — only behind an authenticating terminator — set gateway_auth.allow_unauthenticated: true", c.Listen)
+		if hint := loopbackNameHint(c.Listen); hint != "" {
+			msg += ". " + hint
+		}
+		return errors.New(msg)
 	}
 	return nil
-}
-
-// isLoopbackListen reports whether a bind address reaches loopback ONLY.
-//
-// "localhost" is accepted because that is what it resolves to on every platform
-// this ships to. An empty host is NOT: ":14443" and "0.0.0.0:14443" are the
-// same wildcard bind, and the empty spelling is the one that looks harmless.
-// Anything else unparseable — a hostname, an interface name — is treated as
-// non-loopback, because the safe answer to "I could not tell" is the one that
-// asks for a token.
-func isLoopbackListen(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
-	}
-	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // EnabledRoutes returns only the routes whose feature flag is on.

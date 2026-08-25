@@ -104,6 +104,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **BREAKING — a host NAME is no longer a loopback `listen`, `localhost`
+  included.** `listen: "localhost:14443"` with no `gateway_auth` token now
+  refuses to start; write `listen: "127.0.0.1:14443"` (or `"[::1]:14443"`), or
+  configure a token. The refusal says both.
+
+  Loopback-ness of the *bind* is what relaxes three separate things — it waives
+  the gateway-token requirement, it permits loopback `connect.allowed_hosts`
+  entries, and it disarms the dial-time `CONNECT` guard — so trusting a spelling
+  fails **open**. A host whose `/etc/hosts` mapped `localhost` to a routable
+  address switched all three off silently, and nothing in the config text said
+  so. Deciding a name honestly would mean resolving it during validation, which
+  would let whoever answers the resolver choose the gateway's security posture;
+  config validation still resolves nothing. Note the asymmetry that makes this
+  consistent rather than contradictory: as a `CONNECT` **target** a reserved
+  loopback name is still refused, because there the same answer fails closed.
+
 - **Request budgets are the default; token budgets are advisory.** Operator
   decision: budget by requests, not tokens.
 
@@ -134,6 +150,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     in `docs/helixchannel.md` and on `channel.BudgetAdvisory`.
 
 ### Fixed
+- **A loopback-only deployment could be refused its own loopback targets
+  (confirmed).** Two disagreeing definitions of "loopback" lived in the package:
+  the `CONNECT` target side implemented `inet_aton`'s grammar, while the bind
+  predicate was `net.ParseIP` plus the literal string `"localhost"`. Measured,
+  `listen: 127.1:14443` was read as a *wide* bind, so `allowed_hosts:
+  ["127.0.0.1:9200"]` — a legitimate local target on a legitimate loopback-only
+  deployment — was refused at startup, which on a fresh host presents as an
+  inexplicable refusal to boot. There is now one procedure: `127.0.0.1`,
+  `127.1`, `127.0.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`, `::1` and
+  `::ffff:127.0.0.1` are one answer across the validator, the dial-time guard
+  and the bind predicate. See the `Changed` entry above for the name half of
+  the same fix.
+
 - **A healthy route reported its keys as exhausted (confirmed).** The R1
   admission-control fix created a NEW refusal mode — a key at its hard cap once
   leases in flight are counted — and labelled it with the OLD one. While

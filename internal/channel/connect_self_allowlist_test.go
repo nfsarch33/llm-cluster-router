@@ -188,7 +188,15 @@ func TestValidateConnect_LoopbackBindStillAllowsLoopbackTargets(t *testing.T) {
 	ok := map[string]*Config{
 		"an ephemeral local target, as the end-to-end tunnel test configures it": connectCfg("127.0.0.1:0", "127.0.0.1:41235"),
 		"a local service on another port":                                        connectCfg("127.0.0.1:14443", "127.0.0.1:9200"),
-		"localhost by name on another port":                                      connectCfg("localhost:14443", "localhost:9200"),
+		// The bind spelled the way a C resolver reads it. This used to be
+		// refused: the listen predicate was net.ParseIP alone, which takes
+		// no inet_aton spelling, so a real loopback-only deployment had its
+		// own loopback targets rejected at startup.
+		"a loopback bind in an alternative numeric spelling": connectCfg("127.1:14443", "127.0.0.1:9200"),
+		"a loopback bind spelled in hex":                     connectCfg("0x7f000001:14443", "127.0.0.1:9200"),
+		// "localhost:14443" as the BIND is deliberately not here any more;
+		// TestLoopbackListen_RefusesToTrustANameAsProofOfALoopbackBind owns
+		// that case now.
 	}
 	for name, cfg := range ok {
 		t.Run(name, func(t *testing.T) {
