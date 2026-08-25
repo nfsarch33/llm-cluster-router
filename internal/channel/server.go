@@ -32,10 +32,14 @@ type AuditEvent struct {
 	Method    string `json:"method,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Upstream  string `json:"upstream,omitempty"`
-	// UpstreamHost is the host:port the gateway ACTUALLY contacted, as opposed
-	// to Upstream, which is the host it was CONFIGURED to contact. The two are
-	// the same on every request that goes where it was told to, and that is the
-	// point: a line where they differ is a request that did not.
+	// UpstreamHost is the host:port the gateway ACTUALLY contacted, read back
+	// from the request net/http sent, as opposed to Upstream, which is the
+	// route's CONFIGURED base URL. They are different SHAPES and so never
+	// compare equal -- "http://host:port" against "host:port" -- and with
+	// refuseRedirect in force nothing can move a forward off its configured
+	// host, so a real divergence is unreachable too. Neither field is an
+	// alerting input; recording both makes the log STATE where the gateway went
+	// rather than restate configuration.
 	//
 	// It exists because the pair was previously one field carrying the
 	// configured value, which made the audit stream — the record these docs

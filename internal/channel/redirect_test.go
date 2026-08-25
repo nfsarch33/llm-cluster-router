@@ -235,8 +235,11 @@ func TestForward_RedirectChainCostsExactlyOneUpstreamRoundTripAndOneCharge(t *te
 //
 // The line recorded rt.Route.Upstream — the CONFIGURED host — so a gateway that
 // had just been driven to a host in no configuration recorded that it had gone
-// where it was told. upstream is intent; upstream_host is fact; a line where
-// they disagree is the signature.
+// where it was told. upstream is intent; upstream_host is fact. The two are
+// different shapes and never compare equal, and refuseRedirect makes a genuine
+// divergence unreachable, so what is pinned here is the CONTENT of each field --
+// upstream_host read off the wire and shaped as a bare host -- not a divergence
+// signal an operator could alert on.
 func TestAudit_ProxyLineNamesTheHostActuallyContacted(t *testing.T) {
 	t.Parallel()
 

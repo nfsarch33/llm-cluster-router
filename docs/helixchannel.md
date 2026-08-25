@@ -350,7 +350,21 @@ One NDJSON line per event, with request metadata only — no bodies, no headers,
 
 Errors are recorded as classes (`timeout`, `refused`, `dns`, `tls`, `upstream_error`, `redirect_not_followed`) rather than raw strings, so a URL carrying a token cannot reach the log.
 
-Every `proxy_request` line that obtained a response also carries `upstream_host`: the `host:port` the gateway **actually** contacted, read back from the request `net/http` sent. `upstream` remains the host the route was **configured** to contact. Recording both is the point — the two agree on every request that went where it was told, so a line where they differ is a request that did not, and that is an assertable, alertable signature instead of an invisible one. It used to be one field carrying the configured value, which made this stream — the record this document presents as the forensic one — incapable of recording an SSRF the gateway had just performed. A line with no response to read it from (a `502` after a dial failure) omits it.
+Every `proxy_request` line that obtained a response also carries `upstream_host`: the `host:port` the gateway **actually** contacted, read back from the request `net/http` sent. `upstream` remains the route's **configured** base URL.
+
+The two fields are different shapes, and that shows on every line:
+
+```
+"upstream":"http://127.0.0.1:19811"   "upstream_host":"127.0.0.1:19811"
+```
+
+So **do not alert on `upstream != upstream_host`.** A URL is never equal to a bare host, so that rule matches 100% of lines and pages on entirely healthy traffic. A comparison that means anything has to parse the host out of `upstream` first.
+
+And once it does, it has nothing to find. The forwarder refuses every redirect (see [Redirects are never followed](#redirects-are-never-followed)) and nothing else can move a forward off the host its route configured, so **while redirects are refused there is no reachable divergence between these two fields** — the same conclusion this document reaches from the other direction above. `upstream_host` is not a live alerting signal, and no alert should be written against it.
+
+What it is for is corroboration. This stream used to carry one field holding the *configured* value, so the record this document presents as the forensic one restated configuration back at the reader and was structurally incapable of recording an SSRF the gateway had just performed. Reading the host back off the wire makes "the request went where the route said" a fact the log *states* rather than an assumption the log *inherits* — checkable after the event, and correct on the day some future change does move a request.
+
+The alertable signal in this area is `"error":"redirect_not_followed"`: a reachable, countable outcome that names an upstream that *tried* to move a request off its configured host. A line with no response to read the host from (a `502` after a dial failure) omits `upstream_host`.
 
 Pooled routes add three `omitempty` fields to each `proxy_request` event, so existing consumers of the NDJSON stream are unaffected and single-key lines stay byte-identical:
 

@@ -130,8 +130,13 @@ func redirectNotFollowed(resp *http.Response) bool {
 // connection elsewhere. That is precisely the assumption a redirect breaks, so
 // the one event that most needed to say "this went somewhere else" was the one
 // event structurally incapable of saying it. Recording both — intent in
-// upstream, fact in upstream_host — makes a divergence an assertable and
-// alertable signature rather than an invisible one.
+// upstream, fact in upstream_host — makes that invariant CHECKABLE rather than
+// inherited from configuration.
+//
+// It is NOT an alerting input. The two fields are different shapes and never
+// compare equal, and refuseRedirect makes a genuine divergence unreachable by
+// construction. The reachable signal for an upstream that TRIED to move a
+// request is the audit error redirect_not_followed.
 //
 // Empty when there is no response to read it from (a dial failure) or when a
 // substituted Forwarder returned a hand-built response; omitempty then leaves
