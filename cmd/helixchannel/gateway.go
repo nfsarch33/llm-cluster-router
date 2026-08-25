@@ -51,6 +51,13 @@ func runGateway(args []string) error {
 		}
 	}
 
+	// Emitted HERE — before the server is built and before --print-routes
+	// returns — because it is an advisory about the CONFIGURATION, not about
+	// this process's runtime posture. An operator inspecting a config with
+	// --print-routes is exactly who needs to hear it, and a config that later
+	// fails to start should still have said what its budgets mean.
+	warnAdvisoryTokenBudgets(os.Stderr, cfg)
+
 	auditWriter := io.Writer(os.Stdout)
 	if cfg.AuditLog != "" {
 		f, err := os.OpenFile(cfg.AuditLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -115,6 +122,27 @@ func warnUnauthenticatedProxyLeg(w io.Writer, mode channel.ProxyAuthMode, listen
 		_, _ = fmt.Fprintf(w, "WARNING: no gateway_auth token is configured, so the reverse-proxy leg authenticates NOBODY. Reaching %s is sufficient to spend every key on every enabled route; the bind address is the only boundary. Set gateway_auth.token_env/token_file/token_ref before publishing this socket any wider.\n", listen)
 	case channel.ProxyAuthOpen:
 		_, _ = fmt.Fprintf(w, "WARNING: gateway_auth.allow_unauthenticated is set, so the reverse-proxy leg authenticates NOBODY on %s. Anyone who can open a TCP connection to it can spend every key on every enabled route. This is only safe behind an authenticating terminator that is the sole reachable path to this socket.\n", listen)
+	}
+}
+
+// warnAdvisoryTokenBudgets prints the loud startup warning for every route whose
+// per-key plan is denominated in TOKENS, naming the overshoot ratio derived from
+// that route's own cap and estimate.
+//
+// It is emitted at startup rather than left to the documentation because the
+// failure mode is a BILL. A token cap bounds the estimate an unsettled lease is
+// projected by, not the charge that lease eventually settles, so the plan is
+// overspendable by cap/estimate under concurrency — measured at 50x on cap 1000
+// / estimate 100 against a real 5000-token response. Request budgets have no
+// such gap and are the shape every shipped config now uses; see
+// channel.BudgetAdvisory for the arithmetic and for the reserved-token
+// accounting follow-up that would make token caps exact.
+//
+// Silence is the expected output. A warning that fires on the recommended
+// configuration is one operators learn to scroll past.
+func warnAdvisoryTokenBudgets(w io.Writer, cfg *channel.Config) {
+	for _, a := range cfg.TokenBudgetAdvisories() {
+		_, _ = fmt.Fprintln(w, a.Warning())
 	}
 }
 

@@ -94,8 +94,22 @@ routes:
   # running this file.
   # ---------------------------------------------------------------------
 
-  # A token budget with the full rotation block.
+  # A REQUEST budget with the full rotation block.
   # Slots: key_files[0] -> 0, key_files[1] -> 1, key_refs[0] -> 2.
+  #
+  # BUDGET BY REQUESTS. A request cap is EXACT under concurrency: admission
+  # counts the leases already in flight, so a simultaneous burst cannot exceed
+  # the per-key plan. Measured exact across a 12-combination pool-size x cap
+  # sweep at burst 60 — zero overspend, zero leaked leases, charged always equal
+  # to what the upstream actually served.
+  #
+  # `budget.tokens` is still SUPPORTED, and is deliberately not shown here. A
+  # token cap bounds the ESTIMATE, not the charge: it admits
+  # tokens/estimate_tokens leases at once and each settles whatever the upstream
+  # really reported, so a plan is overspendable by that ratio. Measured at
+  # tokens 1000 / estimate_tokens 100 against a real 5000-token response: 50000
+  # charged against a 1000-token cap. Configure one and the gateway says so
+  # loudly at startup, naming the ratio for your numbers.
   - name: minimax-pool
     prefix: /minimax-pool/
     upstream: https://api.minimaxi.com
@@ -106,15 +120,17 @@ routes:
     key_refs:
       - op://Infra/minimax/key-3
     rotation:
+      # Selection policy and budget denomination are independent: this route
+      # BALANCES by the upstream's reported token totals while being CAPPED by
+      # requests. With no estimate_tokens configured, a response that reports no
+      # usage is charged 0 and marks the key estimated, which degrades this
+      # policy to request ordering for that selection — never to a wrong charge.
       policy: least_tokens      # round_robin (default) | least_used | least_tokens
       max_retry_after: 1h       # clamps the Retry-After on a 503; 0 = 1h
       budget:
         window: 1h              # tumbling; 0 disables ALL caps
-        tokens: 2000000         # hard per-key cap; 0 = uncapped
+        requests: 5000          # hard per-key cap; 0 = uncapped
         soft_ratio: 0.8         # retire at 80% of the cap; 0 selects the default
-        estimate_tokens: 1500   # REQUIRED when tokens is set — a streaming
-                                # response reports no usage, and charging it
-                                # zero would let the cap never advance
     enabled: false
 
   # The shorthand spelling. `rotation: round_robin` is exactly
@@ -139,9 +155,11 @@ routes:
 
   # Pooled header route with a REQUEST budget.
   #
-  # A header-auth upstream reports no usage.total_tokens, so every sample is
-  # an estimate. Budget these by requests, not tokens — and note that
-  # `policy: least_tokens` is REJECTED here at config load, because it would
+  # Every route in this file budgets by requests. On a header route the
+  # alternative is not merely inexact but meaningless: a header-auth upstream
+  # reports no usage.total_tokens, so every sample is an estimate and a token
+  # cap would be spent entirely in estimate_tokens increments. For the same
+  # reason `policy: least_tokens` is REJECTED here at config load — it would
   # compare estimates against estimates while claiming to balance tokens.
   - name: exa-pool
     prefix: /exa/

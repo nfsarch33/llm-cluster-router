@@ -414,7 +414,19 @@ func TestExampleConfig_IsTheOneShippedSchema(t *testing.T) {
 		t.Errorf("codex key_ref = %q, want an %s reference", got, SchemeOP)
 	}
 
-	// The full rotation block, with a token budget.
+	// The full rotation block, with a REQUEST budget.
+	//
+	// It used to carry a token budget. Every shipped config now budgets by
+	// requests: a request cap is exact under concurrency, whereas a token cap
+	// bounds only the ESTIMATE and is overspendable by tokens/estimate_tokens —
+	// measured 50x at cap 1000 / estimate 100 against a real 5000-token
+	// response. An example that budgets by tokens is a default an operator
+	// inherits without ever making the decision.
+	//
+	// The policy assertion stays exactly as it was, and now carries a second
+	// meaning: selection and budget denomination are INDEPENDENT. This route
+	// balances by the upstream's reported token totals while being capped by
+	// requests.
 	mmPool := byName["minimax-pool"]
 	if declaredKeyCount(mmPool) != 3 {
 		t.Errorf("minimax-pool declares %d slots, want 3", declaredKeyCount(mmPool))
@@ -422,8 +434,11 @@ func TestExampleConfig_IsTheOneShippedSchema(t *testing.T) {
 	if mmPool.Rotation == nil || mmPool.Rotation.Policy != PolicyLeastTokens {
 		t.Fatalf("minimax-pool rotation = %+v, want least_tokens", mmPool.Rotation)
 	}
-	if mmPool.Rotation.Budget.EstimateTokens == 0 {
-		t.Error("minimax-pool sets a token cap with no estimate_tokens; Validate should have refused it")
+	if mmPool.Rotation.Budget.Requests == 0 {
+		t.Error("minimax-pool ships no request budget; the example must SHOW the cap an operator should copy, not merely omit the one they should not")
+	}
+	if got := mmPool.Rotation.Budget.Tokens; got != 0 {
+		t.Errorf("minimax-pool budgets by tokens (%d); token caps are advisory and no shipped example may configure one", got)
 	}
 
 	// The scalar shorthand the pooledauth branch shipped must still parse.

@@ -102,6 +102,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     with reasons `cap` / `quota` / `error`. The `gateway` subcommand registers
     it at startup, so the series actually exists for alerts to watch.
 
+### Changed
+
+- **Request budgets are the default; token budgets are advisory.** Operator
+  decision: budget by requests, not tokens.
+
+  A `rotation.budget.requests` cap is EXACT under concurrency — admission counts
+  the leases already in flight and a request's cost is known before it is
+  admitted — measured exact across a 12-combination pool-size × cap sweep at
+  burst 60, with zero overspend, zero leaked in-flight and the charge always
+  equal to what the upstream served.
+
+  A `rotation.budget.tokens` cap bounds the ESTIMATE, not the charge: it admits
+  `ceil(tokens/estimate_tokens)` leases at once and each settles whatever the
+  upstream actually reported. MEASURED at `tokens: 1000`, `estimate_tokens: 100`
+  and a real 5000-token response: 10 concurrent leases charged 50000 against a
+  1000-token cap, a 50x overshoot, where the sequential worst case for the same
+  numbers is 5000.
+
+  - `deploy/helixchannel/gateway.example.yml` — the only example config — now
+    budgets `minimax-pool` by requests. No shipped example configures a token
+    budget.
+  - Token budgets remain **supported**. Configuring one now produces a loud
+    startup warning naming the overshoot ratio for that route's own numbers
+    (`tokens/estimate_tokens`), so the magnitude arrives at start rather than on
+    a bill. `Config.TokenBudgetAdvisories` is the one place that arithmetic
+    lives, and it is asserted against what `admissibleLocked` actually grants.
+  - Reserved-token accounting — reserving `estimate_tokens` at admission and
+    reconciling it to the real total at settlement — is the known path to an
+    exact token cap. It is deliberately NOT implemented; see the follow-up note
+    in `docs/helixchannel.md` and on `channel.BudgetAdvisory`.
+
 ### Fixed
 - **A healthy route reported its keys as exhausted (confirmed).** The R1
   admission-control fix created a NEW refusal mode — a key at its hard cap once
