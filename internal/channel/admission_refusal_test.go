@@ -160,8 +160,14 @@ func TestRotation_DrainedRouteStillReportsKeysExhausted(t *testing.T) {
 // is being offered more concurrency than its plan allows" — which is exactly the
 // distinction the error code now makes in the body.
 //
-// Route names are unique to this test so its label sets are private to it and
-// the global counter needs no reset.
+// AdmissionRefusedTotal is a PACKAGE GLOBAL with no reset, so it accumulates
+// across every run of this test in a process. Unique route names keep the label
+// sets private to this test but do NOT make the counter start at zero on the
+// second run. Every assertion below is therefore a delta against a reading taken
+// before the requests are made — the same shape as the sibling at
+// TestRotation_UpstreamQuotaStatusRetiresWithReasonQuota. Asserting the absolute
+// value instead made the entire package fail under -count>1 and -shuffle, which
+// cost the package its only flake detector.
 func TestRotation_RefusalsAreCountedUnderSeparateMetricReasons(t *testing.T) {
 	t.Parallel()
 	const (
@@ -170,6 +176,19 @@ func TestRotation_RefusalsAreCountedUnderSeparateMetricReasons(t *testing.T) {
 	)
 	count := func(route, reason string) float64 {
 		return testutil.ToFloat64(AdmissionRefusedTotal.WithLabelValues(route, reason))
+	}
+	type series struct{ route, reason string }
+	before := map[series]float64{}
+	for _, s := range []series{
+		{admissionRoute503, "admission_limited"},
+		{admissionRoute503, "keys_exhausted"},
+		{drainedRoute503, "keys_exhausted"},
+		{drainedRoute503, "admission_limited"},
+	} {
+		before[s] = count(s.route, s.reason)
+	}
+	delta := func(route, reason string) float64 {
+		return count(route, reason) - before[series{route, reason}]
 	}
 
 	admSrv := admissionRoute(t, admissionRoute503, nil)
@@ -187,18 +206,18 @@ func TestRotation_RefusalsAreCountedUnderSeparateMetricReasons(t *testing.T) {
 		t.Fatalf("drained status = %d, want 503", got)
 	}
 
-	if got := count(admissionRoute503, "admission_limited"); got != 1 {
-		t.Errorf("admission_limited{route=%q} = %v, want 1", admissionRoute503, got)
+	if got := delta(admissionRoute503, "admission_limited"); got != 1 {
+		t.Errorf("admission_limited{route=%q} delta = %v, want 1", admissionRoute503, got)
 	}
-	if got := count(admissionRoute503, "keys_exhausted"); got != 0 {
-		t.Errorf("keys_exhausted{route=%q} = %v, want 0: an admission refusal must not inflate the billing series",
+	if got := delta(admissionRoute503, "keys_exhausted"); got != 0 {
+		t.Errorf("keys_exhausted{route=%q} delta = %v, want 0: an admission refusal must not inflate the billing series",
 			admissionRoute503, got)
 	}
-	if got := count(drainedRoute503, "keys_exhausted"); got != 1 {
-		t.Errorf("keys_exhausted{route=%q} = %v, want 1", drainedRoute503, got)
+	if got := delta(drainedRoute503, "keys_exhausted"); got != 1 {
+		t.Errorf("keys_exhausted{route=%q} delta = %v, want 1", drainedRoute503, got)
 	}
-	if got := count(drainedRoute503, "admission_limited"); got != 0 {
-		t.Errorf("admission_limited{route=%q} = %v, want 0", drainedRoute503, got)
+	if got := delta(drainedRoute503, "admission_limited"); got != 0 {
+		t.Errorf("admission_limited{route=%q} delta = %v, want 0", drainedRoute503, got)
 	}
 }
 
