@@ -18,6 +18,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A pooled route with no budget now warns at startup.** `Config.UncappedPoolAdvisories()`
+  reports every route that declares a key pool (`key_envs`/`key_files`/`key_refs`)
+  and carries neither `rotation.budget.requests` nor `rotation.budget.tokens`.
+  The gateway previously warned only about budgets in the wrong *denomination*
+  (`TokenBudgetAdvisories`) and said nothing at all about the absence of a
+  budget — so the configuration that spends a plan without limit was the
+  quietest one in the file. The warning names how many funded plans the route
+  exposes and the exact YAML that caps them. It is **advisory, not a load
+  error**: making it fatal would refuse every already-deployed pooled config at
+  its next restart. Single-key routes are excluded because `validateRotation`
+  refuses a rotation block there, so a budget is not configurable at all.
+- **`deploy/helixchannel/gateway.example.yml` is gated on being fully capped.**
+  `TestExampleConfig_EveryPooledRouteCarriesARequestBudget` strengthens the
+  previous "at least one route somewhere is budgeted" check to "no pooled route
+  is uncapped", asserted against the **parsed** config rather than the file text
+  (`LoadConfig` uses `yaml.Unmarshal` with no `KnownFields`, so a misspelled
+  `budgets:` silently vanishes and a text grep would pass on a config the
+  gateway reads as uncapped).
+
+### Fixed
+
+- **`qwen-pool` in the shipped example was an uncapped pool.** It used the
+  scalar shorthand `rotation: round_robin`, which is exactly
+  `rotation: {policy: round_robin}` — a policy with no budget, and the only
+  spelling of a pool that *cannot* carry one. It is now written in the mapping
+  form with a request budget, and the shorthand is documented as a footgun on a
+  funded route rather than as a convenience.
+- **`trust_forwarded_for_audit` was missing from the example config.** It is a
+  supported, code-backed field documented only in `docs/helixchannel.md`, and
+  `gateway.example.yml` describes itself as the only example config — so an
+  omission there propagates to every node deployed from it.
+
 - **`trust_forwarded_for_audit`** (default `false`): when the gateway sits
   behind a same-host TLS terminator (nginx/Caddy) relaying public traffic to
   a loopback bind, every request previously logged `client_addr: 127.0.0.1`

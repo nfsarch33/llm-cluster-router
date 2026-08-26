@@ -155,3 +155,76 @@ func TestWarnAdvisoryTokenBudgets_SaysNothingWhenNothingBudgetsByTokens(t *testi
 		t.Errorf("warnAdvisoryTokenBudgets wrote %q, want nothing", got)
 	}
 }
+
+// writeUncappedPoolConfig writes a pooled inject route with no budget at all —
+// the shape that spends every funded plan without limit and, until this
+// warning existed, said nothing at startup.
+func writeUncappedPoolConfig(t *testing.T) string {
+	t.Helper()
+	path := t.TempDir() + "/gateway.yml"
+	cfg := `listen: "127.0.0.1:0"
+routes:
+  - name: minimax
+    prefix: /minimax/
+    upstream: "http://127.0.0.1:9"
+    auth: inject
+    key_envs: [V18772_UNCAPPED_K1, V18772_UNCAPPED_K2, V18772_UNCAPPED_K3] # gitleaks:allow — env NAMES, not secrets
+    rotation: least_used
+    enabled: true
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+// TestRunGateway_SaysAtStartupThatAPooledRouteIsUncapped is the wiring test for
+// the second advisory, and it reproduces the EXACT shape the live edge ran:
+// three pooled MiniMax keys behind `rotation: least_used` with no budget block.
+//
+// That config started clean and silent. The whole point of this warning is that
+// it no longer does.
+func TestRunGateway_SaysAtStartupThatAPooledRouteIsUncapped(t *testing.T) {
+	t.Setenv("V18772_UNCAPPED_K1", "sk-test-1")
+	t.Setenv("V18772_UNCAPPED_K2", "sk-test-2")
+	t.Setenv("V18772_UNCAPPED_K3", "sk-test-3")
+	cfgPath := writeUncappedPoolConfig(t)
+
+	var stdout string
+	stderr, err := captureStderr(t, func() error {
+		var runErr error
+		stdout, runErr = captureStdout(t, func() error {
+			return runGateway([]string{"--config", cfgPath, "--print-routes"})
+		})
+		return runErr
+	})
+	if err != nil {
+		t.Fatalf("runGateway --print-routes = %v, want nil", err)
+	}
+	for _, want := range []string{"WARNING", `"minimax"`, "UNCAPPED", "3 server-held keys", "rotation.budget.requests"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("startup stderr does not contain %q:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stdout, "WARNING") {
+		t.Errorf("the warning leaked into the --print-routes JSON envelope on stdout:\n%s", stdout)
+	}
+}
+
+// TestWarnUncappedPools_SilentOnACappedPool keeps the banner quiet on the
+// recommended shape, for the same reason as its token-budget sibling.
+func TestWarnUncappedPools_SilentOnACappedPool(t *testing.T) {
+	cfg := &channel.Config{Listen: "127.0.0.1:0", Routes: []channel.Route{{
+		Name: "minimax", Prefix: "/minimax/", Upstream: "https://api.example.invalid",
+		Auth: channel.AuthInject, KeyEnvs: []string{"K1", "K2", "K3"}, Enabled: true,
+		Rotation: &channel.RotationConfig{Budget: channel.Budget{
+			Window: time.Hour, Requests: 1000, SoftRatio: 0.8,
+		}},
+	}}}
+
+	var buf bytes.Buffer
+	warnUncappedPools(&buf, cfg)
+	if got := buf.String(); got != "" {
+		t.Errorf("warnUncappedPools wrote %q on a capped pool, want nothing", got)
+	}
+}

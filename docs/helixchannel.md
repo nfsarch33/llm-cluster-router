@@ -808,6 +808,57 @@ decision.
 > for now; this note is the record of that choice, so that "token caps are
 > advisory" reads as a decision rather than as an unnoticed defect.
 
+### A pool with no budget says so at startup
+
+Two things can be wrong with a budget, and until v18772 the gateway only ever
+mentioned one of them.
+
+`TokenBudgetAdvisories` warns the operator who capped in the wrong
+**denomination** — a real decision, made and mis-spelled, and it shouted its own
+overshoot ratio. Nothing warned the operator who had not capped **at all**, and
+that is the shape that actually spends a plan without limit: a pooled route
+holds server-side keys, and every caller who gets past `gateway_auth` spends
+them. The louder message went to the smaller problem.
+
+`Config.UncappedPoolAdvisories()` closes that asymmetry. Any route that declares
+a key pool (`key_envs` / `key_files` / `key_refs`) and carries neither
+`rotation.budget.requests` nor `rotation.budget.tokens` produces a startup
+warning naming the number of funded plans exposed and the exact YAML that caps
+them.
+
+Two shapes are uncapped and both are reported:
+
+```yaml
+rotation: round_robin          # scalar shorthand — a policy with NO budget
+```
+
+```yaml
+key_files: [a.key, b.key]      # a pool with no rotation block at all
+```
+
+The scalar shorthand deserves its own warning because it is the one spelling of
+a pool that **cannot** carry a budget: `rotation: round_robin` is exactly
+`rotation: {policy: round_robin}`, it reads like a complete rotation config, and
+it produces an uncapped pool. Use it only where the pool is not funded.
+
+Single-key routes are excluded, and that exclusion is a correctness rule rather
+than a preference: `validateRotation` *refuses* a rotation block on a single-key
+route, so warning that one is uncapped would be advice to write a config the
+loader rejects.
+
+The advisory is deliberately **not** a load error. Making it fatal would refuse
+every already-deployed pooled config at its next restart, turning a warning into
+a fleet-wide outage during an upgrade.
+
+`deploy/helixchannel/gateway.example.yml` is gated on it: every pooled route in
+the shipped example must carry a request budget and a window
+(`TestExampleConfig_EveryPooledRouteCarriesARequestBudget`). The assertion runs
+against the **parsed** config and never against the file text — `LoadConfig`
+uses `yaml.Unmarshal` with no `KnownFields`, so a misspelled `budgets:` or a
+mis-indented `requests:` is silently dropped and the route parses as
+budget-free. A text grep would pass on a config the gateway reads as uncapped,
+which is the exact failure the gate exists to catch.
+
 ### Unsettled leases are reclaimed after 30 minutes
 
 Counting leases in flight has a corollary: a reservation that is never settled
