@@ -602,7 +602,7 @@ curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/minimax/v1/mo
 # placeholder is stripped, the server key reaches MiniMax, the request is served.
 curl -s https://gateway.example.com/minimax/v1/models \
   -H "X-HelixChannel-Token: $GW" \
-  -H "Authorization: Bearer placeholder-is-stripped-not-forwarded"
+  -H "Authorization: Bearer placeholder"
 
 # The CONNECT leg, and that the certificate is the provider's
 curl -v -x http://127.0.0.1:47810 https://api.anthropic.com/ 2>&1 | grep -E 'subject:|verify'

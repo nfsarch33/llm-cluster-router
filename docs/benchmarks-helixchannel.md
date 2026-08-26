@@ -17,7 +17,7 @@ A benchmark result without its host is not a measurement.
 | Toolchain | `go1.26.7 linux/amd64` |
 | CPU | Intel Core i9-10900X @ 3.70 GHz |
 | Logical CPUs / `GOMAXPROCS` | 16 / 16 (benchmark names carry the `-16` suffix) |
-| OS | Ubuntu 24.04 under WSL2, kernel `6.18.33.2-microsoft-standard-WSL2` |
+| OS | Ubuntu 24.04 under WSL2, kernel `6.18.x-microsoft-standard-WSL2` |
 | Command | `go test -run='^$' -bench=. -benchmem -count=5 ./internal/channel/` |
 | Statistic | **median of 5**, and every figure below was reproducible to within a few percent across those 5 |
 
