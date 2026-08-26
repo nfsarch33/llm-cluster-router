@@ -32,6 +32,11 @@ jobs:
       HELIXCHANNEL_LIVE_INSECURE: ${{ secrets.HELIXCHANNEL_LIVE_INSECURE }}
       HELIXCHANNEL_LIVE_CHAT: ${{ secrets.HELIXCHANNEL_LIVE_CHAT }}
       HELIXCHANNEL_CONNECT_ADDR: ${{ secrets.HELIXCHANNEL_CONNECT_ADDR }}
+      # The reverse-proxy leg is gated by gateway_auth, so every inject-route
+      # assertion needs this. Absent, those tests SKIP (not fail); the anonymous
+      # auth-boundary and disclosure regressions still run without it.
+      HELIXCHANNEL_GATEWAY_TOKEN: ${{ secrets.HELIXCHANNEL_GATEWAY_TOKEN }}
+      HELIXCHANNEL_CONNECT_TOKEN_FILE: ${{ secrets.HELIXCHANNEL_CONNECT_TOKEN_FILE }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
