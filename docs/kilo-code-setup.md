@@ -74,10 +74,23 @@ exempt by default and need no token, so nothing on that host changes. The
 exemption is decided from the connection's peer address, so it cannot be claimed
 with `X-Forwarded-For`.
 
-If a client cannot send a custom header at all, the supported answer is to make
-it a loopback caller — reach the gateway over an SSH tunnel or a tailnet address
-bound on loopback — or to put an authenticating terminator in front and let it
-hold the token. Do not disable `gateway_auth` to work around it.
+Both clients this repo documents can send it: Kilo Code has a **Headers** field
+on the OpenAI-Compatible provider, and Claude Code has `ANTHROPIC_CUSTOM_HEADERS`
+(one `Name: Value` pair per line). Neither needs a workaround.
+
+If some other client cannot send a custom header at all, the supported answer is
+to make it a loopback caller — reach the gateway over an SSH tunnel or a tailnet
+address bound on loopback — or to put an authenticating terminator in front and
+let it hold the token. Do not disable `gateway_auth` to work around it.
+
+**A caution about `exempt_loopback` when a terminator is involved.** The
+exemption asks "is the TCP peer on 127.0.0.0/8", and it answers that honestly.
+It does not, and cannot, ask "is the caller trustworthy". If an nginx or Caddy
+server block on the same host proxies *public* traffic to a loopback-bound
+gateway, then every public request arrives with a loopback peer and the default
+`exempt_loopback: true` waives the token for all of them — a gateway that looks
+configured and authenticates nobody. Set `exempt_loopback: false` on any gateway
+whose loopback callers are relays rather than local clients.
 
 Roll it out in this order so no traffic is dropped: create the token, configure
 every remote client with it *first* (nothing rejects it yet), then add the
@@ -114,15 +127,52 @@ Extensions panel → search "Kilo Code" → Install. Open the Kilo Code panel, t
 | API Provider | `OpenAI Compatible` |
 | Base URL | `https://gateway.example.com/minimax/v1` |
 | API Key | any non-empty placeholder, e.g. `helixchannel-client` |
+| **Headers** | `X-HelixChannel-Token` → the gateway token |
 | Model | `MiniMax-M3` |
 | Max Tokens | `2048` |
 | Temperature | `0.7` |
 
-Two details that cause most failures:
+The **Headers** field is the one that matters and the one people miss. Kilo
+Code's own documentation describes it as *"Headers (optional) — Custom HTTP
+headers as key-value pairs"*, and the extension merges those into every request
+it sends. This was verified rather than assumed: the field is documented for the
+OpenAI-Compatible provider, and `customHeaders` is applied in the extension's
+own request path.
+
+One consequence of how that merge works is worth knowing. The extension sets
+`Authorization: Bearer <API Key>` **after** merging your custom headers, so an
+`Authorization` entry in the Headers field is overwritten and cannot be used to
+carry anything. `X-HelixChannel-Token` is unaffected.
+
+Recent Kilo Code builds are rebuilt on the Kilo CLI and share one JSONC config
+across the CLI, VS Code and JetBrains, so the same provider can be written
+directly to `~/.config/kilo/kilo.jsonc` instead of clicking through the panel:
+
+```jsonc
+{
+  "provider": {
+    "helixchannel-minimax": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "HelixChannel (MiniMax)",
+      "options": {
+        "baseURL": "https://gateway.example.com/minimax/v1",
+        "apiKey": "helixchannel-client",
+        "headers": { "X-HelixChannel-Token": "<the gateway token>" }
+      },
+      "models": { "MiniMax-M3": { "name": "MiniMax-M3" } }
+    }
+  }
+}
+```
+
+Check which layout your installed build uses before scripting this: older
+versions kept provider settings in VS Code `globalStorage` instead.
+
+Three details that cause most failures:
 
 - **The route prefix is part of the base URL.** `https://gateway.example.com/v1` will 404 — the gateway needs `/minimax/v1` to know which upstream you mean. The 404 body lists the routes that are available.
 - **The API key is a placeholder.** The gateway replaces it with the real key. That is the entire point: the editor never holds a provider credential. If the gateway is running in `passthrough` mode instead, then the key you enter *is* the one used.
-- **The gateway token is a separate field.** If the gateway requires one (see [1b](#1b-the-gateway-token-every-client-that-is-not-on-the-gateway-host)), add `X-HelixChannel-Token` in the provider's custom-headers section. It does not go in the API Key field — that field is the placeholder the gateway strips, and putting the gateway token there would send it to the provider rather than to the gateway.
+- **The gateway token is a separate field.** If the gateway requires one (see [1b](#1b-the-gateway-token-every-client-that-is-not-on-the-gateway-host)), it goes in **Headers**, not in API Key. Putting it in the API Key field would send it to the provider rather than to the gateway — on an inject route the gateway strips that field before forwarding, so the token would be discarded and the request refused; on a `passthrough` route it would be forwarded to the provider verbatim, which is worse.
 
 If the gateway serves a self-signed certificate, enable the extension's TLS-skip option. Prefer a CA-issued certificate and leave verification on.
 
