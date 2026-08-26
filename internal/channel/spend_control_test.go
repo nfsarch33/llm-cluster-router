@@ -190,14 +190,15 @@ func TestRotation_ConcurrentBurstCannotOverspendTheHardCap(t *testing.T) {
 		reqCap = 5
 	)
 	gate := newReleaseGate(burst)
-	var hits atomic.Int64
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
+	// A probe, not a bare httptest server: "the upstream saw exactly N" is
+	// only true of an upstream no other process can reach, and the gate below
+	// makes it worse than a miscount -- a note raised by a stray request
+	// releases the burst before it has come to rest. See upstreamProbe.
+	upstream := newUpstreamProbe(t, func(w http.ResponseWriter, _ *http.Request) {
 		gate.note()
 		gate.wait()
 		_, _ = io.WriteString(w, `{"usage":{"total_tokens":1}}`)
-	}))
-	defer upstream.Close()
+	})
 
 	srv := rotServer(t, rotatingConfig(t, "mm", upstream.URL,
 		[]string{"k1-not-real"},
@@ -213,7 +214,7 @@ func TestRotation_ConcurrentBurstCannotOverspendTheHardCap(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mm/v1/chat", nil))
+			handler.ServeHTTP(rec, upstream.stamp(httptest.NewRequest(http.MethodGet, "/mm/v1/chat", nil)))
 			switch rec.Code {
 			case http.StatusOK:
 				served.Add(1)
@@ -229,7 +230,7 @@ func TestRotation_ConcurrentBurstCannotOverspendTheHardCap(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := hits.Load(); got != reqCap {
+	if got := upstream.hitCount(); got != reqCap {
 		t.Errorf("upstream saw %d of %d burst requests against a %d-request cap, want %d",
 			got, burst, reqCap, reqCap)
 	}
@@ -255,13 +256,14 @@ func TestRotation_ConcurrentBurstCannotOverspendTheHardCap(t *testing.T) {
 // multi-hour quota outage, labelled reason=cap, caused by a transient outage.
 func TestRotation_UpstreamServerErrorIsNeverChargedAsSpend(t *testing.T) {
 	t.Parallel()
-	var hits atomic.Int64
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
+	// A probe, not a bare httptest server. This count was MEASURED wrong on a
+	// STRICTLY SEQUENTIAL test: five requests, eight arrivals, because three
+	// came from another test binary that had been handed this port. See
+	// upstreamProbe.
+	upstream := newUpstreamProbe(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, `{"error":"upstream exploded"}`)
-	}))
-	defer upstream.Close()
+	})
 
 	obs := newCountingObserver()
 	var audit bytes.Buffer
@@ -272,7 +274,7 @@ func TestRotation_UpstreamServerErrorIsNeverChargedAsSpend(t *testing.T) {
 		}}), nil, &audit, WithRotationRetireObserver(obs))
 
 	for i := range 4 {
-		rec := serve(srv, http.MethodGet, "/mm/v1/chat", nil)
+		rec := serve(srv, http.MethodGet, "/mm/v1/chat", upstream.header(nil))
 		if rec.Code != http.StatusInternalServerError {
 			t.Fatalf("request %d status = %d, want the upstream 500 relayed", i, rec.Code)
 		}
@@ -293,7 +295,7 @@ func TestRotation_UpstreamServerErrorIsNeverChargedAsSpend(t *testing.T) {
 		t.Errorf("cap retirements = %d, want 0: nothing was spent, so no plan was capped", n)
 	}
 
-	fifth := serve(srv, http.MethodGet, "/mm/v1/chat", nil)
+	fifth := serve(srv, http.MethodGet, "/mm/v1/chat", upstream.header(nil))
 	if fifth.Code == http.StatusServiceUnavailable {
 		t.Fatalf("status = 503 (Retry-After %q) after four upstream failures; "+
 			"an upstream outage must not become a self-inflicted quota outage",
@@ -302,7 +304,7 @@ func TestRotation_UpstreamServerErrorIsNeverChargedAsSpend(t *testing.T) {
 	if fifth.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want the upstream 500 still relayed", fifth.Code)
 	}
-	if got := hits.Load(); got != 5 {
+	if got := upstream.hitCount(); got != 5 {
 		t.Errorf("upstream saw %d requests, want 5: the route must still be serving", got)
 	}
 	for _, l := range auditLines(t, &audit) {
@@ -374,15 +376,17 @@ func TestRotation_QuotaRetirementIsCountedOncePerKeyOnTheMinimalConfig(t *testin
 	t.Parallel()
 	const burst = 60
 	gate := newReleaseGate(burst)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// A probe: this test counts no arrivals, but it does GATE on them, and a
+	// note raised by another process releases the burst before all sixty are
+	// in flight -- which is the whole premise of the test. See upstreamProbe.
+	upstream := newUpstreamProbe(t, func(w http.ResponseWriter, _ *http.Request) {
 		// Hold every request until the whole burst is in flight, so all sixty
 		// settle against a key that is already retired.
 		gate.note()
 		gate.wait()
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":"rate limited"}`)
-	}))
-	defer upstream.Close()
+	})
 
 	obs := newCountingObserver()
 	// &RotationConfig{} is exactly what the documented minimal block
@@ -399,7 +403,7 @@ func TestRotation_QuotaRetirementIsCountedOncePerKeyOnTheMinimalConfig(t *testin
 		go func() {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
-			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mm/v1/chat", nil))
+			handler.ServeHTTP(rec, upstream.stamp(httptest.NewRequest(http.MethodGet, "/mm/v1/chat", nil)))
 			if rec.Code != http.StatusTooManyRequests {
 				t.Errorf("status = %d, want the upstream 429 relayed", rec.Code)
 			}

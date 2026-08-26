@@ -407,14 +407,15 @@ func TestIT_ConcurrentBurstIsAdmissionControlledOverRealHTTP(t *testing.T) {
 		reqCap = 5
 	)
 	gate := newReleaseGate(burst)
-	var hits atomic.Int64
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
+	// A probe, not a bare httptest server: "the upstream saw exactly N" is
+	// only true of an upstream no other process can reach, and the gate below
+	// makes it worse than a miscount -- a note raised by a stray request
+	// releases the burst before it has come to rest. See upstreamProbe.
+	upstream := newUpstreamProbe(t, func(w http.ResponseWriter, _ *http.Request) {
 		gate.note()
 		gate.wait()
 		_, _ = io.WriteString(w, `{"usage":{"total_tokens":1}}`)
-	}))
-	defer upstream.Close()
+	})
 
 	srv := rotServer(t, rotatingConfig(t, "mm", upstream.URL,
 		[]string{"k1-not-real", "k2-not-real"},
@@ -436,7 +437,7 @@ func TestIT_ConcurrentBurstIsAdmissionControlledOverRealHTTP(t *testing.T) {
 				gate.note()
 				return
 			}
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := http.DefaultClient.Do(upstream.stamp(req))
 			if err != nil {
 				t.Errorf("GET through the gateway: %v", err)
 				gate.note()
@@ -461,7 +462,7 @@ func TestIT_ConcurrentBurstIsAdmissionControlledOverRealHTTP(t *testing.T) {
 
 	// Two keys, five requests each: the plan is ten, not five.
 	const plan = 2 * reqCap
-	if got := hits.Load(); got != plan {
+	if got := upstream.hitCount(); got != plan {
 		t.Errorf("upstream saw %d of %d burst requests against a %d-request cap on each of 2 keys, want %d",
 			got, burst, reqCap, plan)
 	}
