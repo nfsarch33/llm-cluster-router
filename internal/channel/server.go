@@ -173,6 +173,11 @@ type Server struct {
 	proxyAuth  ProxyAuthMode
 	proxyToken string
 
+	// trustForwardedForAudit mirrors Config.TrustForwardedForAudit, copied
+	// once by NewServer. Consulted ONLY by auditClientAddr. No admission
+	// decision reads this field -- see the config-level doc for why.
+	trustForwardedForAudit bool
+
 	// connectLinger is the CONNECT tunnel half-close backstop, written exactly
 	// once by NewServer and only read thereafter. See the comment on
 	// defaultConnectHalfCloseLinger for what it bounds and why.
@@ -348,6 +353,7 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) 
 		}
 		s.proxyToken = tok
 	}
+	s.trustForwardedForAudit = cfg.TrustForwardedForAudit
 	return s, nil
 }
 
@@ -526,7 +532,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 			AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 			Upstream: rt.Route.Upstream, Status: http.StatusBadGateway,
-			LatencyMS: time.Since(start).Milliseconds(), ClientAddr: r.RemoteAddr,
+			LatencyMS: time.Since(start).Milliseconds(), ClientAddr: s.auditClientAddr(r),
 			Error: errorClass(err),
 		}
 		// The 502 line carries the key index too: during a per-key outage,
@@ -552,7 +558,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		Upstream: rt.Route.Upstream, UpstreamHost: contactedHost(resp),
 		Status:    resp.StatusCode,
 		LatencyMS: time.Since(start).Milliseconds(), BytesOut: n,
-		ClientAddr: r.RemoteAddr,
+		ClientAddr: s.auditClientAddr(r),
 	}
 	// A redirect the gateway declined to follow is a distinct outcome, not a
 	// plain 3xx relay: the upstream asked for a credential to be replayed
@@ -687,7 +693,7 @@ func (s *Server) denyUnavailable(w http.ResponseWriter, rt *boundRoute, r *http.
 		Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 		AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 		Upstream: rt.Route.Upstream, Status: http.StatusServiceUnavailable,
-		LatencyMS: time.Since(start).Milliseconds(), ClientAddr: r.RemoteAddr,
+		LatencyMS: time.Since(start).Milliseconds(), ClientAddr: s.auditClientAddr(r),
 		Error: code,
 	})
 }
@@ -1028,7 +1034,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.audit.Log(AuditEvent{
 			Event: "connect_denied", RequestID: requestID, Target: target,
 			Status: status, LatencyMS: time.Since(start).Milliseconds(),
-			ClientAddr: r.RemoteAddr, Error: reason,
+			ClientAddr: s.auditClientAddr(r), Error: reason,
 		})
 	}
 
@@ -1054,7 +1060,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.audit.Log(AuditEvent{
 			Event: "connect_denied", RequestID: requestID, Target: target,
 			Status: http.StatusServiceUnavailable, LatencyMS: time.Since(start).Milliseconds(),
-			ClientAddr: r.RemoteAddr, Error: "tunnels_at_capacity",
+			ClientAddr: s.auditClientAddr(r), Error: "tunnels_at_capacity",
 		})
 		return
 	}
@@ -1101,7 +1107,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.audit.Log(AuditEvent{
 		Event: "connect_established", RequestID: requestID, Target: target,
 		Status: http.StatusOK, LatencyMS: time.Since(start).Milliseconds(),
-		ClientAddr: r.RemoteAddr,
+		ClientAddr: s.auditClientAddr(r),
 	})
 
 	// Both directions are copied concurrently, and BOTH are bounded three ways.
@@ -1167,7 +1173,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.audit.Log(AuditEvent{
 		Event: "connect_closed", RequestID: requestID, Target: target,
 		LatencyMS: time.Since(start).Milliseconds(), BytesOut: bytesUp,
-		ClientAddr: r.RemoteAddr,
+		ClientAddr: s.auditClientAddr(r),
 	})
 }
 

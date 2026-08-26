@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: the gateway token header is renamed from `X-HelixChannel-Token`
+  to `X-HLXN-Token`.** `HLXN` is the standing short code for "Helixon" across
+  headers, env var prefixes and CLI flags. This is a rename, not an added
+  alias — a client still sending the old header is refused identically to a
+  client sending none (`gateway_token_required`). Every remote client's
+  configuration must be updated before this build reaches a host any
+  non-loopback client talks to.
+
+### Added
+
+- **`trust_forwarded_for_audit`** (default `false`): when the gateway sits
+  behind a same-host TLS terminator (nginx/Caddy) relaying public traffic to
+  a loopback bind, every request previously logged `client_addr: 127.0.0.1`
+  — the terminator's own connection, not the real caller. This option
+  recovers the real address from `X-Forwarded-For` for the **audit log
+  only**; `authorizeProxy`, `isLoopbackPeer` and every admission decision are
+  unaffected and keep reading the accepted TCP peer directly, never a
+  header. Deployments using this option should also set
+  `gateway_auth.exempt_loopback: false`, since the terminator's connection
+  being "loopback" no longer implies the caller is local.
+
 ### Fixed
 
 - **A loopback `listen` is now decided from the bound socket, not from the

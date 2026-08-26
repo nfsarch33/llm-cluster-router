@@ -346,6 +346,24 @@ type Config struct {
 	GatewayAuth GatewayAuthConfig `yaml:"gateway_auth"`
 	// TLS optionally terminates TLS on the gateway itself.
 	TLS TLSConfig `yaml:"tls"`
+
+	// TrustForwardedForAudit records the AUDIT LOG's client_addr from
+	// X-Forwarded-For instead of the accepted TCP peer, when (and only when)
+	// that peer is loopback. It exists for exactly one shape: a same-host
+	// TLS terminator (nginx) relaying the public internet to a gateway bound
+	// on 127.0.0.1, where every peer is "loopback" and the real caller
+	// address would otherwise be lost from every audit line.
+	//
+	// SECURITY BOUNDARY, stated plainly because this field sits one line
+	// away from code that decides who gets served: it is read in exactly one
+	// place (auditClientAddr in server.go) and written to exactly one field
+	// (AuditEvent.ClientAddr). authorizeProxy, isLoopbackPeer and every other
+	// admission decision keep reading r.RemoteAddr directly and never call
+	// auditClientAddr. A header cannot buy a caller anything by setting it —
+	// at most it buys a more accurate audit line, and an unparseable or
+	// multi-hop header falls back to the peer address unchanged rather than
+	// failing open to something this process never verified.
+	TrustForwardedForAudit bool `yaml:"trust_forwarded_for_audit"`
 }
 
 // DefaultTimeout is applied when neither the route nor the config sets one.

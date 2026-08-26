@@ -20,7 +20,7 @@ interchangeable. Pick deliberately:
 | Credential Claude Code uses | its own — your claude.ai login stays the active credential | the gateway's, or one you supply |
 | Billing | your subscription | per token, to whoever owns the credential the gateway forwards |
 | Client-side install | the `helixchannel` binary, run as a user service | none |
-| Which channel secret | the **CONNECT** token, in `Proxy-Authorization` | the **gateway** token, in `X-HelixChannel-Token` |
+| Which channel secret | the **CONNECT** token, in `Proxy-Authorization` | the **gateway** token, in `X-HLXN-Token` |
 | Feature loss | none | base-URL override disables Remote Control |
 | What the gateway can see | destination host and encrypted bytes | the full request and response |
 
@@ -34,7 +34,7 @@ audit trail, and its spend controls applied to this traffic.
 ```bash
 export ANTHROPIC_BASE_URL="https://gateway.example.com/anthropic"
 export ANTHROPIC_AUTH_TOKEN="placeholder"            # stripped on inject routes
-export ANTHROPIC_CUSTOM_HEADERS="X-HelixChannel-Token: <the gateway token>"
+export ANTHROPIC_CUSTOM_HEADERS="X-HLXN-Token: <the gateway token>"
 ```
 
 or the same three under `env` in `~/.claude/settings.json`. `ANTHROPIC_AUTH_TOKEN`
