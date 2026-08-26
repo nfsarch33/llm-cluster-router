@@ -172,13 +172,19 @@ type Server struct {
 	// read thereafter.
 	proxyAuth  ProxyAuthMode
 	proxyToken string
+
+	// connectLinger is the CONNECT tunnel half-close backstop, written exactly
+	// once by NewServer and only read thereafter. See the comment on
+	// defaultConnectHalfCloseLinger for what it bounds and why.
+	connectLinger time.Duration
 }
 
 // serverOptions are the injectable construction dependencies.
 type serverOptions struct {
-	secrets  SecretProvider
-	now      func() time.Time
-	observer RetireObserver
+	secrets       SecretProvider
+	now           func() time.Time
+	observer      RetireObserver
+	connectLinger time.Duration
 }
 
 // ServerOption customises Server construction. Variadic options keep every
@@ -205,6 +211,17 @@ func WithRotationRetireObserver(o RetireObserver) ServerOption {
 	return func(so *serverOptions) { so.observer = o }
 }
 
+// WithConnectHalfCloseLinger overrides how long the surviving direction of a
+// CONNECT tunnel may keep copying once the first direction has finished.
+//
+// It exists so a leak test can assert the bound in milliseconds instead of
+// waiting out defaultConnectHalfCloseLinger, and it is deliberately NOT a
+// config key: an operator has no reason to tune a backstop whose only job is to
+// stop an unresponsive peer parking a goroutine. Values <= 0 keep the default.
+func WithConnectHalfCloseLinger(d time.Duration) ServerOption {
+	return func(o *serverOptions) { o.connectLinger = d }
+}
+
 // NewServer builds a gateway from validated configuration.
 //
 // Every credential is resolved HERE, eagerly, before Handler() is reachable —
@@ -227,7 +244,11 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) 
 	if sp == nil {
 		sp = NewDefaultSecretProvider()
 	}
-	s := &Server{cfg: cfg, forwarder: fwd, audit: audit, allowed: map[string]bool{}}
+	linger := o.connectLinger
+	if linger <= 0 {
+		linger = defaultConnectHalfCloseLinger
+	}
+	s := &Server{cfg: cfg, forwarder: fwd, audit: audit, allowed: map[string]bool{}, connectLinger: linger}
 
 	for _, r := range cfg.EnabledRoutes() {
 		// The Store is sized from configuration alone: resolveKeyPool yields
@@ -732,6 +753,29 @@ func (s *Server) match(path string) *boundRoute {
 	return nil
 }
 
+// closeWriter is the half-close capability of a connection, stated as a
+// BEHAVIOUR so that no concrete conn type has to be enumerated.
+//
+// The CONNECT tunnel used to assert client.(*net.TCPConn), and that assertion
+// is FALSE on the deployment that matters. When tls.cert_file/key_file are set,
+// Serve hands the listener to http.Server.ServeTLS, so the conn returned by
+// Hijack is a *tls.Conn: ok came back false, CloseWrite was never called, the
+// client was never sent a FIN after the upstream half-closed, and the opposite
+// io.Copy blocked forever on an idle client -- taking wg.Wait, the handler
+// goroutine and both deferred Closes down with it. The upstream side of the
+// same pair worked only by luck, because net.DialTimeout really does hand back
+// a *net.TCPConn.
+//
+// *net.TCPConn, *tls.Conn and *net.UnixConn all implement CloseWrite, so asking
+// for the method covers every posture this gateway can serve in today and does
+// not silently regress the next time a conn arrives wrapped in something else.
+type closeWriter interface{ CloseWrite() error }
+
+// defaultConnectHalfCloseLinger bounds how long the surviving direction of a
+// CONNECT tunnel may keep copying after the FIRST direction has finished. It is
+// the backstop for a peer that is sent a FIN and then neither writes nor closes.
+const defaultConnectHalfCloseLinger = 30 * time.Second
+
 // handleConnect serves the CONNECT tunnel leg.
 //
 // The gateway authenticates the client with a shared token, checks the target
@@ -815,25 +859,69 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		ClientAddr: r.RemoteAddr,
 	})
 
-	// Both directions are copied concurrently; the tunnel closes as soon as
-	// either side does, so a half-closed peer cannot leak a goroutine.
+	// Both directions are copied concurrently, and BOTH are now bounded.
+	//
+	// FIRST bound -- the FIN actually reaches the peer. When a direction runs
+	// out of bytes the other side is told so with CloseWrite, asked for as a
+	// BEHAVIOUR (closeWriter) rather than as *net.TCPConn. See closeWriter for
+	// the defect that replaces: the concrete-type assertion was false on a
+	// TLS-terminating gateway, which is the only posture a reachable gateway
+	// may run in, so the half-close was silently skipped exactly where it
+	// mattered and every affected tunnel parked this handler forever.
+	//
+	// SECOND bound -- a peer that ignores the FIN still cannot park us. The
+	// moment the FIRST direction finishes, a deadline is armed on BOTH conns;
+	// the surviving io.Copy then unblocks on os.ErrDeadlineExceeded instead of
+	// waiting on a socket nobody will ever write to or close again. CloseWrite
+	// asks a peer to stop and nothing makes a peer listen, so the half-close
+	// fix alone is a courtesy, not a bound. This is the bound.
+	//
+	// Two deliberate choices inside that second bound:
+	//
+	//   - The deadline is armed when the first copy RETURNS, never at tunnel
+	//     establishment. Arming it up front would cap the lifetime of a
+	//     perfectly healthy full-duplex tunnel, which is not what this is for.
+	//   - Both conns are DEADLINED, not closed. Closing both the instant the
+	//     first copy returns is the other obvious shape and it is wrong here:
+	//     it truncates the ordinary half-close -- client has finished sending,
+	//     upstream is still streaming the response -- and so converts a
+	//     goroutine leak into silent data loss. A deadline lets the surviving
+	//     direction drain for connectLinger and only then gives up.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var bytesUp int64
+	var armOnce sync.Once
+	armLinger := func() {
+		armOnce.Do(func() {
+			linger := s.connectLinger
+			if linger <= 0 {
+				// A Server built as a bare struct literal (some tests do that)
+				// never ran the defaulting in NewServer, and a zero here would
+				// mean a deadline in the past: it would kill the tunnel on the
+				// spot rather than bound it.
+				linger = defaultConnectHalfCloseLinger
+			}
+			deadline := time.Now().Add(linger)
+			_ = client.SetDeadline(deadline)
+			_ = upstream.SetDeadline(deadline)
+		})
+	}
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(upstream, client)
 		bytesUp = n
-		if c, ok := upstream.(*net.TCPConn); ok {
-			_ = c.CloseWrite()
+		if cw, ok := upstream.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		}
+		armLinger()
 	}()
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(client, upstream)
-		if c, ok := client.(*net.TCPConn); ok {
-			_ = c.CloseWrite()
+		if cw, ok := client.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		}
+		armLinger()
 	}()
 	wg.Wait()
 
