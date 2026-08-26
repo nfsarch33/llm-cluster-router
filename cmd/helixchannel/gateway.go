@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/nfsarch33/llm-cluster-router/internal/channel"
 )
@@ -38,7 +41,22 @@ func runGateway(args []string) error {
 	}
 	if *listen != "" {
 		cfg.Listen = *listen
+		// Re-validate: the override replaces the one field gateway_auth's bind
+		// rule reads, so a config that legitimately bound loopback with no token
+		// could otherwise be moved onto a wildcard address from the command line
+		// and skip the check entirely. Validate is idempotent — it re-derives
+		// the same defaults from values already at their defaults.
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
 	}
+
+	// Emitted HERE — before the server is built and before --print-routes
+	// returns — because it is an advisory about the CONFIGURATION, not about
+	// this process's runtime posture. An operator inspecting a config with
+	// --print-routes is exactly who needs to hear it, and a config that later
+	// fails to start should still have said what its budgets mean.
+	warnAdvisoryTokenBudgets(os.Stderr, cfg)
 
 	auditWriter := io.Writer(os.Stdout)
 	if cfg.AuditLog != "" {
@@ -55,20 +73,77 @@ func runGateway(args []string) error {
 		return err
 	}
 
+	// Register the rotation metric on the process registry. Without this call
+	// llm_cluster_router_helixchannel_key_retired_total is never exported and
+	// every alert written against it is dead on arrival — the same failure
+	// mode as a rule file that looks real and routes to nobody.
+	//
+	// AlreadyRegisteredError is tolerated so that a second gateway invocation
+	// inside one process (the in-process CLI tests do exactly this) is not a
+	// startup failure; the collector is a package-level var, so the first
+	// registration is the one that counts.
+	if err := channel.RegisterMetrics(prometheus.DefaultRegisterer); err != nil {
+		var dup prometheus.AlreadyRegisteredError
+		if !errors.As(err, &dup) {
+			return fmt.Errorf("register helixchannel metrics: %w", err)
+		}
+	}
+
 	if *printRoutes {
 		names := srv.RouteNames()
 		sort.Strings(names)
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"listen": cfg.Listen, "routes": names, "connect": cfg.Connect.Enabled,
+			"proxy_auth": string(srv.ProxyAuthMode()),
 		})
 	}
 
-	fmt.Fprintf(os.Stderr, "helixchannel gateway listening on %s routes=%v connect=%t\n",
-		cfg.Listen, srv.RouteNames(), cfg.Connect.Enabled)
+	fmt.Fprintf(os.Stderr, "helixchannel gateway listening on %s routes=%v connect=%t proxy_auth=%s\n",
+		cfg.Listen, srv.RouteNames(), cfg.Connect.Enabled, srv.ProxyAuthMode())
+	warnUnauthenticatedProxyLeg(os.Stderr, srv.ProxyAuthMode(), cfg.Listen)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return srv.ListenAndServe(ctx)
+}
+
+// warnUnauthenticatedProxyLeg prints the loud startup warning for the two
+// postures in which the reverse-proxy leg authenticates nobody.
+//
+// It is deliberately not a debug line an operator has to go looking for. Both
+// states are legitimate — loopback_only is the historical default and open is
+// the fronted-by-a-terminator deployment — and both are indistinguishable, from
+// inside this process, from having forgotten to configure a token. The banner
+// above already carries proxy_auth for a log parser; this is the sentence a
+// human reads.
+func warnUnauthenticatedProxyLeg(w io.Writer, mode channel.ProxyAuthMode, listen string) {
+	switch mode {
+	case channel.ProxyAuthLoopbackOnly:
+		_, _ = fmt.Fprintf(w, "WARNING: no gateway_auth token is configured, so the reverse-proxy leg authenticates NOBODY. Reaching %s is sufficient to spend every key on every enabled route; the bind address is the only boundary. Set gateway_auth.token_env/token_file/token_ref before publishing this socket any wider.\n", listen)
+	case channel.ProxyAuthOpen:
+		_, _ = fmt.Fprintf(w, "WARNING: gateway_auth.allow_unauthenticated is set, so the reverse-proxy leg authenticates NOBODY on %s. Anyone who can open a TCP connection to it can spend every key on every enabled route. This is only safe behind an authenticating terminator that is the sole reachable path to this socket.\n", listen)
+	}
+}
+
+// warnAdvisoryTokenBudgets prints the loud startup warning for every route whose
+// per-key plan is denominated in TOKENS, naming the overshoot ratio derived from
+// that route's own cap and estimate.
+//
+// It is emitted at startup rather than left to the documentation because the
+// failure mode is a BILL. A token cap bounds the estimate an unsettled lease is
+// projected by, not the charge that lease eventually settles, so the plan is
+// overspendable by cap/estimate under concurrency — measured at 50x on cap 1000
+// / estimate 100 against a real 5000-token response. Request budgets have no
+// such gap and are the shape every shipped config now uses; see
+// channel.BudgetAdvisory for the arithmetic and for the reserved-token
+// accounting follow-up that would make token caps exact.
+//
+// Silence is the expected output. A warning that fires on the recommended
+// configuration is one operators learn to scroll past.
+func warnAdvisoryTokenBudgets(w io.Writer, cfg *channel.Config) {
+	for _, a := range cfg.TokenBudgetAdvisories() {
+		_, _ = fmt.Fprintln(w, a.Warning())
+	}
 }
 
 // runProxy serves the loopback client proxy that lets an agent route through

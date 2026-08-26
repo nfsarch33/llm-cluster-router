@@ -23,6 +23,19 @@ defaults:
   max_concurrency: 2
   request_timeout: 120s
   max_body_size: 1048576
+  # How long the router waits for the NEXT bytes of a request body before it
+  # gives up on the read. It is an INACTIVITY bound, refreshed by every read
+  # that makes progress, so a caller on a slow link is never cut off for being
+  # slow -- only one that has gone silent is.
+  #
+  # It matters because a queue slot is taken BEFORE the body is read and held
+  # across the read: without this, max_queue_depth callers who simply stop
+  # sending are enough to make the router answer 429 to everybody else. A
+  # stalled caller is answered 408 and its slot goes straight back.
+  #
+  # Omit the key or write 0s for the 15s default. A negative value is a startup
+  # error; there is no spelling for "wait forever".
+  body_read_timeout: 15s
   # Per-upstream circuit breaker tuning. Opens after `threshold` consecutive
   # failures and stays open for `cooldown` before a half-open probe. Defaults
   # to 5 / 30s when omitted. Raise the threshold / shorten the cooldown for a

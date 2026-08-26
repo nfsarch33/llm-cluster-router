@@ -28,3 +28,8 @@ coverage.out
 # Benchmark output
 *-benchmark.json
 *-gpu-probe.json
+
+# Benchmark runs. Only a deliberately-recorded .bench/baseline.txt is tracked;
+# every other run is a local artifact (see docs/testing-tiers.md).
+.bench/*
+!.bench/baseline.txt

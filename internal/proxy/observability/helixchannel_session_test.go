@@ -17,6 +17,13 @@ import (
 // acceptance gate for "helixchannel_session_total{outcome} metric
 // + dashboards".
 func TestHelixChannelSessionTotal_RegisterAndIncrement(t *testing.T) {
+	// The counter vectors are package-level singletons, so a fresh
+	// prometheus.NewRegistry() still gathers whatever an earlier test in
+	// this package already incremented. This test asserts absolute values,
+	// so it must start from a known zero or its answer depends on the
+	// order -shuffle=on happens to pick.
+	Reset()
+
 	reg := prometheus.NewRegistry()
 	if err := RegisterMetrics(reg); err != nil {
 		t.Fatalf("RegisterMetrics: %v", err)
@@ -74,6 +81,12 @@ func TestHelixChannelSessionTotal_RegisterAndIncrement(t *testing.T) {
 // help string mentions the canonical label name so Grafana panel
 // auto-discovery works without manual editing.
 func TestHelixChannelSessionTotal_HelpText(t *testing.T) {
+	// Prometheus omits a metric family with no child series from Gather()
+	// entirely, so this test has to create the series it then looks for
+	// instead of inheriting one from whichever test ran before it.
+	Reset()
+	HelixChannelSessionTotal.WithLabelValues("success").Inc()
+
 	reg := prometheus.NewRegistry()
 	if err := RegisterMetrics(reg); err != nil {
 		t.Fatalf("RegisterMetrics: %v", err)

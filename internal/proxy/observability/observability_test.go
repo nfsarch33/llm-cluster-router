@@ -137,9 +137,10 @@ func TestAgentraceAppender_DedupesConcurrentWrites(t *testing.T) {
 // canonical counter / histogram series are registered and that
 // /metrics serves them in Prometheus text format.
 func TestMetricsRegistry_ExposesDualListenerSeries(t *testing.T) {
-	ConnectionsTotal.Reset()
-	BytesTotal.Reset()
-	DecryptFailedTotal.Reset()
+	// Reset every family, not the three this test names: RegisterMetrics
+	// installs all seven, and a leftover series on any of them changes
+	// what /metrics serves.
+	Reset()
 	reg := prometheus.NewRegistry()
 	if err := RegisterMetrics(reg); err != nil {
 		t.Fatalf("RegisterMetrics: %v", err)

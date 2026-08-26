@@ -3,13 +3,48 @@
 # Every provider is a route. Turning a provider on or off, or adding a new
 # one, is an edit to this file — not a code change and not a new binary.
 #
-# Credentials are never written here. Each route names an environment
-# variable (key_env) or a file (key_file) that holds the key at runtime, so
-# this file is safe to commit and to copy between nodes.
+# Credentials are never written here. A route NAMES where its key lives:
+# an environment variable (key_env), a file (key_file), or a scheme-qualified
+# reference (key_ref: env:NAME | file:/path | op://<vault>/<item>/<field>).
+# A reference is an identifier, not a secret, so this file stays safe to
+# commit and to copy between nodes.
+#
+# This is the ONLY example config. There is deliberately not a second one
+# under configs/: two examples in two directories is how a node gets deployed
+# from the one that was not updated.
 
 listen: "0.0.0.0:14443"   # bind loopback instead when a TLS terminator runs on the same host
 timeout: 90s
 audit_log: ""             # empty = stdout (captured by the container/journal)
+
+# Caller authentication for the REVERSE-PROXY leg (every route below).
+#
+# Callers present it in the X-HelixChannel-Token header. It is NOT the
+# Authorization header, so a client configured with the placeholder bearer that
+# Kilo Code insists on keeps working unchanged, and the placeholder is still
+# stripped before the request leaves.
+#
+# It is a SEPARATE secret from connect.token_* at the bottom of this file: that
+# one opens an allowlisted byte tunnel, this one authorises spending every key on
+# every enabled route. Pointing both at one source is refused at startup.
+#
+# A caller whose TCP peer is 127.0.0.0/8 or ::1 is served without it, so local
+# clients keep working at cutover. That decision reads the accepted connection's
+# peer address and NO header — X-Forwarded-For cannot claim it. Set
+# exempt_loopback: false to require the token from local callers too.
+#
+# Deleting this block leaves the reverse-proxy leg authenticating NOBODY, and the
+# gateway then REFUSES TO START on the non-loopback `listen` above. That is not a
+# formality: without it, anyone able to open a TCP connection to this socket can
+# spend every key on every enabled route.
+gateway_auth:
+  token_file: /run/secrets/gateway.token
+  # token_ref: op://Infra/helixchannel/gateway-token   # takes precedence
+  # token_env: HELIXCHANNEL_GATEWAY_TOKEN
+  exempt_loopback: true
+  # allow_unauthenticated: true   # ONLY behind an authenticating terminator
+  #   (mTLS, an OIDC proxy) that is the sole reachable path to this socket. It
+  #   waives the loopback-bind rule and is refused together with a token source.
 
 routes:
   # MiniMax — the pilot upstream. Clients send a placeholder bearer; the
@@ -31,11 +66,12 @@ routes:
 
   # OpenAI / Codex CLI. Flip enabled to true and mount the key to switch it
   # on — this entry is the worked example of adding a provider by config.
+  # It also shows key_ref: the same route could name any scheme.
   - name: codex
     prefix: /codex/
     upstream: https://api.openai.com
     auth: inject
-    key_file: /run/secrets/openai.key
+    key_ref: op://Infra/openai/api-key   # or key_env: / key_file:
     enabled: false
 
   # Anthropic over the reverse-proxy path, for clients that hold their own
@@ -48,6 +84,110 @@ routes:
     auth: passthrough
     enabled: false
 
+  # ---------------------------------------------------------------------
+  # POOLED ROUTES — several paid plans behind one prefix.
+  #
+  # Singular (key_env/key_file/key_ref) and plural (key_envs/key_files/
+  # key_refs) sources are mutually exclusive on one route. Slot order is
+  # FROZEN — key_envs, then key_files, then key_refs, in declaration order —
+  # so the key_index in an audit line means the same account on every node
+  # running this file.
+  # ---------------------------------------------------------------------
+
+  # A REQUEST budget with the full rotation block.
+  # Slots: key_files[0] -> 0, key_files[1] -> 1, key_refs[0] -> 2.
+  #
+  # BUDGET BY REQUESTS. A request cap is EXACT under concurrency: admission
+  # counts the leases already in flight, so a simultaneous burst cannot exceed
+  # the per-key plan. Measured exact across a 12-combination pool-size x cap
+  # sweep at burst 60 — zero overspend, zero leaked leases, charged always equal
+  # to what the upstream actually served.
+  #
+  # `budget.tokens` is still SUPPORTED, and is deliberately not shown here. A
+  # token cap bounds the ESTIMATE, not the charge: it admits
+  # tokens/estimate_tokens leases at once and each settles whatever the upstream
+  # really reported, so a plan is overspendable by that ratio. Measured at
+  # tokens 1000 / estimate_tokens 100 against a real 5000-token response: 50000
+  # charged against a 1000-token cap. Configure one and the gateway says so
+  # loudly at startup, naming the ratio for your numbers.
+  - name: minimax-pool
+    prefix: /minimax-pool/
+    upstream: https://api.minimaxi.com
+    auth: inject
+    key_files:
+      - /run/secrets/minimax-1.key
+      - /run/secrets/minimax-2.key
+    key_refs:
+      - op://Infra/minimax/key-3
+    rotation:
+      # Selection policy and budget denomination are independent: this route
+      # BALANCES by the upstream's reported token totals while being CAPPED by
+      # requests. With no estimate_tokens configured, a response that reports no
+      # usage is charged 0 and marks the key estimated, which degrades this
+      # policy to request ordering for that selection — never to a wrong charge.
+      policy: least_tokens      # round_robin (default) | least_used | least_tokens
+      max_retry_after: 1h       # clamps the Retry-After on a 503; 0 = 1h
+      budget:
+        window: 1h              # tumbling; 0 disables ALL caps
+        requests: 5000          # hard per-key cap; 0 = uncapped
+        soft_ratio: 0.8         # retire at 80% of the cap; 0 selects the default
+    enabled: false
+
+  # The shorthand spelling. `rotation: round_robin` is exactly
+  # `rotation: {policy: round_robin}` — a policy with no budget.
+  - name: qwen-pool
+    prefix: /qwen-pool/
+    upstream: https://dashscope.aliyuncs.com
+    auth: inject
+    key_envs: [QWEN_KEY_1, QWEN_KEY_2]
+    rotation: round_robin
+    enabled: false
+
+  # ---------------------------------------------------------------------
+  # auth: header — providers whose key is not a bearer token.
+  # The named header REPLACES any caller-supplied value. On this mode and on
+  # `inject`, every caller-supplied credential header — Authorization,
+  # Proxy-Authorization, X-Api-Key, Api-Key, X-Goog-Api-Key, Cookie, and this
+  # route's own key_header — is STRIPPED before the gateway applies its key, so
+  # a provider that honours a second auth header cannot be reached as the
+  # caller's own account. `passthrough` is the one mode exempt.
+  # ---------------------------------------------------------------------
+
+  # Pooled header route with a REQUEST budget.
+  #
+  # Every route in this file budgets by requests. On a header route the
+  # alternative is not merely inexact but meaningless: a header-auth upstream
+  # reports no usage.total_tokens, so every sample is an estimate and a token
+  # cap would be spent entirely in estimate_tokens increments. For the same
+  # reason `policy: least_tokens` is REJECTED here at config load — it would
+  # compare estimates against estimates while claiming to balance tokens.
+  - name: exa-pool
+    prefix: /exa/
+    upstream: https://api.exa.ai
+    auth: header
+    key_header: x-api-key
+    key_files:
+      - /run/secrets/exa-1.key
+      - /run/secrets/exa-2.key
+    rotation:
+      policy: least_used
+      max_retry_after: 15m
+      budget:
+        window: 24h
+        requests: 1000
+        soft_ratio: 0.8
+    enabled: false
+
+  # Single-key header route: no pool, no accounting store, no key_index.
+  - name: tavily
+    prefix: /tavily/
+    upstream: https://api.tavily.com
+    auth: header
+    key_header: x-api-key
+    key_prefix: "tvly-"
+    key_ref: env:TAVILY_KEY
+    enabled: false
+
 # CONNECT leg: an authenticated, allowlisted TCP tunnel.
 #
 # This is what lets Claude Code (and any agent that must keep its own TLS
@@ -57,7 +197,13 @@ routes:
 connect:
   enabled: true
   token_file: /run/secrets/connect.token
+  # token_ref: op://Infra/helixchannel/connect-token   # takes precedence
   dial_timeout: 10s
+  # Every entry must be a remote host:port. An entry naming this gateway's own
+  # host -- 127.0.0.1, localhost, 0.0.0.0, the bind address itself -- is refused
+  # at startup: the gateway would dial itself, and the tunnelled request would
+  # arrive on the loopback interface where gateway_auth's loopback exemption
+  # serves it without a token.
   allowed_hosts:
     - api.anthropic.com:443
     - statsig.anthropic.com:443

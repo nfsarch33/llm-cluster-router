@@ -135,13 +135,27 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 			// metric. The wrapper's Close is sufficient to
 			// release the underlying conn; we do not need a
 			// separate defer.
+			//
+			// connCtx is THIS CONNECTION's lifetime, and it is
+			// what the tamper forwarder is given -- not the
+			// serve loop's ctx, which outlives every connection
+			// it accepts. The forwarder used to have no exit
+			// condition of any kind: one permanent goroutine and
+			// one 10ms ticker per accepted TCP connection, with
+			// nothing capping the total, each still holding its
+			// *crypto.WrapConn reachable long after the conn it
+			// polls had been closed on the very next line.
+			connCtx, closeConn := context.WithCancel(ctx)
 			wrapped := crypto.Wrap(conn, key)
-			startTamperForwarder(wrapped)
+			startTamperForwarder(connCtx, wrapped)
 			// Production HTTP handling is delegated to the
 			// caller's http.Server. We close the wrapped conn
 			// here so the demo's ServeLoop does not leak
-			// descriptors when no http.Server is registered.
+			// descriptors when no http.Server is registered --
+			// and closeConn retires the forwarder in the same
+			// breath, so the observer cannot outlive its subject.
 			_ = wrapped.Close()
+			closeConn()
 		}
 	}
 	return ln, serve, nil
@@ -150,9 +164,25 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 // startTamperForwarder spawns a goroutine that polls the wrapper's
 // tamper counter every 10ms and increments
 // observability.DecryptFailedTotal{listener="aes-mtls"} on
-// observed deltas. Production wiring should refactor to a
-// per-event channel; for the v18710-4 demo the polling cadence is
-// acceptable.
+// observed deltas.
+//
+// LIFETIME: the goroutine returns when ctx is done, and ctx MUST be
+// derived from the lifetime of wc. It previously ranged over the
+// ticker channel with no stop channel, no ctx and no exit condition,
+// so every call started a goroutine that ran until the process did.
+// A polling observer that cannot be retired is not a shortcut, it is
+// an unbounded resource per accepted connection.
+//
+// Polling remains a demo shortcut. The right shape is still a tamper
+// CALLBACK on crypto.WrapConn, and that is deliberately left as
+// follow-up rather than folded in here: the counter is incremented at
+// four sites inside WrapConn.Read, which is the AES-GCM decrypt path
+// shared by every wrapped conn in the tree, and a callback fired from
+// there runs synchronously on that path -- so a slow or panicking
+// observer becomes a transport fault, and the wrapper's documented
+// "safe for concurrent Read/Write pairs" contract has to be restated
+// to cover it. That is a larger change to a crypto primitive than the
+// leak being closed here warrants.
 //
 // v18714-3: each observed tamper delta ALSO increments the
 // per-session HelixChannel counter with outcome="tampering", and
@@ -161,23 +191,28 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 // failed BEFORE the request even reached the HTTP layer (so the
 // HTTP path will not record it). Without this branch the session
 // counter would under-report the very events the runbook alerts on.
-func startTamperForwarder(wc *crypto.WrapConn) {
+func startTamperForwarder(ctx context.Context, wc *crypto.WrapConn) {
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		var last uint64
-		for range ticker.C {
-			now := wc.TamperCount()
-			if now > last {
-				observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
-				// Per-session counter: one increment per
-				// tamper delta so the rate() query is
-				// meaningful even when one connection
-				// accumulates many tampered frames.
-				for i := uint64(0); i < now-last; i++ {
-					observability.HelixChannelSessionTotal.WithLabelValues("tampering").Inc()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := wc.TamperCount()
+				if now > last {
+					observability.DecryptFailedTotal.WithLabelValues("aes-mtls").Add(float64(now - last))
+					// Per-session counter: one increment per
+					// tamper delta so the rate() query is
+					// meaningful even when one connection
+					// accumulates many tampered frames.
+					for i := uint64(0); i < now-last; i++ {
+						observability.HelixChannelSessionTotal.WithLabelValues("tampering").Inc()
+					}
+					last = now
 				}
-				last = now
 			}
 		}
 	}()

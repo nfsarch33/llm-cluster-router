@@ -29,7 +29,7 @@ A homelab or small cluster ends up with several inference endpoints: a couple of
 
 - **OpenAI-compatible surface** — `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`; existing SDKs and tools work unchanged.
 - **Health-aware routing** — periodic probes with configurable thresholds; unhealthy nodes leave the pool and rejoin automatically.
-- **Bounded concurrency and queueing** — per-node `max_concurrency` and `max_queue_depth`, so a slow upstream applies backpressure instead of exhausting memory.
+- **Bounded concurrency and queueing** — per-node `max_concurrency` and `max_queue_depth`, so a slow upstream applies backpressure instead of exhausting memory. Admission is decided before the request body is allocated, and `defaults.body_read_timeout` bounds that read, so a caller that stops sending mid-upload is answered `408` and gives its queue slot straight back instead of holding it against everybody else.
 - **Circuit breaking** — repeated failures trip a breaker with a cooldown, and `/readyz` reflects it.
 - **Fair-share scheduling** — optional per-user weighting so one caller cannot starve the others.
 - **Tiered routing** — route by an `X-Tier` header to steer heavy jobs at bigger nodes.
@@ -92,6 +92,7 @@ defaults:
   max_queue_depth: 8
   max_concurrency: 2
   request_timeout: 120s
+  body_read_timeout: 15s   # inactivity bound on reading a request body; 0s or omitted = 15s
   circuit:
     threshold: 5
     cooldown: 30s

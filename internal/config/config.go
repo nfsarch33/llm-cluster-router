@@ -68,6 +68,32 @@ type Defaults struct {
 	// the whole node's circuit breaker. 0 disables cooling.
 	KeyCooldown DurationValue `yaml:"key_cooldown"`
 	MaxBodySize int64         `yaml:"max_body_size"`
+	// BodyReadTimeout bounds how long the proxy handler waits for the NEXT
+	// bytes of a request body before giving up on the read. It is an
+	// INACTIVITY bound, refreshed by every read that makes progress -- not a
+	// ceiling on how long a legitimate upload may take.
+	//
+	// It exists because admission happens BEFORE allocation: the queue slot
+	// is taken before io.ReadAll and held across it, so a caller that stops
+	// sending mid-body occupies a slot for as long as it cares to. With
+	// MaxQueueDepth such callers the router answers 429 to everyone else, so
+	// an unbounded read turns the memory exhaustion that ordering closed into
+	// an availability one. Bounding the read is what makes holding the slot
+	// safe, and the two belong together.
+	//
+	// The bound is on INACTIVITY rather than on total duration because a
+	// total cap cannot tell a caller on a slow link from a caller that has
+	// stopped, and killing the first would be a new availability bug in place
+	// of the old one. Total duration is still bounded -- by MaxBodySize, at
+	// whatever rate the caller is actually sustaining -- and the number of
+	// such readers is still bounded by MaxQueueDepth.
+	//
+	// 0 selects DefaultBodyReadTimeout. Negative is a config error: there is
+	// deliberately no spelling for "wait forever", because that is the state
+	// this key was added to make unreachable. Every config in the tree omits
+	// the key, so reading 0 as "unbounded" would leave exactly the
+	// deployments this exists for running exactly as they run today.
+	BodyReadTimeout DurationValue `yaml:"body_read_timeout"`
 	// Circuit tunes the per-upstream circuit breaker fleet-wide. It was
 	// previously hardcoded to 5 failures / 30s in main.go; exposing it here
 	// lets operators retune the breaker for a single-tier provider (e.g.
@@ -90,6 +116,17 @@ const (
 	DefaultCircuitThreshold = 5
 	DefaultCircuitCooldown  = 30 * time.Second
 )
+
+// DefaultBodyReadTimeout is how long the proxy handler waits for the next
+// bytes of a request body before releasing the queue slot that read is
+// holding and refusing the caller.
+//
+// 15s is far beyond any round trip a chat-completions body needs on a link
+// that is working -- the bound is refreshed on every read that makes
+// progress, so it is only ever measured against a gap of total silence -- and
+// far below the 120s RequestTimeout default, so a stalled upload is reaped
+// long before the requests it is blocking would have given up anyway.
+const DefaultBodyReadTimeout = 15 * time.Second
 
 // HealthConfig controls the upstream health-check loop.
 type HealthConfig struct {
@@ -325,6 +362,20 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Defaults.MaxBodySize <= 0 {
 		cfg.Defaults.MaxBodySize = 1 << 20
+	}
+	// A STARTUP ERROR and not a clamp, matching connect.max_concurrent and
+	// connect.idle_timeout: an operator who wrote a negative here meant
+	// something, and every meaning available is one this key exists to refuse.
+	// Silently rounding it to the default would serve them a bound they did
+	// not ask for under a value that says otherwise.
+	if cfg.Defaults.BodyReadTimeout.Duration < 0 {
+		return cfg, fmt.Errorf(
+			"defaults: body_read_timeout must not be negative (got %v); omit the key or set 0 for the default of %v, and note there is no spelling for \"wait forever\"",
+			cfg.Defaults.BodyReadTimeout.Duration, DefaultBodyReadTimeout,
+		)
+	}
+	if cfg.Defaults.BodyReadTimeout.Duration == 0 {
+		cfg.Defaults.BodyReadTimeout.Duration = DefaultBodyReadTimeout
 	}
 	if cfg.Defaults.Circuit.Threshold <= 0 {
 		cfg.Defaults.Circuit.Threshold = DefaultCircuitThreshold

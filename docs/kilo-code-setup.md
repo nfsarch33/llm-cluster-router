@@ -12,6 +12,9 @@ A route per provider, each with its own feature flag:
 listen: "127.0.0.1:14445"
 audit_log: /var/log/helixchannel/gateway.ndjson
 
+gateway_auth:                 # required unless listen is loopback
+  token_file: /run/secrets/gateway.token
+
 routes:
   - name: minimax
     prefix: /minimax/
@@ -27,16 +30,58 @@ Keys stay in root-owned files that only the gateway can read:
 sudo install -d -m 0750 /run/secrets
 printf '%s' "$PROVIDER_KEY" | sudo tee /run/secrets/minimax.key >/dev/null
 sudo chmod 640 /run/secrets/minimax.key
+
+# The gateway token, the same way. This one is the CLIENT's credential: it
+# authorises using the gateway at all, and it is a different secret from the
+# CONNECT channel token.
+openssl rand -hex 32 | sudo tee /run/secrets/gateway.token >/dev/null
+sudo chmod 640 /run/secrets/gateway.token
 ```
 
 Start it (container or systemd — see [HelixChannel](helixchannel.md#running-it)) and confirm the route is live:
 
 ```bash
+# Anonymous: liveness only, and it names the posture in force.
 curl -s https://gateway.example.com/healthz
-# {"status":"ok","service":"helixchannel-gateway","routes":["minimax"],"connect":false}
+# {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt"}
+
+# With the token: the live route set.
+curl -s -H "X-HelixChannel-Token: $GW_TOKEN" https://gateway.example.com/healthz
+# {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt",
+#  "routes":["minimax"],"keys":{...},"connect":false}
 ```
 
 `routes` reflects what is actually enabled. If a provider is missing here, its `enabled` flag is off.
+
+## 1b. The gateway token (every client that is not on the gateway host)
+
+**This is a breaking change if you already run a gateway.** Once `gateway_auth`
+is configured, a caller reaching the gateway from another host must send the
+token in its own header:
+
+```
+X-HelixChannel-Token: <the contents of /run/secrets/gateway.token>
+```
+
+It is **not** the `Authorization` header — that one still carries the harmless
+placeholder described below, and the gateway still strips it. Requests without
+the gateway token are answered `401` with a
+`WWW-Authenticate: HelixChannel …` header naming where it goes, and they never
+reach the provider.
+
+Callers whose TCP peer is loopback (anything on the gateway host itself) are
+exempt by default and need no token, so nothing on that host changes. The
+exemption is decided from the connection's peer address, so it cannot be claimed
+with `X-Forwarded-For`.
+
+If a client cannot send a custom header at all, the supported answer is to make
+it a loopback caller — reach the gateway over an SSH tunnel or a tailnet address
+bound on loopback — or to put an authenticating terminator in front and let it
+hold the token. Do not disable `gateway_auth` to work around it.
+
+Roll it out in this order so no traffic is dropped: create the token, configure
+every remote client with it *first* (nothing rejects it yet), then add the
+`gateway_auth` block to the gateway and restart.
 
 ## 2. Verify the wire before touching the editor
 
@@ -45,6 +90,12 @@ helixchannel kilo-verify \
   -base-url https://gateway.example.com/minimax/v1 \
   -model MiniMax-M3
 ```
+
+**Run this from the gateway host** when `gateway_auth` is configured.
+`kilo-verify` sends no `X-HelixChannel-Token`, so from anywhere else it is
+refused `401` and reports a broken wire that is not broken. From the gateway
+host it is a loopback caller and is exempt (use `-base-url
+http://127.0.0.1:14445/minimax/v1`).
 
 ```json
 {"verdict":"pass","base_url":"https://gateway.example.com/minimax/v1","model":"MiniMax-M3","latency_ms":1884,"error_class":"none"}
@@ -71,6 +122,7 @@ Two details that cause most failures:
 
 - **The route prefix is part of the base URL.** `https://gateway.example.com/v1` will 404 — the gateway needs `/minimax/v1` to know which upstream you mean. The 404 body lists the routes that are available.
 - **The API key is a placeholder.** The gateway replaces it with the real key. That is the entire point: the editor never holds a provider credential. If the gateway is running in `passthrough` mode instead, then the key you enter *is* the one used.
+- **The gateway token is a separate field.** If the gateway requires one (see [1b](#1b-the-gateway-token-every-client-that-is-not-on-the-gateway-host)), add `X-HelixChannel-Token` in the provider's custom-headers section. It does not go in the API Key field — that field is the placeholder the gateway strips, and putting the gateway token there would send it to the provider rather than to the gateway.
 
 If the gateway serves a self-signed certificate, enable the extension's TLS-skip option. Prefer a CA-issued certificate and leave verification on.
 
