@@ -43,6 +43,16 @@ regexes = [
     # entry covers the historical commits. Anchored so it matches ONLY the
     # exact literal word and cannot swallow a longer real secret.
     "^placeholder$",
+
+    # 'placeholder-is-stripped-not-forwarded' was the same docs example spelled
+    # out as a sentence, in docs/helixchannel.md. It is not a credential for
+    # anything and never was: it is the value the surrounding paragraph is
+    # explaining that the gateway DROPS. Its entropy (3.82) is what tripped
+    # curl-auth-header, not any secret material. The working tree now uses the
+    # bare word above; this entry covers commits cf853b83..d6a1aa1, which we do
+    # not rewrite on a public repo. Anchored for the same reason as the entry
+    # above -- it matches this exact string and cannot swallow a longer one.
+    "^placeholder-is-stripped-not-forwarded$",
 ]
 
 # Stop signals (entries that MUST NOT be allowlisted, even by accident).
