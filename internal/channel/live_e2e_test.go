@@ -13,6 +13,10 @@
 //
 //	HELIXCHANNEL_LIVE_BASE      e.g. https://channel.example.com   (required by all)
 //	HELIXCHANNEL_LIVE_INSECURE  "1" while the edge serves a self-signed cert
+//	HELIXCHANNEL_GATEWAY_TOKEN_FILE  path to the reverse-proxy gateway token; sent in the
+//	                            X-HLXN-Token header. Required by every test that expects a
+//	                            2xx from an inject route, because gateway_auth now gates that
+//	                            leg. HELIXCHANNEL_GATEWAY_TOKEN is the env-value fallback.
 //	HELIXCHANNEL_CONNECT_ADDR   host:port of the TLS CONNECT listener (optional)
 //	HELIXCHANNEL_CONNECT_TOKEN_FILE  path to the CONNECT token (optional; enables the positive tunnel test)
 //	HELIXCHANNEL_LIVE_CHAT      "1" to enable the paid chat-completion round trip (costs upstream tokens)
@@ -51,12 +55,45 @@ func liveClient() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second, Transport: tr}
 }
 
+// liveGatewayToken returns the reverse-proxy gateway token, or SKIPs. A file
+// path is preferred over an env value so the secret stays off process listings;
+// the env value exists for CI-secret injection.
+func liveGatewayToken(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("HELIXCHANNEL_GATEWAY_TOKEN_FILE"); p != "" {
+		raw, err := os.ReadFile(p) //nolint:gosec // operator-supplied path
+		if err != nil {
+			t.Fatalf("read gateway token file: %v", err)
+		}
+		return strings.TrimSpace(string(raw))
+	}
+	if v := os.Getenv("HELIXCHANNEL_GATEWAY_TOKEN"); v != "" {
+		return strings.TrimSpace(v)
+	}
+	t.Skip("HELIXCHANNEL_GATEWAY_TOKEN_FILE / _TOKEN unset — gateway-auth live tests skipped (SKIP, not pass)")
+	return ""
+}
+
+// withGatewayToken attaches the reverse-proxy gateway token to a request in the
+// exported header constant, so a future rename of that header cannot leave this
+// suite silently sending the wrong thing.
+func withGatewayToken(req *http.Request, token string) {
+	req.Header.Set(GatewayTokenHeader, token)
+}
+
 // TestLive_HealthzReportsRouteSet is the regression test for the
 // static-health antipattern: /healthz must be answered by the gateway and
 // carry the live route list, never a hardcoded literal.
+//
+// Since gateway_auth landed, the route list moved BEHIND the token — anonymous
+// /healthz no longer carries it (see TestLive_HealthzHidesRouteTableFromAnonymous
+// for that half). So this test now presents the gateway token to see routes.
 func TestLive_HealthzReportsRouteSet(t *testing.T) {
 	base := liveBase(t)
-	resp, err := liveClient().Get(base + "/healthz")
+	token := liveGatewayToken(t)
+	req, _ := http.NewRequest(http.MethodGet, base+"/healthz", nil)
+	withGatewayToken(req, token)
+	resp, err := liveClient().Do(req)
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
 	}
@@ -76,7 +113,7 @@ func TestLive_HealthzReportsRouteSet(t *testing.T) {
 		t.Errorf("service = %q, want helixchannel-gateway (is nginx answering from a literal again?)", got.Service)
 	}
 	if len(got.Routes) == 0 {
-		t.Error("routes is empty — gateway is up but serving nothing")
+		t.Error("routes is empty with a valid token — gateway is up but serving nothing")
 	}
 	t.Logf("live routes: %v", got.Routes)
 }
@@ -86,8 +123,12 @@ func TestLive_HealthzReportsRouteSet(t *testing.T) {
 // reachability, in one unauthenticated-from-our-side call.
 func TestLive_PrimaryRouteModels(t *testing.T) {
 	base := liveBase(t)
+	token := liveGatewayToken(t)
 	req, _ := http.NewRequest(http.MethodGet, base+"/minimax/v1/models", nil)
+	// The Authorization bearer is the placeholder clients are told to send;
+	// the forwarder strips it. Admission is the X-HLXN-Token below.
 	req.Header.Set("Authorization", "Bearer live-e2e-placeholder")
+	withGatewayToken(req, token)
 	resp, err := liveClient().Do(req)
 	if err != nil {
 		t.Fatalf("GET /minimax/v1/models: %v", err)
@@ -110,10 +151,12 @@ func TestLive_ChatCompletionRoundTrip(t *testing.T) {
 	if os.Getenv("HELIXCHANNEL_LIVE_CHAT") != "1" {
 		t.Skip("HELIXCHANNEL_LIVE_CHAT != 1 — paid round trip skipped")
 	}
+	token := liveGatewayToken(t)
 	payload := `{"model":"MiniMax-M3","messages":[{"role":"user","content":"Reply with the single word pong."}],"max_tokens":8}`
 	req, _ := http.NewRequest(http.MethodPost, base+"/minimax/v1/chat/completions", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer live-e2e-placeholder")
+	withGatewayToken(req, token)
 	start := time.Now()
 	resp, err := liveClient().Do(req)
 	if err != nil {
@@ -139,7 +182,13 @@ func TestLive_ChatCompletionRoundTrip(t *testing.T) {
 // starts returning 200, a flag was flipped without a release note.
 func TestLive_DisabledRouteStays404(t *testing.T) {
 	base := liveBase(t)
-	resp, err := liveClient().Get(base + "/codex/v1/models")
+	token := liveGatewayToken(t)
+	// The token is required to reach route matching at all: authorizeProxy runs
+	// BEFORE the route table is consulted, so an anonymous call to a disabled
+	// route is refused 401 (and never told the route exists), not 404.
+	req, _ := http.NewRequest(http.MethodGet, base+"/codex/v1/models", nil)
+	withGatewayToken(req, token)
+	resp, err := liveClient().Do(req)
 	if err != nil {
 		t.Fatalf("GET /codex/v1/models: %v", err)
 	}
