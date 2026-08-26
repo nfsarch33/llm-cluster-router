@@ -46,7 +46,7 @@ curl -s https://gateway.example.com/healthz
 # {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt"}
 
 # With the token: the live route set.
-curl -s -H "X-HelixChannel-Token: $GW_TOKEN" https://gateway.example.com/healthz
+curl -s -H "X-HLXN-Token: $GW_TOKEN" https://gateway.example.com/healthz
 # {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt",
 #  "routes":["minimax"],"keys":{...},"connect":false}
 ```
@@ -60,7 +60,7 @@ is configured, a caller reaching the gateway from another host must send the
 token in its own header:
 
 ```
-X-HelixChannel-Token: <the contents of /run/secrets/gateway.token>
+X-HLXN-Token: <the contents of /run/secrets/gateway.token>
 ```
 
 It is **not** the `Authorization` header — that one still carries the harmless
@@ -105,7 +105,7 @@ helixchannel kilo-verify \
 ```
 
 **Run this from the gateway host** when `gateway_auth` is configured.
-`kilo-verify` sends no `X-HelixChannel-Token`, so from anywhere else it is
+`kilo-verify` sends no `X-HLXN-Token`, so from anywhere else it is
 refused `401` and reports a broken wire that is not broken. From the gateway
 host it is a loopback caller and is exempt (use `-base-url
 http://127.0.0.1:14445/minimax/v1`).
@@ -127,7 +127,7 @@ Extensions panel → search "Kilo Code" → Install. Open the Kilo Code panel, t
 | API Provider | `OpenAI Compatible` |
 | Base URL | `https://gateway.example.com/minimax/v1` |
 | API Key | any non-empty placeholder, e.g. `helixchannel-client` |
-| **Headers** | `X-HelixChannel-Token` → the gateway token |
+| **Headers** | `X-HLXN-Token` → the gateway token |
 | Model | `MiniMax-M3` |
 | Max Tokens | `2048` |
 | Temperature | `0.7` |
@@ -142,7 +142,7 @@ own request path.
 One consequence of how that merge works is worth knowing. The extension sets
 `Authorization: Bearer <API Key>` **after** merging your custom headers, so an
 `Authorization` entry in the Headers field is overwritten and cannot be used to
-carry anything. `X-HelixChannel-Token` is unaffected.
+carry anything. `X-HLXN-Token` is unaffected.
 
 Recent Kilo Code builds are rebuilt on the Kilo CLI and share one JSONC config
 across the CLI, VS Code and JetBrains, so the same provider can be written
@@ -157,7 +157,7 @@ directly to `~/.config/kilo/kilo.jsonc` instead of clicking through the panel:
       "options": {
         "baseURL": "https://gateway.example.com/minimax/v1",
         "apiKey": "helixchannel-client",
-        "headers": { "X-HelixChannel-Token": "<the gateway token>" }
+        "headers": { "X-HLXN-Token": "<the gateway token>" }
       },
       "models": { "MiniMax-M3": { "name": "MiniMax-M3" } }
     }

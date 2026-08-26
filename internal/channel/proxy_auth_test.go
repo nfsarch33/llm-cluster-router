@@ -35,7 +35,7 @@ const (
 	gwAuthLoopback8  = "127.9.9.9:44100"
 	gwAuthLoopbackV6 = "[::1]:44100"
 
-	gwAuthChallenge = `HelixChannel realm="helixchannel-gateway", header="X-HelixChannel-Token"`
+	gwAuthChallenge = `HelixChannel realm="helixchannel-gateway", header="X-HLXN-Token"`
 )
 
 // gwAuthUpstream is a mock provider that counts what actually reached it. The

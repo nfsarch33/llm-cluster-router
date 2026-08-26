@@ -83,7 +83,7 @@ This is the part that decides how you may deploy it, so it is stated before the
 configuration reference rather than in a footnote.
 
 The reverse-proxy leg takes a **gateway token**: a shared secret presented in the
-`X-HelixChannel-Token` request header and compared in constant time, **before**
+`X-HLXN-Token` request header and compared in constant time, **before**
 the path is matched and before any key is leased.
 
 ```yaml
@@ -104,7 +104,7 @@ It is also **not the `Authorization` header**. Clients of an `inject` route are
 told to configure a placeholder bearer — Kilo Code will not send a request
 without some API key — and the forwarder strips that placeholder before the
 request leaves. Admission must not depend on a value clients were told was
-meaningless. A placeholder `Authorization` **plus** a valid `X-HelixChannel-Token`
+meaningless. A placeholder `Authorization` **plus** a valid `X-HLXN-Token`
 is the supported shape, and the server-held key is still what reaches the
 provider.
 
@@ -340,7 +340,7 @@ same gate: an unauthenticated caller is refused before the path is matched.
 gateway from another host must add one header:
 
 ```bash
-curl -H "X-HelixChannel-Token: $(cat /run/secrets/gateway.token)" \
+curl -H "X-HLXN-Token: $(cat /run/secrets/gateway.token)" \
      https://gateway.example.com/minimax/v1/models
 ```
 
@@ -483,9 +483,19 @@ listen: "127.0.0.1:14445"    # a non-loopback bind REQUIRES gateway_auth below
 timeout: 90s
 audit_log: /var/log/helixchannel/gateway.ndjson   # empty = stdout
 
+# Only when a same-host TLS terminator (nginx, Caddy) relays PUBLIC traffic
+# to a gateway bound on loopback: every request then arrives with a loopback
+# peer, which is why exempt_loopback below must be false in that shape. This
+# flag recovers the real caller address for the AUDIT LOG ONLY — it is never
+# consulted by any admission decision. See auditClientAddr in
+# internal/channel/proxy_auth.go for the exact boundary.
+trust_forwarded_for_audit: false   # default; set true only behind a same-host relay
+
 gateway_auth:               # caller auth for the reverse-proxy leg
   token_file: /run/secrets/gateway.token          # or token_env: / token_ref:
-  exempt_loopback: true     # default; peer address only, never a header
+  exempt_loopback: true     # default; peer address only, never a header — and
+                             # MUST be false when the loopback caller is a relay,
+                             # not a local client (see trust_forwarded_for_audit above)
   # allow_unauthenticated: true   # only behind an authenticating terminator
 
 routes:
@@ -576,7 +586,7 @@ curl -s https://gateway.example.com/healthz
 # The inventory needs the gateway token (or a loopback peer, when exempt).
 # It reflects the enabled flags, not a hardcoded string.
 GW=$(cat /run/secrets/gateway.token)
-curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/healthz
+curl -s -H "X-HLXN-Token: $GW" https://gateway.example.com/healthz
 # {"status":"ok","service":"helixchannel-gateway","proxy_auth":"token_loopback_exempt",
 #  "routes":["minimax","qwen"],
 #  "keys":{"minimax":{"mode":"inject","pooled":false,"keys":1,"available":1,"degraded":false},
@@ -586,7 +596,7 @@ curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/healthz
 # Anonymous from a non-loopback peer: refused before the route is matched.
 curl -si https://gateway.example.com/minimax/v1/models | head -3
 # HTTP/1.1 401 Unauthorized
-# WWW-Authenticate: HelixChannel realm="helixchannel-gateway", header="X-HelixChannel-Token"
+# WWW-Authenticate: HelixChannel realm="helixchannel-gateway", header="X-HLXN-Token"
 # {"error":"gateway_token_required",...}
 
 # A route end-to-end. No PROVIDER credential is needed or wanted: the gateway
@@ -596,12 +606,12 @@ curl -si https://gateway.example.com/minimax/v1/models | head -3
 # placeholder a client insists on sending never leaves the gateway. Only
 # passthrough forwards it. The gateway token rides in its own header and is
 # stripped on every mode.
-curl -s -H "X-HelixChannel-Token: $GW" https://gateway.example.com/minimax/v1/models
+curl -s -H "X-HLXN-Token: $GW" https://gateway.example.com/minimax/v1/models
 
 # The Kilo Code shape: a placeholder bearer AND the gateway token. The
 # placeholder is stripped, the server key reaches MiniMax, the request is served.
 curl -s https://gateway.example.com/minimax/v1/models \
-  -H "X-HelixChannel-Token: $GW" \
+  -H "X-HLXN-Token: $GW" \
   -H "Authorization: Bearer placeholder"
 
 # The CONNECT leg, and that the certificate is the provider's

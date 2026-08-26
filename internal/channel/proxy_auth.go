@@ -25,7 +25,17 @@ import (
 // gateway token gates the ability to spend every key on every enabled route.
 // Overloading one for the other would silently widen whichever was configured
 // first.
-const GatewayTokenHeader = "X-HelixChannel-Token"
+//
+// SECURITY CHANGE 2026-08-27: renamed from "X-HelixChannel-Token" to
+// "X-HLXN-Token" (operator naming convention: HLXN is the short code for
+// "Helixon" across headers, env var prefixes and CLI flags going forward).
+// Nothing reads the old name any more — this is a rename, not an added
+// alias — so every remote client's configuration and every doc/example must
+// be updated to the new header BEFORE this build reaches a host any
+// non-loopback client talks to. A client still sending the old header is
+// indistinguishable from one sending no header at all: refusalTokenRequired,
+// not refusalTokenInvalid.
+const GatewayTokenHeader = "X-HLXN-Token"
 
 // gatewayAuthChallenge is the WWW-Authenticate value on a refusal.
 //
@@ -76,6 +86,48 @@ func isLoopbackPeer(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// auditClientAddr reports the address an audit line should blame for r.
+//
+// This is an OBSERVABILITY function, not an authorization function, and the
+// distinction is the entire design: it is the sole reader of
+// Config.TrustForwardedForAudit, it is never called from authorizeProxy or
+// authorizeConnect, and nothing it returns changes whether a request is
+// served. A caller cannot buy anything by setting X-Forwarded-For except a
+// more (or less) accurate audit line.
+//
+// The condition for trusting the header is narrow on purpose: the peer that
+// ACCEPTED this TCP connection must itself be loopback (isLoopbackPeer on
+// r.RemoteAddr — the same predicate the auth path uses, so "loopback" means
+// one thing everywhere in this package), which is the shape of exactly one
+// deployment: a same-host TLS terminator relaying the public internet to a
+// gateway bound on 127.0.0.1. A non-loopback peer's own address is already
+// the real one and nothing overrides it.
+//
+// X-Forwarded-For may carry a comma-separated chain; only the FIRST entry
+// (nearest the original client, per the header's own convention) is used,
+// and only after net.ParseIP accepts it as a literal — the same numeric-only
+// parse isLoopbackPeer uses, not a hostname the OS resolver could interpret
+// differently between two calls. Anything that fails to parse falls back to
+// r.RemoteAddr unchanged: this function fails closed to the value the
+// process itself observed, never open to a string the caller supplied.
+func (s *Server) auditClientAddr(r *http.Request) string {
+	if !s.trustForwardedForAudit || !isLoopbackPeer(r.RemoteAddr) {
+		return r.RemoteAddr
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return r.RemoteAddr
+	}
+	first := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+	if first == "" {
+		return r.RemoteAddr
+	}
+	if net.ParseIP(first) == nil {
+		return r.RemoteAddr
+	}
+	return first
 }
 
 // authorizeProxy decides whether a caller may use the reverse-proxy leg.
@@ -153,6 +205,6 @@ func (s *Server) denyUnauthenticated(w http.ResponseWriter, r *http.Request, req
 		Method: r.Method, Path: r.URL.Path,
 		Status:     http.StatusUnauthorized,
 		LatencyMS:  time.Since(start).Milliseconds(),
-		ClientAddr: r.RemoteAddr, Error: string(refusal),
+		ClientAddr: s.auditClientAddr(r), Error: string(refusal),
 	})
 }

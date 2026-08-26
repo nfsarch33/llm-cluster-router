@@ -19,7 +19,7 @@ audit_log: ""             # empty = stdout (captured by the container/journal)
 
 # Caller authentication for the REVERSE-PROXY leg (every route below).
 #
-# Callers present it in the X-HelixChannel-Token header. It is NOT the
+# Callers present it in the X-HLXN-Token header. It is NOT the
 # Authorization header, so a client configured with the placeholder bearer that
 # Kilo Code insists on keeps working unchanged, and the placeholder is still
 # stripped before the request leaves.
