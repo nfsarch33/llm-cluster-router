@@ -10,6 +10,50 @@ Claude Code ──HTTPS_PROXY──► helixchannel proxy ──TLS──► gat
 
 The gateway sees encrypted bytes and a destination, nothing more.
 
+## Which of the two paths you want
+
+There are two ways to put Claude Code behind HelixChannel, and they are not
+interchangeable. Pick deliberately:
+
+| | **CONNECT tunnel** (the rest of this page) | **Reverse-proxy route** |
+|---|---|---|
+| Credential Claude Code uses | its own — your claude.ai login stays the active credential | the gateway's, or one you supply |
+| Billing | your subscription | per token, to whoever owns the credential the gateway forwards |
+| Client-side install | the `helixchannel` binary, run as a user service | none |
+| Which channel secret | the **CONNECT** token, in `Proxy-Authorization` | the **gateway** token, in `X-HelixChannel-Token` |
+| Feature loss | none | base-URL override disables Remote Control |
+| What the gateway can see | destination host and encrypted bytes | the full request and response |
+
+The CONNECT tunnel is the default for Claude Code because it is the only one
+that preserves the subscription and keeps TLS end-to-end with Anthropic. Use the
+reverse-proxy route when you deliberately want the gateway's credential, its
+audit trail, and its spend controls applied to this traffic.
+
+### The reverse-proxy route, if that is what you want
+
+```bash
+export ANTHROPIC_BASE_URL="https://gateway.example.com/anthropic"
+export ANTHROPIC_AUTH_TOKEN="placeholder"            # stripped on inject routes
+export ANTHROPIC_CUSTOM_HEADERS="X-HelixChannel-Token: <the gateway token>"
+```
+
+or the same three under `env` in `~/.claude/settings.json`. `ANTHROPIC_AUTH_TOKEN`
+travels as `Authorization: Bearer`; `ANTHROPIC_API_KEY` travels as `x-api-key`.
+Which one the gateway wants depends on the route's `auth` mode — on `passthrough`
+the value you set is the credential that reaches Anthropic, so put a real one
+there; on `inject` it is a placeholder the gateway drops and replaces.
+
+Setting `ANTHROPIC_BASE_URL` **without** a credential variable does not replace
+your subscription: requests route through the gateway but the saved claude.ai
+login stays active, and a gateway passing that traffic on to Anthropic has to
+forward the OAuth capability in `anthropic-beta`.
+
+The two tokens are different secrets on purpose and are not interchangeable. The
+CONNECT token opens a byte tunnel bounded by an exact-match host allowlist; the
+gateway token authorises spending every key on every enabled route. Sending one
+where the other is expected fails closed — `407` on the tunnel, `401` on the
+reverse-proxy leg — rather than quietly granting the wider power.
+
 ## 1. Enable the tunnel on the gateway
 
 ```yaml
@@ -126,7 +170,9 @@ Remove the five proxy keys from `~/.claude/settings.json` and restart the app. K
 | Every request fails after wiring the env | Proxy not running | `systemctl --user status helixchannel-proxy`; check `enable-linger` |
 | `403` from the gateway | Host not allowlisted | Add the exact `host:port` to `allowed_hosts` and restart the gateway |
 | `407` from the gateway | Token missing or wrong | Compare the client token file with the gateway's |
-| TLS error dialling the gateway | Self-signed certificate | Use a CA-issued certificate, or `--insecure` while piloting |
+| `curl: (56) CONNECT tunnel failed, response 502` | **Both of the above look like this from the client.** The gateway distinguishes them correctly — it returns `403 host_not_allowlisted` or `407 bad_token` — but the client proxy reports its own `502` to the local caller either way, so the status code you see does not tell you which happened | Read the gateway's audit log, not the client's status. `connect_denied` carries the real `status` and an `error` of `host_not_allowlisted` or `bad_token`. Verified against a live edge: a disallowed host and a wrong token both surfaced as 502 locally while the gateway logged 403 and 407 respectively |
+| TLS error dialling the gateway | Self-signed certificate | Issue a CA-signed certificate. `--insecure` is a piloting crutch, not a configuration: it relaxes verification of the outer hop only — Claude Code's TLS to Anthropic stays verified end to end — but an unverified outer hop means anyone in the path can present their own certificate and read the CONNECT request line and the `Proxy-Authorization` token you send with it. On a managed laptop, prefer a real certificate over asking for a trust exception you may not be allowed to grant. |
+| `Self-signed certificate detected` from Claude Code while `curl` to the same URL succeeds | Node uses its own bundled CA store, not the one `curl` reads | Point `NODE_EXTRA_CA_CERTS` at the CA bundle. It *adds* to the trust store; do not use `SSL_CERT_FILE`, which replaces it and breaks TLS for `git`, `curl` and everything else the agent runs. |
 | `curl` works, agent does not | Agent read a stale config | Fully restart the app; confirm the keys are in the user-level `settings.json` |
 
 ## Local models and the per-agent gate
