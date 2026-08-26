@@ -241,16 +241,39 @@ func (s *refusalSpy) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap keeps the body read bounded through this wrapper.
+//
+// http.ResponseController walks a wrapper chain looking for SetReadDeadline,
+// and embedding the http.ResponseWriter INTERFACE promotes only that
+// interface's three methods, never the concrete *http.response's deadline
+// setters. Without this the handler would fall back to an unbounded read here
+// and the ceiling below would be measured on a path production never takes.
+func (s *refusalSpy) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 // newAdmissionRouter builds a one-node router with the admission limits under
 // test and marks the node healthy.
+//
+// The body_read_timeout it picks is a minute: these tests are about admission
+// ORDER, and they arrange stalls that they release themselves, so a bound that
+// could fire while one is being measured would make them measure something
+// else. Tests that are about the bound choose their own -- see
+// body_read_timeout_test.go.
 func newAdmissionRouter(t *testing.T, maxConc, maxQueue int, maxBody int64, upstreamURL string) *router {
+	t.Helper()
+	return newAdmissionRouterWithBodyRead(t, maxConc, maxQueue, maxBody, time.Minute, upstreamURL)
+}
+
+// newAdmissionRouterWithBodyRead is newAdmissionRouter with the read bound
+// named explicitly.
+func newAdmissionRouterWithBodyRead(t *testing.T, maxConc, maxQueue int, maxBody int64, bodyRead time.Duration, upstreamURL string) *router {
 	t.Helper()
 	c := config{
 		Defaults: cfgpkg.Defaults{
-			MaxConcurrency: maxConc,
-			MaxQueueDepth:  maxQueue,
-			MaxBodySize:    maxBody,
-			RequestTimeout: cfgpkg.DurationValue{Duration: 10 * time.Second},
+			MaxConcurrency:  maxConc,
+			MaxQueueDepth:   maxQueue,
+			MaxBodySize:     maxBody,
+			RequestTimeout:  cfgpkg.DurationValue{Duration: 10 * time.Second},
+			BodyReadTimeout: cfgpkg.DurationValue{Duration: bodyRead},
 		},
 		Nodes: []cfgpkg.NodeConfig{{
 			Name: "up", URL: upstreamURL, Tier: "0", Enabled: "true", Weight: 1, Models: []string{"m1"},

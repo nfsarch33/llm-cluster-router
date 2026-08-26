@@ -678,6 +678,132 @@ func (r *router) beginBuffering() func() {
 	return func() { r.buffering.Add(-1) }
 }
 
+// bodyReadTimeout resolves the inactivity bound the proxy handler applies to
+// a request body read.
+//
+// The fallback is here as well as in config.LoadConfig because a Config can
+// reach the router without passing through LoadConfig -- tests build one by
+// hand, and an embedded caller may too -- and a zero read as "no bound" is the
+// exact failure this key exists to prevent. Zero means the default in both
+// places, or it does not mean the default at all.
+func bodyReadTimeout(c config) time.Duration {
+	if d := c.Defaults.BodyReadTimeout.Duration; d > 0 {
+		return d
+	}
+	return cfg.DefaultBodyReadTimeout
+}
+
+// readBodyWithin reads body to EOF, giving up if the read stops making
+// progress for `within`.
+//
+// THE BOUND IS ON INACTIVITY, NOT ON TOTAL DURATION, and the refresh in
+// bodyDeadlineReader.Read is what makes that true. A single deadline armed
+// once would be a total cap, and a total cap cannot tell a caller on a slow
+// link from a caller that has stopped: it kills the first in order to catch
+// the second, which is a new availability bug in place of the one being fixed.
+// What is wanted is "this upload has gone silent", and silence is what a
+// deadline re-armed on every read that returned bytes measures.
+//
+// A per-request deadline via http.ResponseController is the instrument rather
+// than http.Server.ReadTimeout, for three reasons that are all about what
+// ReadTimeout would ALSO do:
+//
+//   - ReadTimeout is one absolute deadline covering the whole request read, so
+//     it is the total cap described above. It cannot be refreshed on progress,
+//     and it would cut a legitimate slow upload at a fixed wall time no matter
+//     how healthily it was streaming.
+//   - http.Server.IdleTimeout falls back to ReadTimeout when it is zero, and
+//     it is zero here, so setting ReadTimeout would silently become the
+//     keep-alive idle timeout as well and start tearing down every pooled
+//     connection in the fleet after the same interval. That is a large
+//     behaviour change smuggled in beside a small one.
+//   - The server is built once at boot; a per-request value is read from the
+//     reload snapshot, so body_read_timeout is retunable over SIGHUP like the
+//     limits it protects, instead of needing a restart.
+//
+// When the ResponseWriter cannot carry a read deadline -- an
+// httptest.ResponseRecorder, or a wrapper that neither implements
+// SetReadDeadline nor offers Unwrap -- the read proceeds UNBOUNDED rather than
+// failing. That is a deliberate fail-open: the alternative is refusing real
+// requests because of the shape of a writer, and every wrapper on the serving
+// path passes w through untouched (proxy.LimitBody, proxy.BearerAuthFunc), so
+// the production writer always carries one. It is logged so an operator is not
+// left believing in a bound that is not there.
+func readBodyWithin(w http.ResponseWriter, body io.Reader, within time.Duration) ([]byte, error) {
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(within)); err != nil {
+		warnUnboundedBodyRead(err)
+		return io.ReadAll(body)
+	}
+	buf, err := io.ReadAll(&bodyDeadlineReader{src: body, extend: rc.SetReadDeadline, within: within})
+	if err != nil {
+		// The deadline is left EXPIRED on purpose. net/http drains whatever is
+		// left of an unconsumed body after the handler returns, and clearing
+		// the deadline first would hand that drain the unbounded wait this
+		// function just refused -- on the connection goroutine, where none of
+		// this handler's defers are left to release anything.
+		return nil, err
+	}
+	// Cleared on success so the deadline cannot outlive the read it was armed
+	// for. net/http clears it too once the body hits EOF, but relying on that
+	// is relying on an unexported detail of another package.
+	_ = rc.SetReadDeadline(time.Time{})
+	return buf, nil
+}
+
+// bodyDeadlineReader re-arms the connection read deadline before every read,
+// which is what turns a deadline into an inactivity bound.
+//
+// extend is called per Read and not per byte: the cost is one netpoll deadline
+// update per delivered segment, and it buys a bound that no caller who is
+// genuinely still sending can trip.
+type bodyDeadlineReader struct {
+	src    io.Reader
+	extend func(time.Time) error
+	within time.Duration
+	// unbounded records that extend began failing part-way through a read.
+	// Reads continue without a bound rather than being torn down on the
+	// strength of a deadline the transport turned out not to support.
+	unbounded bool
+}
+
+func (b *bodyDeadlineReader) Read(p []byte) (int, error) {
+	if !b.unbounded {
+		if err := b.extend(time.Now().Add(b.within)); err != nil {
+			b.unbounded = true
+			warnUnboundedBodyRead(err)
+		}
+	}
+	return b.src.Read(p)
+}
+
+// isReadDeadlineExceeded reports whether err is the read deadline firing
+// rather than any other read failure.
+//
+// Both forms are checked because the error reaches us through net/http from
+// the connection: os.ErrDeadlineExceeded is what package net wraps, and the
+// net.Error timeout bit is what a transport reporting timeouts its own way
+// will set. A caller whose body merely broke still gets 400; only this gets
+// 408.
+func isReadDeadlineExceeded(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// unboundedBodyReadWarning fires once per process: the condition is a property
+// of the serving stack rather than of a request, so logging per request would
+// be one line per request saying the same thing.
+var unboundedBodyReadWarning sync.Once
+
+func warnUnboundedBodyRead(err error) {
+	unboundedBodyReadWarning.Do(func() {
+		log.Printf("body_read_timeout is NOT being enforced: this ResponseWriter cannot carry a read deadline (%v); a stalled upload will hold its queue slot until the caller goes away", err)
+	})
+}
+
 func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
 	snap := r.snap()
 	seen := make(map[string]struct{})
@@ -799,11 +925,21 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 //
 // The semaphore is deliberately NOT moved ahead of io.ReadAll as well, which
 // would tighten the bound to MaxConcurrency alone. MaxConcurrency is small (2
-// by default) and there is no read timeout on the body, so a handful of slow
-// uploads would hold every upstream slot in the router and starve traffic that
-// was ready to be served: that trades a memory exhaustion for an availability
-// one. Queue slots are the resource that is meant to be occupied by work that
-// is waiting, and MaxQueueDepth is sized for it.
+// by default), so a handful of slow uploads would hold every upstream slot in
+// the router and starve traffic that was ready to be served: that trades a
+// memory exhaustion for an availability one. Queue slots are the resource that
+// is meant to be occupied by work that is waiting, and MaxQueueDepth is sized
+// for it.
+//
+// THE SAME ARGUMENT APPLIES TO THE QUEUE SLOT, and for one revision it was not
+// applied there. Holding a slot across an UNBOUNDED read means MaxQueueDepth
+// callers who simply stop sending are enough to make the router answer 429 to
+// everything else -- measured, with four stalled uploads against a queue depth
+// of four -- which is the same availability exhaustion the paragraph above
+// refuses, merely reached through the other resource. The reasoning was right;
+// it was applied to one gate and not the other. readBodyWithin is the missing
+// half: the read is bounded by defaults.body_read_timeout, so a slot can only
+// be held for as long as the upload is making progress.
 //
 // NOT FIXED HERE, and reported rather than changed: proxy.BearerAuth returns
 // the handler UNWRAPPED when the configured token is empty ("An empty token
@@ -879,8 +1015,42 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	releaseBuffer := r.beginBuffering()
 	defer releaseBuffer()
 
-	body, err := io.ReadAll(req.Body)
+	// THE READ IS BOUNDED, and that bound is what makes holding a queue slot
+	// across it safe -- see readBodyWithin.
+	body, err := readBodyWithin(w, req.Body, bodyReadTimeout(snap.cfg))
 	if err != nil {
+		if isReadDeadlineExceeded(err) {
+			// 408 AND NOT 503 + Retry-After. 503 says the router cannot serve
+			// requests right now and Retry-After says when it expects to be
+			// able to; both would be false. The router has capacity -- the
+			// slot this caller was holding has just been given back, which is
+			// the entire point -- and the fault is in one caller's upload, so
+			// telling a whole fleet to back off would spread one stalled
+			// connection across every client that shares the deployment. 408
+			// is the status RFC 9110 defines for exactly this ("did not
+			// receive a complete request message within the time that it was
+			// prepared to wait"), it is already what this handler answers
+			// when a queued request is abandoned, and it keeps the stalled
+			// caller's own failure distinguishable in the metrics from the
+			// 429 that its stall used to inflict on everybody else.
+			//
+			// Connection: close is BELT AND BRACES and is measured as such:
+			// deleting the line does not change what any caller receives
+			// today, because net/http already declines to reuse a connection
+			// whose body was left undrained -- and readBodyWithin leaves this
+			// one undrained against an expired deadline on purpose. The line
+			// is kept because that close is a consequence of net/http's
+			// post-handler drain heuristics rather than a decision of this
+			// handler's, and a future edit that clears the deadline on the
+			// error path would silently start offering a caller a connection
+			// with an unread body still on it.
+			w.Header().Set("Connection", "close")
+			http.Error(w, "request body stalled: no progress within body_read_timeout", http.StatusRequestTimeout)
+			// "unknown"/"none" for the same reason queue_full uses them: the
+			// model is a property of a body that never arrived.
+			requestsTotal.WithLabelValues("unknown", "none", "body_read_timeout").Inc()
+			return
+		}
 		http.Error(w, fmt.Sprintf("read request body: %v", err), http.StatusBadRequest)
 		return
 	}
