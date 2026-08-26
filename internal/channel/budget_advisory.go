@@ -98,6 +98,104 @@ func (a BudgetAdvisory) Warning() string {
 		a.Route, a.Tokens, a.EstimateTokens, a.Window, n, n, n, tail)
 }
 
+// UncappedPoolAdvisory names one route that pools SERVER-HELD credentials
+// behind no cap of any kind.
+//
+// It is the counterpart to BudgetAdvisory, and it covers the failure that one
+// could not see. BudgetAdvisory warns an operator who capped in the wrong
+// DENOMINATION — a real decision, made and mis-spelled. This one warns the
+// operator who made no decision at all, which is the shape that actually spends
+// a plan without limit: every caller past gateway_auth spends the pool, and
+// nothing in the config, the startup log or /healthz said the pool was
+// boundless.
+//
+// The asymmetry mattered in practice. A token budget shouted its own overshoot
+// ratio at startup; an ABSENT budget was indistinguishable from a reviewed
+// config that had deliberately chosen not to cap. This type removes that
+// ambiguity: from here on, "uncapped" is something a config SAYS, not something
+// it omits.
+//
+// SCOPE, and why it is pooled routes only: validateRotation REFUSES a rotation
+// block on a single-key route, so a budget is not configurable there at all and
+// warning about one would be advice to write a config the loader rejects. A
+// single-key route's blast radius is bounded by the provider's own plan, not by
+// this gateway.
+//
+// This is ADVISORY and deliberately not a load error. Making it fatal would
+// refuse every already-deployed pooled config at its next restart — turning a
+// warning into a fleet-wide outage during an upgrade.
+type UncappedPoolAdvisory struct {
+	// Route is the route name as it appears in logs, metrics and the audit
+	// trail.
+	Route string
+	// Enabled mirrors the route's feature flag. A disabled route is advised on
+	// anyway, for the same reason BudgetAdvisory does it: the route behaves
+	// this way the instant the flag is flipped, and finding that out at the
+	// flip is the failure the warning exists to prevent.
+	Enabled bool
+	// Keys is how many credential sources the pool declares — that is, how many
+	// separately funded provider plans this one route can spend.
+	Keys int
+	// Policy is the configured selection policy, or empty when the route
+	// declares a pool with no rotation block at all. Both are uncapped; only
+	// the remedy's shape differs, and the warning names which one applies.
+	Policy PolicyName
+}
+
+// Warning is the operator-facing sentence. It names the number of funded plans
+// exposed and the exact YAML that caps them, because "add a budget" is not
+// actionable at 3am and `rotation.budget.requests` is.
+func (a UncappedPoolAdvisory) Warning() string {
+	var tail string
+	if !a.Enabled {
+		tail = " This route is disabled today; it behaves exactly this way the moment it is enabled."
+	}
+	shape := "its rotation block carries no budget"
+	if a.Policy == "" {
+		shape = "it declares no rotation block at all"
+	}
+	return fmt.Sprintf("WARNING: route %q pools %d server-held keys and is UNCAPPED — %s, so rotation.budget.requests and rotation.budget.tokens are both unset. Every caller that passes gateway_auth can spend all %d funded plans without limit, and nothing bounds a runaway client or a leaked token except the provider's own billing. Set a REQUEST cap, which is exact under concurrency:\n    rotation:\n      policy: %s\n      budget:\n        window: 1h        # short window = a wrong cap self-heals within the hour\n        requests: <N>     # per KEY, per window\n        soft_ratio: 0.8   # retire a key at 80%% so the pool degrades, not cliffs\nSize <N> well above measured peak throughput: exhausting every key returns 503 with Retry-After (reason=keys_exhausted), so a cap set too low refuses real traffic until the window rolls.%s",
+		a.Route, a.Keys, shape, a.Keys, policyOrDefault(a.Policy), tail)
+}
+
+// policyOrDefault spells the policy for the remedy snippet. An unset policy
+// becomes the default the loader would have applied, so the snippet is
+// copy-pasteable rather than merely illustrative.
+func policyOrDefault(p PolicyName) PolicyName {
+	if p == "" {
+		return PolicyRoundRobin
+	}
+	return p
+}
+
+// UncappedPoolAdvisories reports every pooled route with no cap of any kind, in
+// configuration order.
+//
+// Like TokenBudgetAdvisories it reads the configuration and nothing else, so
+// the startup banner, a config linter and a test all derive the same answer
+// from the same place.
+func (c *Config) UncappedPoolAdvisories() []UncappedPoolAdvisory {
+	var out []UncappedPoolAdvisory
+	for _, r := range c.Routes {
+		if !hasPluralKeys(r) {
+			continue
+		}
+		if r.Rotation != nil && (r.Rotation.Budget.Requests > 0 || r.Rotation.Budget.Tokens > 0) {
+			continue
+		}
+		a := UncappedPoolAdvisory{
+			Route:   r.Name,
+			Enabled: r.Enabled,
+			Keys:    len(r.KeyEnvs) + len(r.KeyFiles) + len(r.KeyRefs),
+		}
+		if r.Rotation != nil {
+			a.Policy = r.Rotation.Policy
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 // TokenBudgetAdvisories reports every route that budgets by tokens, in
 // configuration order.
 //

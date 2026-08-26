@@ -57,6 +57,7 @@ func runGateway(args []string) error {
 	// --print-routes is exactly who needs to hear it, and a config that later
 	// fails to start should still have said what its budgets mean.
 	warnAdvisoryTokenBudgets(os.Stderr, cfg)
+	warnUncappedPools(os.Stderr, cfg)
 
 	auditWriter := io.Writer(os.Stdout)
 	if cfg.AuditLog != "" {
@@ -142,6 +143,21 @@ func warnUnauthenticatedProxyLeg(w io.Writer, mode channel.ProxyAuthMode, listen
 // configuration is one operators learn to scroll past.
 func warnAdvisoryTokenBudgets(w io.Writer, cfg *channel.Config) {
 	for _, a := range cfg.TokenBudgetAdvisories() {
+		_, _ = fmt.Fprintln(w, a.Warning())
+	}
+}
+
+// warnUncappedPools prints the startup warning for every pooled route carrying
+// no cap at all.
+//
+// It sits beside warnAdvisoryTokenBudgets rather than inside it because the two
+// answer different questions and an operator can be wrong in only one of them
+// at a time: that one says "your cap does not mean what you think", this one
+// says "you have no cap". Before this existed, only the first was ever spoken,
+// so the config that spent a pool without limit was the quietest one in the
+// file.
+func warnUncappedPools(w io.Writer, cfg *channel.Config) {
+	for _, a := range cfg.UncappedPoolAdvisories() {
 		_, _ = fmt.Fprintln(w, a.Warning())
 	}
 }

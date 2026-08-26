@@ -232,3 +232,129 @@ func TestExampleConfig_BudgetsByRequestsNotTokens(t *testing.T) {
 		t.Errorf("%s ships no route with rotation.budget.requests; the example must SHOW the budget an operator should copy, not merely omit the one they should not", path)
 	}
 }
+
+// TestUncappedPoolAdvisories_NamesEveryPooledRouteWithNoCap is the OTHER half of
+// the budget rule, and the half that was missing.
+//
+// TokenBudgetAdvisories warns an operator who capped in the WRONG DENOMINATION.
+// Nothing warned the operator who did not cap AT ALL — and that is the shape
+// that actually spends a plan without limit, because a pooled route holds
+// server-side keys and every caller who gets past gateway_auth spends them.
+// "Configured a token budget" was loud; "configured no budget" was silent.
+//
+// The no-rotation case is the one that decides the rule rather than
+// illustrating it: a route may declare key_files with no rotation block at all,
+// which Validate accepts, and that route is exactly as uncapped as one whose
+// rotation block carries an empty budget. Keying off Rotation != nil would miss
+// it entirely.
+func TestUncappedPoolAdvisories_NamesEveryPooledRouteWithNoCap(t *testing.T) {
+	t.Parallel()
+	single := Route{
+		Name: "single", Prefix: "/single/", Upstream: "https://api.example.invalid",
+		Auth: AuthInject, KeyEnv: "SINGLE_K", Enabled: true,
+	}
+	cfg := &Config{Listen: "127.0.0.1:0", Routes: []Route{
+		budgetedRoute("requests-capped", true, &Budget{Window: time.Hour, Requests: 5000}),
+		budgetedRoute("tokens-capped", true, &Budget{Window: time.Hour, Tokens: 1000, EstimateTokens: 100}),
+		budgetedRoute("empty-budget", true, &Budget{}),
+		budgetedRoute("no-rotation", true, nil),
+		budgetedRoute("disabled-uncapped", false, nil),
+		single,
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+
+	got := cfg.UncappedPoolAdvisories()
+	want := []string{"empty-budget", "no-rotation", "disabled-uncapped"}
+	if len(got) != len(want) {
+		t.Fatalf("UncappedPoolAdvisories() named %d routes (%v), want %v", len(got), uncappedNames(got), want)
+	}
+	for i, name := range want {
+		if got[i].Route != name {
+			t.Errorf("advisory[%d] = %q, want %q (configuration order)", i, got[i].Route, name)
+		}
+	}
+}
+
+// TestUncappedPoolAdvisories_IgnoresASingleKeyRoute pins the one exclusion that
+// is a correctness rule and not a preference: a rotation block — and therefore
+// a budget — is REFUSED by validateRotation on a single-key route, so warning
+// that such a route is uncapped would be telling the operator to write a config
+// the loader rejects.
+func TestUncappedPoolAdvisories_IgnoresASingleKeyRoute(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{Listen: "127.0.0.1:0", Routes: []Route{{
+		Name: "solo", Prefix: "/solo/", Upstream: "https://api.example.invalid",
+		Auth: AuthInject, KeyFile: "/dev/null", Enabled: true,
+	}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+	if got := cfg.UncappedPoolAdvisories(); len(got) != 0 {
+		t.Errorf("UncappedPoolAdvisories() = %v on a single-key route; a budget is not configurable there", uncappedNames(got))
+	}
+}
+
+// TestUncappedPoolAdvisory_WarningNamesTheKeyCountAndTheFix asserts the warning
+// carries the two things an operator needs to act: how many funded plans are
+// exposed, and the exact YAML that caps them.
+func TestUncappedPoolAdvisory_WarningNamesTheKeyCountAndTheFix(t *testing.T) {
+	t.Parallel()
+	a := UncappedPoolAdvisory{Route: "minimax", Enabled: true, Keys: 3}
+	got := a.Warning()
+	for _, want := range []string{"minimax", "3", "UNCAPPED", "rotation.budget.requests"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning does not mention %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "disabled today") {
+		t.Errorf("enabled route must not carry the disabled tail:\n%s", got)
+	}
+	off := UncappedPoolAdvisory{Route: "codex", Enabled: false, Keys: 2}.Warning()
+	if !strings.Contains(off, "disabled today") {
+		t.Errorf("disabled route must say the cap behaves this way once enabled:\n%s", off)
+	}
+}
+
+// TestExampleConfig_EveryPooledRouteCarriesARequestBudget strengthens the
+// config-as-code gate from "at least one route somewhere in the file is
+// budgeted" to "no pooled route is uncapped".
+//
+// The weak form passed as long as ONE route anywhere carried a cap, so a pooled
+// route added tomorrow with no budget would ship silently. Since the example is
+// what every node is deployed from, an uncapped pool in it is the default an
+// operator inherits without ever making the decision.
+func TestExampleConfig_EveryPooledRouteCarriesARequestBudget(t *testing.T) {
+	t.Parallel()
+	const path = "../../deploy/helixchannel/gateway.example.yml"
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig(%s): %v", path, err)
+	}
+	if got := cfg.UncappedPoolAdvisories(); len(got) != 0 {
+		t.Errorf("%s pools keys with no cap on %v; every pooled route in the shipped example must carry rotation.budget.requests", path, uncappedNames(got))
+	}
+	// Assert on the PARSED config and never on the file text: LoadConfig uses
+	// yaml.Unmarshal with no KnownFields, so a misspelled `budgets:` or a
+	// mis-indented `requests:` is silently dropped and the route parses as
+	// budget-free. A text grep would pass on a config the gateway reads as
+	// uncapped, which is the exact failure this gate exists to catch.
+	for _, r := range cfg.Routes {
+		if !hasPluralKeys(r) {
+			continue
+		}
+		if r.Rotation.Budget.Window <= 0 {
+			t.Errorf("route %q: rotation.budget.window is not set; a cap with no window never resets", r.Name)
+		}
+	}
+}
+
+// uncappedNames lists advisory route names for a failure message.
+func uncappedNames(as []UncappedPoolAdvisory) []string {
+	out := make([]string, 0, len(as))
+	for _, a := range as {
+		out = append(out, a.Route)
+	}
+	return out
+}

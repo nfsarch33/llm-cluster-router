@@ -17,6 +17,21 @@ listen: "0.0.0.0:14443"   # bind loopback instead when a TLS terminator runs on 
 timeout: 90s
 audit_log: ""             # empty = stdout (captured by the container/journal)
 
+# Recover the real caller IP for the AUDIT LOG from X-Forwarded-For, and only
+# when the accepted TCP peer is itself loopback.
+#
+# Turn this on for exactly one shape: a same-host TLS terminator (nginx)
+# relaying the public internet to a gateway bound on 127.0.0.1. There, every
+# peer is "loopback" and the real caller address would otherwise be absent from
+# every audit line — which is the difference between an audit trail and a list
+# of times nginx talked to itself.
+#
+# It is AUDIT-ONLY. It is read in one function and written to one field; no
+# admission decision consults it, so a forged header buys a caller nothing but a
+# less accurate log line. Pair it with gateway_auth.exempt_loopback: false —
+# behind a relay, "the peer is loopback" no longer means "the caller is local".
+trust_forwarded_for_audit: false
+
 # Caller authentication for the REVERSE-PROXY leg (every route below).
 #
 # Callers present it in the X-HLXN-Token header. It is NOT the
@@ -133,14 +148,24 @@ routes:
         soft_ratio: 0.8         # retire at 80% of the cap; 0 selects the default
     enabled: false
 
-  # The shorthand spelling. `rotation: round_robin` is exactly
-  # `rotation: {policy: round_robin}` — a policy with no budget.
+  # The scalar shorthand `rotation: round_robin` is exactly
+  # `rotation: {policy: round_robin}` — a policy with NO BUDGET, and it is the
+  # only spelling of a pool that cannot carry one. That makes it a footgun on a
+  # funded route rather than a convenience: it reads like a complete rotation
+  # config and produces an uncapped pool. The gateway now says so at startup
+  # (see UncappedPoolAdvisories), and this route is written in the mapping form
+  # for that reason. Use the shorthand only where the pool is not funded.
   - name: qwen-pool
     prefix: /qwen-pool/
     upstream: https://dashscope.aliyuncs.com
     auth: inject
     key_envs: [QWEN_KEY_1, QWEN_KEY_2]
-    rotation: round_robin
+    rotation:
+      policy: round_robin
+      budget:
+        window: 1h
+        requests: 2000
+        soft_ratio: 0.8
     enabled: false
 
   # ---------------------------------------------------------------------
