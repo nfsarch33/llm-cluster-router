@@ -177,6 +177,20 @@ type Server struct {
 	// once by NewServer and only read thereafter. See the comment on
 	// defaultConnectHalfCloseLinger for what it bounds and why.
 	connectLinger time.Duration
+
+	// tunnels is the CONNECT admission semaphore: its capacity is the ceiling
+	// on tunnels alive at once, and holding a slot IS the permission to carry
+	// one. NewServer sizes it from Connect.MaxConcurrent whenever the leg is
+	// enabled; tunnelsOnce covers the one remaining way it can be nil, which
+	// is a Server built as a bare struct literal instead of by NewServer.
+	//
+	// A nil channel is deliberately NOT read as "unbounded": a non-blocking
+	// send on nil falls straight through to the refusal branch, so that
+	// accident would be a gateway refusing every tunnel, and the accident it
+	// replaced was a gateway accepting every tunnel. Neither is a decision, so
+	// tunnelSem makes one -- it defaults the semaphore instead.
+	tunnels     chan struct{}
+	tunnelsOnce sync.Once
 }
 
 // serverOptions are the injectable construction dependencies.
@@ -295,6 +309,12 @@ func NewServer(cfg *Config, fwd Forwarder, audit Auditor, opts ...ServerOption) 
 		for _, h := range cfg.Connect.AllowedHosts {
 			s.allowed[strings.ToLower(h)] = true
 		}
+		// Sized HERE, once, from validated configuration -- the same place
+		// and the same moment as the credential that gates the leg. A
+		// semaphore allocated lazily on the request path would be a second
+		// answer to "how many tunnels may this gateway carry", arrived at by
+		// whichever request got there first.
+		s.tunnels = make(chan struct{}, connectMaxConcurrent(cfg))
 	}
 
 	// The gateway token resolves through the SAME SecretProvider as every route
@@ -753,6 +773,66 @@ func (s *Server) match(path string) *boundRoute {
 	return nil
 }
 
+// defaultConnectHalfCloseLinger bounds how long the surviving direction of a
+// CONNECT tunnel may keep copying after the FIRST direction has finished. It is
+// the backstop for a peer that is sent a FIN and then neither writes nor closes.
+const defaultConnectHalfCloseLinger = 30 * time.Second
+
+// connectCopyBufferSize is the per-direction copy buffer, and it is the same
+// 32KiB io.Copy used to allocate here, so the per-tunnel memory an operator
+// budgets is unchanged. What changed is the multiplier: the number of tunnels
+// is now Connect.MaxConcurrent rather than whatever the network offers.
+const connectCopyBufferSize = 32 << 10
+
+// connectRouteLabel is the route name the CONNECT leg reports in a 503 body, in
+// its audit line and on AdmissionRefusedTotal. The leg has no configured route
+// to name, and the alternative -- naming the TARGET -- would put a caller
+// controlled string into a metric label and mint a new series per host.
+const connectRouteLabel = "connect"
+
+// connectMaxConcurrent is the tunnel ceiling for cfg, defaulted.
+//
+// validateConnect has normally applied the default already, so this repeats it
+// only for a Config that never went through Validate -- a test fixture, or an
+// embedder that built one in code. Keeping the fallback in ONE place is what
+// stops the semaphore and the config key disagreeing about what "unset" means.
+func connectMaxConcurrent(cfg *Config) int {
+	if n := cfg.Connect.MaxConcurrent; n > 0 {
+		return n
+	}
+	return DefaultConnectMaxConcurrent
+}
+
+// tunnelSem returns the CONNECT admission semaphore, defaulting it for a Server
+// that was built as a bare struct literal. See Server.tunnels for why nil is
+// not allowed to mean either bound.
+func (s *Server) tunnelSem() chan struct{} {
+	s.tunnelsOnce.Do(func() {
+		if s.tunnels == nil {
+			s.tunnels = make(chan struct{}, connectMaxConcurrent(s.cfg))
+		}
+	})
+	return s.tunnels
+}
+
+// acquireTunnel takes a tunnel slot WITHOUT waiting and reports whether it got
+// one. releaseTunnel gives the slot back.
+//
+// The non-blocking form is the decision, not an optimisation: a blocking
+// acquire would convert an over-capacity gateway into an unbounded queue of
+// parked handler goroutines, which is one of the three resources this bound
+// exists to cap, reached by a different route.
+func (s *Server) acquireTunnel() bool {
+	select {
+	case s.tunnelSem() <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseTunnel() { <-s.tunnelSem() }
+
 // closeWriter is the half-close capability of a connection, stated as a
 // BEHAVIOUR so that no concrete conn type has to be enumerated.
 //
@@ -771,19 +851,170 @@ func (s *Server) match(path string) *boundRoute {
 // not silently regress the next time a conn arrives wrapped in something else.
 type closeWriter interface{ CloseWrite() error }
 
-// defaultConnectHalfCloseLinger bounds how long the surviving direction of a
-// CONNECT tunnel may keep copying after the FIRST direction has finished. It is
-// the backstop for a peer that is sent a FIN and then neither writes nor closes.
-const defaultConnectHalfCloseLinger = 30 * time.Second
+// tunnelDeadlines is the SINGLE writer of both conns deadlines for one CONNECT
+// tunnel. It is a type rather than two closures because the two bounds it
+// applies are armed from different goroutines and would otherwise fight.
+//
+// The two bounds:
+//
+//   - IDLE. Before every Read, the reading direction re-arms that conn read
+//     deadline to now+idle. A tunnel that is established and then goes silent
+//     -- the cheapest way there is to hold a socket, two goroutines and 64KiB
+//     of this gateway indefinitely -- unblocks and unwinds instead.
+//     ReadHeaderTimeout stops applying the instant the conn is hijacked, so
+//     before this there was no deadline of any kind on an established tunnel.
+//
+//   - LINGER. Once the FIRST direction finishes, arm puts a hard deadline on
+//     BOTH conns. That is the half-close backstop, and it is a DEADLINE rather
+//     than a Close because closing both the moment one direction ends
+//     truncates the ordinary half-close -- client done sending, upstream still
+//     streaming -- turning a goroutine leak into silent data loss.
+//
+// EITHER ONE MAY ONLY EVER TIGHTEN THE OTHER, and both directions of that rule
+// had to be written down because both are reachable and each was wrong once:
+//
+//   - A refresh landing just after arm would push the read deadline back out
+//     past the linger bound, and the surviving direction would then sit for a
+//     whole idle period on a peer that has already been told to go away. Every
+//     refresh is therefore CLAMPED to the linger deadline once armed.
+//   - arm setting the linger deadline unconditionally EXTENDS a conn whose
+//     idle deadline is already sooner, which is what happens on any gateway
+//     configured with idle < linger. The direction that times out first arms,
+//     and its arming hands the other direction a fresh linger-long lease on
+//     the very deadline that was about to reap it. arm therefore keeps
+//     whichever of the two is EARLIER, per conn.
+//
+// Both operations run under one mutex, so no refresh can interleave with an
+// arm. The mutex is held across two setsockopt-class calls and never across a
+// Read.
+type tunnelDeadlines struct {
+	mu       sync.Mutex
+	client   net.Conn
+	upstream net.Conn
+	idle     time.Duration
+	linger   time.Duration
+	armed    bool
+	lingerAt time.Time
+
+	// clientIdleAt and upstreamIdleAt are the idle deadlines currently in
+	// force, remembered so arm can tighten to them rather than over them.
+	clientIdleAt   time.Time
+	upstreamIdleAt time.Time
+}
+
+// refreshIdle re-arms src read deadline, clamped to the linger deadline.
+func (d *tunnelDeadlines) refreshIdle(src net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	at := time.Now().Add(d.idle)
+	if d.armed && d.lingerAt.Before(at) {
+		at = d.lingerAt
+	}
+	// Dispatched on conn identity because each direction refreshes only the
+	// conn it READS, and arm needs to know which recorded deadline belongs to
+	// which conn. The two are distinct sockets, so the comparison is exact.
+	if src == d.client {
+		d.clientIdleAt = at
+	} else {
+		d.upstreamIdleAt = at
+	}
+	_ = src.SetReadDeadline(at)
+}
+
+// arm applies the half-close linger bound to both conns, once.
+//
+// SetDeadline reaches a Read that is ALREADY blocked, and that is the whole
+// mechanism: the surviving direction is parked in Read at this moment, and
+// this is what will eventually return it.
+func (d *tunnelDeadlines) arm() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.armed {
+		return
+	}
+	d.armed = true
+	d.lingerAt = time.Now().Add(d.linger)
+	d.tightenLocked(d.client, d.clientIdleAt)
+	d.tightenLocked(d.upstream, d.upstreamIdleAt)
+}
+
+// tightenLocked sets c deadline to the EARLIER of the linger bound and the idle
+// deadline already in force on it, so arming can only ever shorten a tunnel.
+func (d *tunnelDeadlines) tightenLocked(c net.Conn, idleAt time.Time) {
+	at := d.lingerAt
+	if !idleAt.IsZero() && idleAt.Before(at) {
+		at = idleAt
+	}
+	_ = c.SetDeadline(at)
+}
+
+// copyTunnelHalf copies src into dst until src stops producing, refreshing the
+// idle deadline before every Read, and returns the number of bytes written.
+//
+// It is a hand-rolled loop and not io.Copy because io.Copy offers no point at
+// which to re-arm a deadline: the read that has to be bounded happens inside
+// it. The cost is io.Copy ReadFrom/splice fast path -- which this leg never
+// had on the posture that matters anyway, since a TLS-terminating gateway
+// hands one end of every pair to crypto/tls and splice needs both ends to be
+// kernel sockets.
+//
+// Errors are dropped for the same reason the io.Copy calls dropped them: every
+// outcome here -- clean EOF, reset peer, idle deadline, linger deadline --
+// ends this direction, and the audit line already records the tunnel closing.
+func copyTunnelHalf(dst io.Writer, src net.Conn, d *tunnelDeadlines) int64 {
+	buf := make([]byte, connectCopyBufferSize)
+	var total int64
+	for {
+		d.refreshIdle(src)
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			w, werr := dst.Write(buf[:n])
+			total += int64(w)
+			if werr != nil {
+				return total
+			}
+		}
+		if rerr != nil {
+			return total
+		}
+	}
+}
 
 // handleConnect serves the CONNECT tunnel leg.
 //
 // The gateway authenticates the client with a shared token, checks the target
 // against an exact-match allowlist, then copies bytes in both directions. It
-// never terminates the inner TLS session, so the client's own credential
+// never terminates the inner TLS session, so the client own credential
 // (for example an OAuth session token) is never visible to the gateway or to
 // any intermediate hop — which is the entire point of routing an agent whose
 // auth cannot be injected server-side.
+//
+// ADMISSION IS THE BUFFERED-CHANNEL SEMAPHORE, PATTERN (a), ACQUIRED
+// NON-BLOCKINGLY. Stated here because the alternatives are all reachable from
+// this spot and each is wrong in its own specific way:
+//
+//   - A BLOCKING acquire (same channel, no default branch) turns the overflow
+//     into a queue of parked handler goroutines. Goroutines are one of the
+//     three resources being bounded, so that would cap the sockets and the
+//     buffers by uncapping the thing they are counted alongside.
+//   - A WaitGroup or errgroup limit is a different shape entirely: those join
+//     work the SERVER started, and this is work an untrusted CALLER starts.
+//     There is nothing to wait for here and no result to collect.
+//   - A rate limiter (tokens per second) bounds ARRIVALS. The resource here is
+//     held for the whole life of the tunnel, so arrivals are not what runs the
+//     gateway out of file descriptors; concurrency is.
+//
+// The acquire sits immediately after the allowlist check and BEFORE the dial,
+// so a full gateway stops dialling outbound rather than dialling and then
+// discovering it has nowhere to put the result. That ordering is what keeps a
+// saturated gateway from being an amplifier. The release is a defer, so it
+// covers every path out of the handler including the ones that return before
+// wg.Wait -- a failed hijack, a peer that hangs up on the 200.
+//
+// The refusal is 503 + Retry-After, matching the reverse-proxy leg pre-dispatch
+// refusals rather than a 429: nothing about the caller RATE is being judged,
+// the gateway is simply full. It is emitted before a single outbound packet, so
+// a client retrying into a full gateway costs it one HTTP response.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	requestID := uuid.NewString()
@@ -814,6 +1045,20 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusForbidden, "host_not_allowlisted")
 		return
 	}
+
+	if !s.acquireTunnel() {
+		AdmissionRefusedTotal.WithLabelValues(connectRouteLabel, "tunnels_at_capacity").Inc()
+		s.writeUnavailable(w, connectRouteLabel, "tunnels_at_capacity",
+			"the gateway is already carrying connect.max_concurrent tunnels; no upstream was dialled, and a slot frees the moment any tunnel finishes, so retry shortly rather than after a quota window",
+			MinRetryAfter)
+		s.audit.Log(AuditEvent{
+			Event: "connect_denied", RequestID: requestID, Target: target,
+			Status: http.StatusServiceUnavailable, LatencyMS: time.Since(start).Milliseconds(),
+			ClientAddr: r.RemoteAddr, Error: "tunnels_at_capacity",
+		})
+		return
+	}
+	defer s.releaseTunnel()
 
 	upstream, err := net.DialTimeout("tcp", target, s.cfg.Connect.DialTimeout)
 	if err != nil {
@@ -859,7 +1104,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		ClientAddr: r.RemoteAddr,
 	})
 
-	// Both directions are copied concurrently, and BOTH are now bounded.
+	// Both directions are copied concurrently, and BOTH are bounded three ways.
 	//
 	// FIRST bound -- the FIN actually reaches the peer. When a direction runs
 	// out of bytes the other side is told so with CloseWrite, asked for as a
@@ -870,58 +1115,52 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// mattered and every affected tunnel parked this handler forever.
 	//
 	// SECOND bound -- a peer that ignores the FIN still cannot park us. The
-	// moment the FIRST direction finishes, a deadline is armed on BOTH conns;
-	// the surviving io.Copy then unblocks on os.ErrDeadlineExceeded instead of
-	// waiting on a socket nobody will ever write to or close again. CloseWrite
-	// asks a peer to stop and nothing makes a peer listen, so the half-close
-	// fix alone is a courtesy, not a bound. This is the bound.
+	// moment the FIRST direction finishes, a linger deadline is armed on BOTH
+	// conns; the surviving copy then unblocks instead of waiting on a socket
+	// nobody will ever write to or close again. CloseWrite asks a peer to stop
+	// and nothing makes a peer listen, so the half-close fix alone is a
+	// courtesy, not a bound.
 	//
-	// Two deliberate choices inside that second bound:
+	// THIRD bound -- a tunnel that never half-closes at all. Neither of the
+	// above fires while both peers simply hold the socket open and say nothing,
+	// which is the cheapest possible way to occupy this gateway, and it is what
+	// made an established tunnel an unbounded hold. The idle deadline refreshed
+	// before every Read is what reaps that one.
 	//
-	//   - The deadline is armed when the first copy RETURNS, never at tunnel
-	//     establishment. Arming it up front would cap the lifetime of a
-	//     perfectly healthy full-duplex tunnel, which is not what this is for.
-	//   - Both conns are DEADLINED, not closed. Closing both the instant the
-	//     first copy returns is the other obvious shape and it is wrong here:
-	//     it truncates the ordinary half-close -- client has finished sending,
-	//     upstream is still streaming the response -- and so converts a
-	//     goroutine leak into silent data loss. A deadline lets the surviving
-	//     direction drain for connectLinger and only then gives up.
+	// See tunnelDeadlines for how the second and third are kept from fighting,
+	// and for why the linger is a deadline rather than a Close.
+	linger := s.connectLinger
+	if linger <= 0 {
+		// A Server built as a bare struct literal (some tests do that) never
+		// ran the defaulting in NewServer, and a zero here would mean a
+		// deadline in the past: it would kill the tunnel on the spot rather
+		// than bound it.
+		linger = defaultConnectHalfCloseLinger
+	}
+	idle := s.cfg.Connect.IdleTimeout
+	if idle <= 0 {
+		idle = DefaultConnectIdleTimeout
+	}
+	dl := &tunnelDeadlines{client: client, upstream: upstream, idle: idle, linger: linger}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var bytesUp int64
-	var armOnce sync.Once
-	armLinger := func() {
-		armOnce.Do(func() {
-			linger := s.connectLinger
-			if linger <= 0 {
-				// A Server built as a bare struct literal (some tests do that)
-				// never ran the defaulting in NewServer, and a zero here would
-				// mean a deadline in the past: it would kill the tunnel on the
-				// spot rather than bound it.
-				linger = defaultConnectHalfCloseLinger
-			}
-			deadline := time.Now().Add(linger)
-			_ = client.SetDeadline(deadline)
-			_ = upstream.SetDeadline(deadline)
-		})
-	}
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(upstream, client)
-		bytesUp = n
+		bytesUp = copyTunnelHalf(upstream, client, dl)
 		if cw, ok := upstream.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		armLinger()
+		dl.arm()
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(client, upstream)
+		_ = copyTunnelHalf(client, upstream, dl)
 		if cw, ok := client.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
-		armLinger()
+		dl.arm()
 	}()
 	wg.Wait()
 

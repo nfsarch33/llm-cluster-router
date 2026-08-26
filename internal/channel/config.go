@@ -132,6 +132,35 @@ type Route struct {
 	Rotation *RotationConfig `yaml:"rotation"`
 }
 
+// Bounds for the CONNECT leg, applied by validateConnect when the operator
+// leaves the corresponding key unset.
+//
+// ZERO MEANS "THE DEFAULT", NOT "UNLIMITED", for both of them, and that choice
+// is the whole point rather than a convention: every gateway config written
+// before these keys existed omits them, so a zero that meant "no bound" would
+// leave exactly the deployments this bound exists for running unbounded while
+// the config file looks like it has been reviewed. A negative value is refused
+// outright instead of being read as an opt-out, because "turn the bound off"
+// is not a thing an operator should be able to say by accident.
+const (
+	// DefaultConnectMaxConcurrent is the ceiling on tunnels alive at once.
+	// A few hundred: high enough that no plausible fleet of agents reaches
+	// it in normal operation, low enough that the worst case is arithmetic
+	// an operator can do -- at 256 tunnels the copy buffers alone are
+	// 256 * 2 * 32KiB = 16MiB, against the ~640MiB an unbounded 10k would
+	// have cost.
+	DefaultConnectMaxConcurrent = 256
+
+	// DefaultConnectIdleTimeout is how long a tunnel may carry no bytes in
+	// EITHER direction before it is reaped. Five minutes is chosen against
+	// the traffic this leg actually carries: a long-running agent response
+	// is a stream, and a stream that has produced nothing for five minutes
+	// has failed rather than paused. It is deliberately not seconds --
+	// see ConnectConfig.IdleTimeout for why this one is operator-tunable
+	// and the half-close linger is not.
+	DefaultConnectIdleTimeout = 5 * time.Minute
+)
+
 // ConnectConfig configures the CONNECT (tunnel) leg used by clients whose
 // traffic cannot be reverse-proxied because they hold their own session
 // credential and require an end-to-end TLS path — Claude Code being the
@@ -156,6 +185,34 @@ type ConnectConfig struct {
 	TokenRef string `yaml:"token_ref"`
 	// DialTimeout bounds the outbound dial to the target host.
 	DialTimeout time.Duration `yaml:"dial_timeout"`
+
+	// MaxConcurrent is the number of CONNECT tunnels this gateway will carry
+	// at once. It is the only thing standing between one leaked CONNECT
+	// token and resource exhaustion: each tunnel costs two sockets, two copy
+	// goroutines plus the handler goroutine that waits on them, and two
+	// 32KiB copy buffers, and nothing else in the admission chain counts
+	// them. A caller arriving when the gateway is full is refused with 503
+	// and a Retry-After BEFORE the outbound dial, so a saturated gateway
+	// stops being an outbound amplifier rather than merely a slow one.
+	//
+	// 0 selects DefaultConnectMaxConcurrent. Negative is a config error.
+	MaxConcurrent int `yaml:"max_concurrent"`
+
+	// IdleTimeout reaps a tunnel that has carried no bytes in either
+	// direction for this long.
+	//
+	// It is a CONFIG KEY, whereas the half-close linger backstop is a
+	// constant, and the difference is which tunnels each one can kill. The
+	// linger only ever fires on a tunnel whose peer has already been sent a
+	// FIN and has answered neither with bytes nor with a close -- there is
+	// no healthy tunnel for it to get wrong. This one can kill a tunnel that
+	// is merely quiet, so the right value depends on the workload behind it
+	// and the operator is the only one who knows that.
+	//
+	// 0 selects DefaultConnectIdleTimeout. Negative is a config error: there
+	// is deliberately no spelling for "never reap", because that is the
+	// state this key was added to make unreachable.
+	IdleTimeout time.Duration `yaml:"idle_timeout"`
 }
 
 // ProxyAuthMode is the caller-authentication posture of the REVERSE-PROXY leg,
@@ -619,6 +676,18 @@ func (c *Config) validateConnect() error {
 	}
 	if c.Connect.DialTimeout == 0 {
 		c.Connect.DialTimeout = 10 * time.Second
+	}
+	if c.Connect.MaxConcurrent < 0 {
+		return fmt.Errorf("connect: max_concurrent must not be negative (got %d); omit the key or set 0 for the default of %d, and note there is no spelling for \"unlimited\"", c.Connect.MaxConcurrent, DefaultConnectMaxConcurrent)
+	}
+	if c.Connect.MaxConcurrent == 0 {
+		c.Connect.MaxConcurrent = DefaultConnectMaxConcurrent
+	}
+	if c.Connect.IdleTimeout < 0 {
+		return fmt.Errorf("connect: idle_timeout must not be negative (got %v); omit the key or set 0 for the default of %v, and note there is no spelling for \"never reap\"", c.Connect.IdleTimeout, DefaultConnectIdleTimeout)
+	}
+	if c.Connect.IdleTimeout == 0 {
+		c.Connect.IdleTimeout = DefaultConnectIdleTimeout
 	}
 	return nil
 }

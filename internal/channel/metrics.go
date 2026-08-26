@@ -26,10 +26,17 @@ var KeyRetiredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 //
 // The reason label carries exactly the error code in the 503 body and in the
 // audit line, so one vocabulary spans the response, the log and the series.
+//
+// The CONNECT leg reports here too, with reason tunnels_at_capacity and the
+// literal route "connect" -- that leg has no configured route to name, and
+// naming the TARGET instead would put a caller-controlled string in a metric
+// label and mint a series per host. It is a capacity signal like
+// admission_limited and not a fault: sustained, it means the gateway is being
+// offered more simultaneous tunnels than connect.max_concurrent allows.
 var AdmissionRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "llm_cluster_router",
 	Name:      "helixchannel_admission_refused_total",
-	Help:      "HelixChannel requests refused before any upstream call, by route and reason (keys_exhausted|admission_limited).",
+	Help:      "HelixChannel requests refused before any upstream call, by route and reason (keys_exhausted|admission_limited|tunnels_at_capacity).",
 }, []string{"route", "reason"})
 
 // RegisterMetrics registers the channel metrics with reg.
