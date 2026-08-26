@@ -130,6 +130,20 @@ type router struct {
 	queueDepth atomic.Int64
 	inflight   atomic.Int64
 
+	// buffering is the number of request bodies handleProxy is holding in
+	// memory right now, and bufferingPeak is the high-water mark since boot.
+	// They exist because that count is the router MEMORY ceiling and nothing
+	// else reports it: queueDepth and inflight both measure progress through
+	// the upstream, and a body is held from before admission completes until
+	// the handler returns, which is a strictly wider window than either.
+	//
+	// Read them together with max_queue_depth and max_concurrency: the bound
+	// is MaxQueueDepth + MaxConcurrency bodies, so a peak at that ceiling
+	// means the router has been running at its memory limit, not that
+	// anything has gone wrong.
+	buffering     atomic.Int64
+	bufferingPeak atomic.Int64
+
 	queueTierMu      sync.Mutex
 	queueDepthByTier map[string]int64
 }
@@ -631,13 +645,37 @@ func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		"inflight_requests": r.inflight.Load(),
 		"max_queue_depth":   snap.cfg.Defaults.MaxQueueDepth,
 		"max_concurrency":   snap.cfg.Defaults.MaxConcurrency,
-		"nodes":             nodes,
+		// The memory ceiling, reported next to the two limits that set it.
+		// See router.buffering.
+		"buffered_bodies":      r.buffering.Load(),
+		"peak_buffered_bodies": r.bufferingPeak.Load(),
+		"nodes":                nodes,
 	}
 	if live {
 		resp["live_probe"] = true
 		resp["probe_timeout"] = probeTimeout.String()
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// beginBuffering records that one more request body is about to be held in
+// memory and returns the function that records its release.
+//
+// The peak is maintained with a compare-and-swap loop rather than a plain
+// store because two handlers can be raising it at once and the LOSER of that
+// race is the one whose value would otherwise be written last. It is a
+// high-water mark since boot and is never reset: the question it answers is
+// "how close has this router come to its memory ceiling", which a value that
+// decays cannot answer.
+func (r *router) beginBuffering() func() {
+	n := r.buffering.Add(1)
+	for {
+		peak := r.bufferingPeak.Load()
+		if n <= peak || r.bufferingPeak.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+	return func() { r.buffering.Add(-1) }
 }
 
 func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -730,21 +768,122 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 	return resp, usedKeyIdx, err
 }
 
+// handleProxy is the reverse-proxy request path.
+//
+// ADMISSION HAPPENS BEFORE ALLOCATION, and the ORDER is the whole point of the
+// arrangement rather than an implementation detail. io.ReadAll used to be the
+// second statement of this function, ahead of both gates, so MaxQueueDepth and
+// MaxConcurrency protected the UPSTREAM fan-out and protected memory not at
+// all: every one of the per-request pieces is individually capped
+// (MaxBytesReader at max_body_size, the 2MiB limitedBuffer, the 64KiB
+// io.LimitReader) but the multiplier on all of them was the number of
+// connections a caller chose to open, which nothing caps. The real ceiling was
+// therefore "unbounded x roughly 3.1MiB".
+//
+// The admission path is the buffered-channel semaphore, pattern (a), used
+// TWICE OVER and in one specific order:
+//
+//  1. A COUNTED BOUNDED QUEUE (r.queueDepth against MaxQueueDepth), refusing
+//     with 429 rather than waiting. This one is first because it is the only
+//     gate that can be evaluated without reading anything, and refusing here
+//     costs one atomic add.
+//  2. A BUFFERED-CHANNEL SEMAPHORE (snap.semaphore against MaxConcurrency),
+//     acquired BLOCKINGLY with a request-context escape. Blocking is correct
+//     at this stage precisely because stage 1 already bounded how many callers
+//     can be waiting here.
+//
+// The queue slot is HELD ACROSS io.ReadAll and given back on acquiring the
+// semaphore, so the number of bodies in memory is bounded by
+// MaxQueueDepth + MaxConcurrency -- two configured constants -- instead of by
+// the connection count. r.buffering reports the live figure.
+//
+// The semaphore is deliberately NOT moved ahead of io.ReadAll as well, which
+// would tighten the bound to MaxConcurrency alone. MaxConcurrency is small (2
+// by default) and there is no read timeout on the body, so a handful of slow
+// uploads would hold every upstream slot in the router and starve traffic that
+// was ready to be served: that trades a memory exhaustion for an availability
+// one. Queue slots are the resource that is meant to be occupied by work that
+// is waiting, and MaxQueueDepth is sized for it.
+//
+// NOT FIXED HERE, and reported rather than changed: proxy.BearerAuth returns
+// the handler UNWRAPPED when the configured token is empty ("An empty token
+// disables auth entirely"), so a deployment with no auth_token serves this
+// path to anyone who can open a socket. That is an auth-semantics decision,
+// not an admission one.
 func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
-
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read request body: %v", err), http.StatusBadRequest)
-		return
-	}
 
 	// Snapshot the reloadable state once at the top so the entire
 	// request runs against a consistent config even if SIGHUP fires
 	// mid-flight. The snapshot is cheap (one RLock + a slice copy)
 	// and avoids the inconsistency of a request that picks a node
 	// from one config and a timeout from a newer one.
+	//
+	// It is taken FIRST because admission reads its limits and admission now
+	// runs before anything is allocated. It reads no part of the body.
 	snap := r.snap()
+
+	// The cheapest refusal there is: a caller who has DECLARED a body over the
+	// limit is turned away without allocating for it. MaxBytesReader still
+	// backs this up for a caller who declares nothing and streams, and for a
+	// caller who lies about the length -- this only removes the case where the
+	// request says up front that it cannot be served.
+	if maxBody := snap.cfg.Defaults.MaxBodySize; maxBody > 0 && req.ContentLength > maxBody {
+		http.Error(w, "request body exceeds max_body_size", http.StatusRequestEntityTooLarge)
+		requestsTotal.WithLabelValues("unknown", "none", "body_too_large").Inc()
+		return
+	}
+
+	// STAGE 1. The queue slot is taken before the body is read and held until
+	// the semaphore is acquired, so a caller waiting for capacity is holding a
+	// counter rather than megabytes.
+	//
+	// tierLabel is empty until a node is chosen, because the tier is a
+	// property of the NODE and no node has been selected yet. The per-tier
+	// gauge is therefore joined late and dequeue skips it when it was never
+	// joined; the router-wide gauge is exact from the first statement.
+	queueDepth := r.queueDepth.Add(1)
+	queueDepthGauge.Set(float64(queueDepth))
+	tierLabel := ""
+	dequeued := false
+	dequeue := func() {
+		if dequeued {
+			return
+		}
+		dequeued = true
+		queueDepthGauge.Set(float64(r.queueDepth.Add(-1)))
+		if tierLabel != "" {
+			r.addQueueDepthByTier(tierLabel, -1)
+		}
+	}
+	// A SAFETY NET, not the normal path: the normal path dequeues on acquiring
+	// the semaphore. Admission now precedes several refusals that used to run
+	// before any slot was held (a body that will not read, a disallowed agent,
+	// no healthy upstream), and a slot leaked on any one of them is permanent
+	// -- queueDepth only ever climbs, and the router answers 429 to everyone
+	// from then on. Being idempotent is what lets both callers exist.
+	defer dequeue()
+
+	if int(queueDepth) > snap.cfg.Defaults.MaxQueueDepth {
+		http.Error(w, "router queue is full", http.StatusTooManyRequests)
+		// "unknown"/"none": the refusal is now decided before the body is read
+		// and therefore before the model or the node is known. Naming them
+		// would mean reading the body to label a request that is being turned
+		// away for the express purpose of not reading it.
+		requestsTotal.WithLabelValues("unknown", "none", "queue_full").Inc()
+		return
+	}
+
+	// From here the body is IN MEMORY and stays there until the handler
+	// returns, which is what r.buffering counts.
+	releaseBuffer := r.beginBuffering()
+	defer releaseBuffer()
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read request body: %v", err), http.StatusBadRequest)
+		return
+	}
 
 	tier := req.Header.Get("X-Tier")
 	if snap.smart != nil {
@@ -771,21 +910,12 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	tierLabel := metricLabel(node.cfg.Tier, "unknown")
-	queueDepth := r.queueDepth.Add(1)
-	queueDepthGauge.Set(float64(queueDepth))
+	// The tier is known only now, so the per-tier queue gauge joins the slot
+	// this request has been holding since before the body was read.
+	tierLabel = metricLabel(node.cfg.Tier, "unknown")
 	r.addQueueDepthByTier(tierLabel, 1)
-	dequeue := func() {
-		queueDepthGauge.Set(float64(r.queueDepth.Add(-1)))
-		r.addQueueDepthByTier(tierLabel, -1)
-	}
-	if int(queueDepth) > snap.cfg.Defaults.MaxQueueDepth {
-		dequeue()
-		http.Error(w, "router queue is full", http.StatusTooManyRequests)
-		requestsTotal.WithLabelValues(model, node.cfg.Name, "queue_full").Inc()
-		return
-	}
 
+	// STAGE 2.
 	select {
 	case snap.semaphore <- struct{}{}:
 		dequeue()
