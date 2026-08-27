@@ -193,6 +193,27 @@ type NodeConfig struct {
 	// Circuit optionally overrides the global Defaults.Circuit tuning for this
 	// single upstream. Unset (zero) fields inherit the global default.
 	Circuit CircuitConfig `yaml:"circuit"`
+	// AuthHeader, when non-empty, names the request header the node's
+	// api_key is sent in -- verbatim, with no "Bearer " prefix -- instead
+	// of the default "Authorization: Bearer <key>". The motivating
+	// upstream is a token-gated egress gateway that must NOT receive the
+	// credential in Authorization, because gateways with passthrough
+	// routes forward Authorization verbatim to the provider behind them.
+	//
+	// Three admission rules, enforced at load time so a misconfiguration
+	// is a boot error rather than silent unauthenticated traffic:
+	//   - "Authorization" is refused (that is the default path; spell it
+	//     by omitting auth_header);
+	//   - the name is restricted to ALPHA / DIGIT / "-";
+	//   - a usable key (api_key or api_keys, post env-expansion) must be
+	//     configured, otherwise the header would never be sent while the
+	//     config reads as though gateway auth were on.
+	//
+	// When AuthHeader is set the proxy also DELETES any inbound
+	// Authorization before dispatch: doUpstream copies caller headers to
+	// the upstream request, and the caller's router token must never
+	// reach the gateway.
+	AuthHeader string `yaml:"auth_header"`
 	// HealthCheckDisabled, when true, removes this upstream from the active
 	// health-probe loop. It defaults to false (probe enabled).
 	//
@@ -422,8 +443,54 @@ func LoadConfig(path string) (Config, error) {
 		if err := ValidateUpstreamURL(cfg.Nodes[i].Name, cfg.Nodes[i].URL); err != nil {
 			return cfg, err
 		}
+		if err := validateAuthHeader(cfg.Nodes[i]); err != nil {
+			return cfg, err
+		}
 	}
 	return cfg, nil
+}
+
+// validateAuthHeader enforces the auth_header admission rules described
+// on NodeConfig.AuthHeader. It runs AFTER env expansion so an api_key of
+// "${UNSET_VAR}" -- which expands to "" -- is caught here rather than
+// producing a node that silently sends no credential.
+func validateAuthHeader(n NodeConfig) error {
+	if n.AuthHeader == "" {
+		return nil
+	}
+	if strings.EqualFold(n.AuthHeader, "Authorization") {
+		return fmt.Errorf(
+			"node %q: auth_header must not be \"Authorization\" -- that is the default "+
+				"Bearer path (omit auth_header for it), and a gateway credential in "+
+				"Authorization is forwarded verbatim to the provider by passthrough routes",
+			n.Name,
+		)
+	}
+	for i := 0; i < len(n.AuthHeader); i++ {
+		c := n.AuthHeader[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'
+		if !ok {
+			return fmt.Errorf(
+				"node %q: auth_header %q contains %q; header names here are restricted to letters, digits and '-'",
+				n.Name, n.AuthHeader, string(c),
+			)
+		}
+	}
+	hasKey := n.APIKey != ""
+	for _, k := range n.APIKeys {
+		if k != "" {
+			hasKey = true
+		}
+	}
+	if !hasKey {
+		return fmt.Errorf(
+			"node %q: auth_header %q is set but no usable api_key/api_keys is configured "+
+				"(after env expansion) -- the header would never be sent and every request "+
+				"would reach the upstream unauthenticated",
+			n.Name, n.AuthHeader,
+		)
+	}
+	return nil
 }
 
 // ValidateUpstreamURL parses rawURL and rejects it when the host
