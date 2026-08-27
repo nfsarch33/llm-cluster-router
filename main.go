@@ -831,6 +831,36 @@ func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// setUpstreamAuth attaches the node's credential to an outbound header
+// set. It is the ONE place upstream auth is decided, extracted so every
+// branch is unit-testable:
+//
+//   - authHeader == "": the historical default. A non-empty key becomes
+//     "Authorization: Bearer <key>" (replacing the caller's router
+//     token); a keyless node leaves the caller's Authorization intact,
+//     which is how clients authenticate directly to local upstreams.
+//   - authHeader != "": gateway mode. The key is sent verbatim in the
+//     named header, and Authorization is ALWAYS deleted -- copyHeaders
+//     has just copied the caller's router token into this header set,
+//     and a gateway with passthrough routes forwards Authorization
+//     verbatim to the provider behind it. The named header is also
+//     scrubbed first so a caller cannot smuggle its own gateway token
+//     through, INCLUDING when the key pool is exhausted (key == "") and
+//     there is nothing of ours to send.
+func setUpstreamAuth(h http.Header, authHeader, key string) {
+	if authHeader == "" {
+		if key != "" {
+			h.Set("Authorization", "Bearer "+key)
+		}
+		return
+	}
+	h.Del("Authorization")
+	h.Del(authHeader)
+	if key != "" {
+		h.Set(authHeader, key)
+	}
+}
+
 // maxFailoverAttempts bounds how many distinct upstreams a single request may
 // try before giving up. The exclude-set already guarantees each upstream is
 // tried at most once per request, so this is a belt-and-braces ceiling that
@@ -863,10 +893,11 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 			return nil, err
 		}
 		copyHeaders(ureq.Header, srcHeader)
-		if key, kidx := node.nextAPIKeyIdx(); key != "" {
-			ureq.Header.Set("Authorization", "Bearer "+key)
+		key, kidx := node.nextAPIKeyIdx()
+		if key != "" {
 			usedKeyIdx = kidx
 		}
+		setUpstreamAuth(ureq.Header, node.cfg.AuthHeader, key)
 		return ureq, nil
 	}
 
@@ -1529,7 +1560,31 @@ func (r *router) runHealthPass(ctx context.Context) {
 }
 
 func probeNode(parent context.Context, hc healthConfig, node *upstreamNode) bool {
+	if h := node.cfg.AuthHeader; h != "" {
+		// An auth_header node gates its whole surface -- health paths
+		// included -- so the probe must carry the same credential the
+		// proxy sends, or the node can never be marked healthy. The
+		// probe key is read WITHOUT advancing the rotation pool: probes
+		// must not perturb per-key round-robin fairness.
+		return health.ProbeNodeAuth(parent, hc.Timeout.Duration, hc.Path, node.baseURL, h, probeAuthKey(node))
+	}
 	return health.ProbeNode(parent, hc.Timeout.Duration, hc.Path, node.baseURL)
+}
+
+// probeAuthKey returns a credential for health probes without touching
+// the round-robin key pool: the single api_key when set, else the first
+// configured pool key. Empty when the node has no key at all (load-time
+// validation refuses that combination for auth_header nodes).
+func probeAuthKey(n *upstreamNode) string {
+	if n.cfg.APIKey != "" {
+		return n.cfg.APIKey
+	}
+	for _, k := range n.cfg.APIKeys {
+		if k != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 var isRetryableConnError = health.IsRetryableConnError
