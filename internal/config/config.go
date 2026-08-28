@@ -11,16 +11,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"gopkg.in/yaml.v3"
 )
 
 // Config is the top-level router configuration loaded from YAML.
 type Config struct {
-	Listen      string `yaml:"listen"`
+	Listen string `yaml:"listen"`
+	// MetricsAddr is where the Prometheus exposition listener binds.
+	// Omitted selects DefaultMetricsAddr; a host-less value like ":9091"
+	// binds LOOPBACK, not every interface. See DiagnosticListenAddr for
+	// why, and for how to opt back out.
 	MetricsAddr string `yaml:"metrics_addr"`
-	DebugAddr   string `yaml:"debug_addr"`
-	LogLevel    string `yaml:"log_level"`
-	AuthToken   string `yaml:"auth_token"`
+	// DebugAddr is where the net/http/pprof listener binds. Omitted
+	// leaves pprof OFF, which is the existing default and is kept: an
+	// endpoint that dumps the heap and blocks on demand should be
+	// switched on deliberately, not merely moved somewhere safer. When
+	// it IS set, a host-less value like ":6060" binds loopback. See
+	// DiagnosticListenAddr.
+	DebugAddr string `yaml:"debug_addr"`
+	LogLevel  string `yaml:"log_level"`
+	AuthToken string `yaml:"auth_token"`
 	// SlackWebhookURL, when non-empty, is the Slack Incoming Webhook URL the
 	// router posts quota-fallback alerts to. The webhook URL is loaded from
 	// the LLM_ROUTER_SLACK_WEBHOOK_URL env var at startup; the YAML field is
@@ -135,6 +146,32 @@ type HealthConfig struct {
 	Path               string        `yaml:"path"`
 	UnhealthyThreshold int           `yaml:"unhealthy_threshold"`
 	HealthyThreshold   int           `yaml:"healthy_threshold"`
+	// LiveProbe bounds the /healthz?live=1 forced-probe path. See
+	// LiveProbeConfig.
+	LiveProbe LiveProbeConfig `yaml:"live_probe"`
+}
+
+// LiveProbeConfig bounds the rate at which anonymous callers can force a
+// live sweep of every configured upstream via /healthz?live=1.
+//
+// Plain /healthz is a liveness check and stays open -- caddy,
+// blackbox-exporter, Prometheus and a status page all depend on it, and
+// gating it would trade one outage for another. ?live=1 is not that: it
+// makes one inbound request fan out to one outbound request PER UPSTREAM,
+// which is an amplification lever rather than a liveness check, and it is
+// the one part of the endpoint that needs a bound.
+//
+// Zero values select the health package defaults
+// (health.DefaultLiveProbeInterval / DefaultLiveProbeBurst). Negative
+// values are a config error: there is no spelling for "unbounded",
+// because unbounded is the state this block exists to make unreachable.
+type LiveProbeConfig struct {
+	// Interval is the refill period of the forced-probe token bucket:
+	// one forced sweep is admitted per Interval once the burst is spent.
+	Interval DurationValue `yaml:"interval"`
+	// Burst is how many forced sweeps an idle router admits back to back
+	// before the Interval rate applies.
+	Burst int `yaml:"burst"`
 }
 
 // DurationValue wraps time.Duration for YAML unmarshalling from a
@@ -365,8 +402,13 @@ func LoadConfig(path string) (Config, error) {
 		cfg.Listen = ":8080"
 	}
 	if cfg.MetricsAddr == "" {
-		cfg.MetricsAddr = ":9091"
+		cfg.MetricsAddr = DefaultMetricsAddr
 	}
+	// Resolve BOTH diagnostic listeners through the same rule, so a
+	// host-less spelling binds loopback and an explicit host is honoured
+	// verbatim. DebugAddr keeps "" meaning "pprof off".
+	cfg.MetricsAddr = DiagnosticListenAddr(cfg.MetricsAddr)
+	cfg.DebugAddr = DiagnosticListenAddr(cfg.DebugAddr)
 	if cfg.Defaults.MaxQueueDepth <= 0 {
 		cfg.Defaults.MaxQueueDepth = 8
 	}
@@ -418,6 +460,23 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.HealthCheck.HealthyThreshold <= 0 {
 		cfg.HealthCheck.HealthyThreshold = 1
+	}
+	// A STARTUP ERROR and not a clamp, for the same reason as
+	// body_read_timeout: every meaning a negative could carry here is one
+	// this block exists to refuse, and silently rounding it to the default
+	// would leave the operator believing in a bound they did not get.
+	// Zero is fine and means "the health package default".
+	if cfg.HealthCheck.LiveProbe.Interval.Duration < 0 {
+		return cfg, fmt.Errorf(
+			"health_check.live_probe: interval must not be negative (got %v); omit the key or set 0 for the default of %v, and note there is no spelling for \"unbounded\"",
+			cfg.HealthCheck.LiveProbe.Interval.Duration, health.DefaultLiveProbeInterval,
+		)
+	}
+	if cfg.HealthCheck.LiveProbe.Burst < 0 {
+		return cfg, fmt.Errorf(
+			"health_check.live_probe: burst must not be negative (got %d); omit the key or set 0 for the default of %d, and note there is no spelling for \"unbounded\"",
+			cfg.HealthCheck.LiveProbe.Burst, health.DefaultLiveProbeBurst,
+		)
 	}
 	if cfg.FairShare.Enabled {
 		if cfg.FairShare.MaxRequestsPerUser <= 0 {

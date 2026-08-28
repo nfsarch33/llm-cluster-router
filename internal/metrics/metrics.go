@@ -93,4 +93,15 @@ var (
 		Name: "llm_router_auth_rejected_total",
 		Help: "Requests rejected by the bearer-token auth middleware (401).",
 	}, []string{"path"})
+
+	// LiveProbeThrottledTotal counts /healthz?live=1 requests that were
+	// served the cached health view because the forced-probe rate bound
+	// was exhausted. Those requests still answer 200, so this counter is
+	// the ONLY signal that the bound is biting -- alert on a sustained
+	// rate, which means either a misconfigured poller or somebody using
+	// the endpoint as an amplifier.
+	LiveProbeThrottledTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "llm_router_health_live_probe_throttled_total",
+		Help: "Forced /healthz?live=1 probes refused by the rate bound and served from cache.",
+	})
 )

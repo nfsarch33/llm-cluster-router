@@ -85,7 +85,9 @@ The router reads a YAML file. A minimal example:
 
 ```yaml
 listen: ":8787"
-metrics_addr: ":9091"
+# Host-less means loopback: ":9091" binds 127.0.0.1:9091, not every
+# interface. Spell an explicit host (0.0.0.0, ::, an address) to opt out.
+metrics_addr: "127.0.0.1:9091"
 log_level: info
 
 defaults:
@@ -113,6 +115,9 @@ health_check:
   path: /health
   unhealthy_threshold: 3
   healthy_threshold: 2
+  live_probe:            # bounds /healthz?live=1; 0 or omitted = 10s / 3
+    interval: 10s
+    burst: 3
 ```
 
 Smart routing and per-agent gates are configured via `smart_route: {enabled, policy_file}` with the policy documented in [`configs/smartroute.example.yml`](configs/smartroute.example.yml). See [`router.sample.yml`](router.sample.yml) for the full annotated schema, including fair-share and per-tenant options. Secrets are referenced as `${ENV_VAR}` and resolved at load time; the router never stores credentials in its own config.
@@ -130,7 +135,33 @@ kill -HUP "$(pgrep -f 'llm-router serve')"
 | `/v1/chat/completions`, `/v1/models`, `/v1/embeddings` | OpenAI-compatible API |
 | `/healthz` (alias `/health`) | Rich per-node health JSON: ok, healthy/total nodes, queue depth, inflight, and a per-node `{name, tier, url, models, healthy, probe_ms}` array. `?live=1` forces a live probe (`&timeout=500ms` optional). |
 | `/readyz` | Readiness; fails while every node is unhealthy or breakers are open |
-| `/metrics` | Prometheus exposition (on `metrics_addr`) |
+| `/metrics` | Prometheus exposition (on `metrics_addr`, loopback by default) |
+| `/debug/pprof/*` | Off unless `debug_addr` is set; loopback by default |
+
+### Diagnostic listeners and the anonymous surface
+
+`/health`, `/healthz` and `/readyz` are anonymous by design -- reverse proxies,
+blackbox exporters and status pages poll them without a credential, and gating
+them would trade a disclosure risk for a monitoring outage. Bearer auth
+(`auth_token`) covers `/v1/*` only.
+
+Two consequences are handled explicitly:
+
+- **`metrics_addr` and `debug_addr` bind loopback when the host is omitted.**
+  `":9091"` resolves to `127.0.0.1:9091`; `":6060"` to `127.0.0.1:6060`. Neither
+  listener has an auth layer, and pprof serves heap and goroutine dumps plus a
+  CPU-profile endpoint that blocks for its whole duration. An explicit host --
+  `0.0.0.0:9091`, `[::]:6060`, a specific address -- is honoured verbatim, so the
+  wildcard bind remains available as a deliberate choice. pprof stays off
+  entirely unless `debug_addr` is set.
+- **`?live=1` is rate-limited.** Plain `/healthz` reads a cached flag; `?live=1`
+  makes one inbound request fan out to one outbound probe per upstream, which is
+  an amplification lever rather than a liveness check. It is bounded by a global
+  token bucket (`health_check.live_probe`, default one sweep per 10s with a burst
+  of 3). Exceeding the bound does **not** return 429: the response degrades to
+  the cached view with `"live_probe": false, "live_probe_throttled": true`, and
+  increments `llm_router_health_live_probe_throttled_total`. Plain `/healthz` is
+  never throttled and its response is unchanged.
 
 ## HelixChannel
 

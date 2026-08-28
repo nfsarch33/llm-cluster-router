@@ -146,6 +146,20 @@ type router struct {
 
 	queueTierMu      sync.Mutex
 	queueDepthByTier map[string]int64
+
+	// liveGate bounds /healthz?live=1, the one part of the health
+	// surface that fans one anonymous inbound request out to one
+	// outbound probe PER UPSTREAM. Built lazily from the reload
+	// snapshot so a router assembled without newRouter -- a test, an
+	// embedded caller -- is bounded too, rather than inheriting a nil
+	// limiter and the unbounded path.
+	//
+	// Built ONCE and not re-read on Reload: retuning the bound would
+	// mean discarding the bucket's accumulated state, which is a free
+	// reset of the very budget it is enforcing. Changing it needs a
+	// restart, like listen and metrics_addr.
+	liveGateOnce sync.Once
+	liveGate     *health.ProbeLimiter
 }
 
 // routerSnap is the consistent view of the reloadable router state
@@ -445,27 +459,30 @@ func runServe(args []string) error {
 
 	go r.healthLoop(context.Background())
 
-	if cfg.MetricsAddr != "" {
+	// Both diagnostic listeners resolve a host-less address to loopback
+	// (config.DiagnosticListenAddr). LoadConfig has already applied that,
+	// but re-apply it here: a Config can reach runServe without passing
+	// through LoadConfig, and "the default is loopback" has to be true on
+	// every path into these two listeners or it is not true at all.
+	metricsAddr := diagnosticListenAddr(cfg.MetricsAddr)
+	debugAddr := diagnosticListenAddr(cfg.DebugAddr)
+
+	if metricsAddr != "" {
 		go func() {
 			mux := http.NewServeMux()
 			mux.Handle("/metrics", promhttp.Handler())
-			log.Printf("metrics listening on %s", cfg.MetricsAddr)
-			if err := http.ListenAndServe(cfg.MetricsAddr, mux); err != nil {
+			log.Printf("metrics listening on %s", metricsAddr)
+			if err := http.ListenAndServe(metricsAddr, mux); err != nil {
 				log.Printf("metrics server stopped: %v", err)
 			}
 		}()
 	}
 
-	if cfg.DebugAddr != "" {
+	if debugAddr != "" {
 		go func() {
-			mux := http.NewServeMux()
-			mux.HandleFunc("/debug/pprof/", pprof.Index)
-			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-			log.Printf("debug listening on %s", cfg.DebugAddr)
-			if err := http.ListenAndServe(cfg.DebugAddr, mux); err != nil {
+			mux := newDebugMux()
+			log.Printf("debug listening on %s (pprof; heap/goroutine dumps and a blocking CPU profile)", debugAddr)
+			if err := http.ListenAndServe(debugAddr, mux); err != nil {
 				log.Printf("debug server stopped: %v", err)
 			}
 		}()
@@ -482,15 +499,7 @@ func runServe(args []string) error {
 	})
 	authWrap := bearerAuthFunc(r.AuthToken)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", r.handleHealth)
-	mux.HandleFunc("/health", r.handleHealth)
-	mux.HandleFunc("/readyz", r.handleReadyz) // q10b-8: readiness gate (kubelet/sentrux)
-	mux.HandleFunc("/v1/models", authWrap(r.handleModels))
-	mux.HandleFunc("/v1/chat/completions", authWrap(r.handleProxy))
-	mux.HandleFunc("/v1/completions", authWrap(r.handleProxy))
-	mux.HandleFunc("/v1/embeddings", authWrap(r.handleProxy))
-	mux.Handle("/metrics", promhttp.Handler())
+	mux := serveMux(r, authWrap)
 
 	server := &http.Server{
 		Addr:              cfg.Listen,
@@ -526,6 +535,56 @@ func runServe(args []string) error {
 	go relcheck.WarnIfOutdated(slog.Default(), "nfsarch33", "llm-cluster-router", buildVersion)
 	log.Printf("router listening on %s", cfg.Listen)
 	return server.Serve(ln)
+}
+
+// diagnosticListenAddr delegates to the config package. Kept as a
+// package-level var so the serving path and the tests name the same rule.
+var diagnosticListenAddr = cfg.DiagnosticListenAddr
+
+// newDebugMux builds the net/http/pprof mux served on debug_addr.
+//
+// Extracted so a test can assert exactly which paths this listener
+// exposes: it is the highest-value surface on the process (a heap dump
+// leaks prompts and keys that happen to be resident, and
+// /debug/pprof/profile blocks a goroutine for its whole duration on
+// demand), it sits behind NO auth middleware, and the only thing standing
+// between it and the network is which interface it binds to.
+func newDebugMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return mux
+}
+
+// serveMux builds the router's public listener mux.
+//
+// Extracted verbatim from runServe so the auth boundary can be pinned by
+// a test: which routes sit behind authWrap and which do not is the single
+// most consequential fact about this listener, and it was previously
+// only assertable by starting the whole server. The split is deliberate
+// and load-bearing:
+//
+//   - /health, /healthz and /readyz are ANONYMOUS and must stay that way.
+//     caddy, blackbox-exporter, Prometheus and the status page all poll
+//     them without a credential, so putting them behind the bearer would
+//     trade a disclosure risk for a monitoring outage. The forced-probe
+//     variant of /healthz is bounded separately, inside handleHealth.
+//   - every /v1/* route is behind authWrap, and this function must not
+//     change which ones.
+func serveMux(r *router, authWrap func(http.HandlerFunc) http.HandlerFunc) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", r.handleHealth)
+	mux.HandleFunc("/health", r.handleHealth)
+	mux.HandleFunc("/readyz", r.handleReadyz) // q10b-8: readiness gate (kubelet/sentrux)
+	mux.HandleFunc("/v1/models", authWrap(r.handleModels))
+	mux.HandleFunc("/v1/chat/completions", authWrap(r.handleProxy))
+	mux.HandleFunc("/v1/completions", authWrap(r.handleProxy))
+	mux.HandleFunc("/v1/embeddings", authWrap(r.handleProxy))
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
 }
 
 // helixChannelEnabledFromEnv reads the HELIXCHANNEL_ENABLED env
@@ -601,7 +660,18 @@ func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 	// `node.healthy` flag updated only every hc.Interval (default 30s).
 	//   ?live=1            -> probe each node now
 	//   ?timeout=500ms     -> per-node probe timeout (default 2s)
+	//
+	// The forced variant is RATE-LIMITED, and the plain one is not. See
+	// forcedProbeAllowed for why the bound is here and not on the bearer
+	// middleware, and why exceeding it degrades to the cached view
+	// instead of answering 429.
 	live := req.URL.Query().Get("live") == "1"
+	throttled := false
+	if live && !r.forcedProbeAllowed() {
+		live = false
+		throttled = true
+		metrics.LiveProbeThrottledTotal.Inc()
+	}
 	probeTimeout := 2 * time.Second
 	if v := req.URL.Query().Get("timeout"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= 10*time.Second {
@@ -655,7 +725,47 @@ func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 		resp["live_probe"] = true
 		resp["probe_timeout"] = probeTimeout.String()
 	}
+	if throttled {
+		// Say so rather than degrading silently: a caller that asked for
+		// fresh state and got cached state must be able to tell, and an
+		// operator must be able to see the bound biting (the counter
+		// llm_router_health_live_probe_throttled_total is the alertable
+		// form of the same fact).
+		resp["live_probe"] = false
+		resp["live_probe_throttled"] = true
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// forcedProbeAllowed reports whether this request may force a live sweep
+// of every upstream, consuming one token from the global bound.
+//
+// WHY A RATE LIMIT AND NOT THE BEARER MIDDLEWARE. Requiring the token for
+// ?live=1 was the other candidate and is the stronger gate on paper, but
+// it is the wrong instrument for this deployment in two ways. It is
+// inert exactly when it is needed: the router's configured token is
+// empty today, and BearerAuthFunc short-circuits on an empty token, so a
+// bearer-gated ?live=1 would be wide open through the whole window
+// between this change and the credential rollout -- which is the window
+// this change exists to cover. And it converts an existing anonymous
+// caller of the forced variant into a 401 the moment the token lands,
+// which is the shape of outage the "keep liveness anonymous" rule is
+// there to prevent. A rate limit holds with or without a token, needs no
+// coordination with the rollout, and cannot 401 anybody.
+//
+// EXCEEDING IT DOES NOT 429. The response degrades to the cached health
+// view -- still 200, still the same JSON shape, plus
+// live_probe_throttled -- because /healthz is a liveness endpoint before
+// it is anything else, and answering an error to a monitor that happened
+// to append ?live=1 would manufacture the outage signal this is supposed
+// to protect. Refusing the AMPLIFICATION while still answering the
+// LIVENESS question is the whole point; a 429 would refuse both.
+func (r *router) forcedProbeAllowed() bool {
+	r.liveGateOnce.Do(func() {
+		lp := r.snap().cfg.HealthCheck.LiveProbe
+		r.liveGate = health.NewProbeLimiter(lp.Interval.Duration, lp.Burst)
+	})
+	return r.liveGate.Allow()
 }
 
 // beginBuffering records that one more request body is about to be held in
