@@ -1,0 +1,108 @@
+name: deny-pattern
+
+# Anti-leak pattern check, installed into a Helixon repo by
+# scripts/ci/install-deny-pattern.sh. Edit it THERE, in the knowledge base,
+# and re-run the installer -- a local edit here is overwritten by the next
+# install.
+#
+# It was `ci-deny-pattern-snippet.yml`: a bare `jobs:` fragment, two-space
+# indented, with no `name:` and no `on:`. The installer copied it to
+# `.github/workflows/deny-pattern.yml`, where it would not have parsed as a
+# workflow -- except that the installer named a file that did not exist and so
+# never got that far. It is a complete, standalone workflow now.
+#
+# The scanner is scripts/ci/deny-pattern.sh; what it forbids and why is in
+# docs/security/anti-leak.md and in L0 rule 01-public-repo-sanity.mdc.
+#
+# It does no build and no test: a checkout and one bash script, a few seconds
+# per run.
+
+on:
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Every pull-request-triggered job in this estate lands on a single serial
+# self-hosted runner, so a force-push must not leave its superseded run holding
+# the slot. Cancelling is safe here specifically because the scan is scoped to
+# the whole PR diff rather than to one commit: a newer run re-scans everything
+# the cancelled one would have. There is no push trigger, so `true` cannot
+# reach one.
+concurrency:
+  group: deny-pattern-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only on purpose. The knowledge base's own copy of this workflow posts a
+# sticky PR comment and therefore holds `pull-requests: write` plus a
+# third-party action; a gate installed into every repo should not hand out a
+# write token and a supply-chain dependency for an annotation. The scanner
+# names every match in the job log.
+permissions:
+  contents: read
+
+jobs:
+  deny-pattern:
+    # Not `ubuntu-latest`: GitHub-hosted minutes on this account are exhausted,
+    # so a hosted job is rejected before it starts. `[self-hosted, linux]` is
+    # what the other repos in the estate use. Runner labels naming a specific
+    # host are deliberately avoided -- several of them are themselves deny
+    # patterns, so a workflow that named one would fail the gate it installs.
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history, not a truncated fetch. actions/checkout only creates
+          # the remote-tracking refs it fetched, and the scanner now treats a
+          # BASE_REF that does not resolve as a configuration error (exit 2)
+          # rather than scanning nothing and passing. A shallow fetch would
+          # turn this gate red for want of a ref instead of for a finding.
+          fetch-depth: 0
+
+      # v18793: the half of the deny-pattern list that names this estate is not
+      # in the scanner -- the scanner lives in a public repository, and a list
+      # of the strings that must never appear in a public repo is itself an
+      # internal map. It is supplied here from a repository secret and written
+      # to a file outside the workspace, so it cannot be committed by accident
+      # and is not part of any diff.
+      #
+      # If the secret is unset the step below writes nothing, the scanner runs
+      # with the public set, and it SAYS SO on stdout. That is a real reduction
+      # in coverage and it is announced rather than inferred. Secrets are not
+      # available to pull requests from forks, so those runs are public-set
+      # scans by construction.
+      - name: Materialise the internal pattern set (if configured)
+        id: patterns
+        env:
+          HLXN_DENY_PATTERNS: ${{ secrets.HLXN_DENY_PATTERNS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HLXN_DENY_PATTERNS:-}" ]; then
+            f="$RUNNER_TEMP/deny-patterns-internal.txt"
+            printf '%s\n' "$HLXN_DENY_PATTERNS" >"$f"
+            chmod 600 "$f"
+            echo "file=$f" >>"$GITHUB_OUTPUT"
+            echo "Internal pattern set materialised ($(grep -cve '^\s*$' -e '^#' "$f") patterns)."
+          else
+            echo "file=" >>"$GITHUB_OUTPUT"
+            echo "NOTICE: secret HLXN_DENY_PATTERNS is not set for this repository."
+            echo "        The scan below covers vendor credential formats and"
+            echo "        private-address ranges only."
+          fi
+
+      - name: Run deny-pattern scanner
+        env:
+          # `github.base_ref` is empty outside pull_request, which would make
+          # the argument the bare string "origin/" and fail the run on a manual
+          # dispatch. Fall back to the repository's default branch.
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+          # Empty when the secret is unset; the scanner treats unset and empty
+          # alike as "public set only, and say so".
+          HLXN_DENY_PATTERNS_FILE: ${{ steps.patterns.outputs.file }}
+        run: bash scripts/ci/deny-pattern.sh "origin/$BASE_REF"
+
+      # The file holds the estate's identifier list. Runners here are
+      # self-hosted and long-lived, so it does not get to outlive the job.
+      - name: Remove the internal pattern set
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deny-patterns-internal.txt"
