@@ -120,6 +120,18 @@
 # discloses nothing new — and hashing it would rewrite the exemption logic
 # v18790 fixed and that tools/deny-pattern-tests.sh pins in both directions.
 #
+# v18797 — the sixth. The operator GitHub handle is an internal deny pattern,
+# and the handle is ALSO the owner segment of every one of these repos' OWN
+# module paths (github.com/nfsarch33/<this-repo>), which sit on go.mod and on
+# every internal import. So a diff that added a new internal import tripped the
+# handle pattern on a string the repo is public by construction for carrying —
+# llm-cluster-router PR #73, and every future PR to either public repo that
+# adds an internal import. The scanner now removes exactly that one public slug
+# (this repo's own github.com/<owner>/<repo>, at a path boundary) from the added
+# lines before matching; a reference to any OTHER repo under the same handle,
+# including a private one, is untouched and still caught. See the SCAN_DIFF
+# block below and docs/security/anti-leak.md.
+#
 # Regression pins: tools/deny-pattern-tests.sh (registered in
 # tools/workspace-doctor.sh). The installer that ships this scanner into other
 # repos is pinned by tools/install-deny-pattern-tests.sh.
@@ -288,6 +300,49 @@ if [[ -z "$DIFF" ]]; then
   exit 0
 fi
 
+# v18797 — neutralize the repo's OWN public module path before matching.
+#
+# The operator GitHub handle is an internal deny pattern, but that handle is
+# ALSO the owner segment of every one of these repos' own module paths:
+# `github.com/nfsarch33/<this-repo>`. That path sits on go.mod's `module` line,
+# on every `require`, and on every internal import, so it is public BY
+# CONSTRUCTION in the repo it names — yet a diff that adds a NEW internal import
+# (e.g. `"github.com/nfsarch33/llm-cluster-router/internal/crypto"`) tripped the
+# handle pattern on a string the repo could not not contain. Measured
+# 2026-08-31: llm-cluster-router PR #73 failed exactly this way, and so would
+# every future PR to either public repo that adds an internal import.
+#
+# So the one string that is public by construction — this repo's own
+# `github.com/<owner>/<repo>` slug, and ONLY that exact slug at a path boundary
+# — is removed from the added lines before any pattern is matched. The slug
+# comes from REPO_SLUG, the same origin-derived identity the internal-repo
+# exemption above already trusts to skip EVERY pattern, so this grants strictly
+# less than that decision does. It is deliberately the smallest narrowing that
+# fixes the defect (docs/security/anti-leak.md, "Responding to a finding"):
+#
+#   * ONE token: the literal `github.com/<REPO_SLUG>`, anchored on the right to
+#     a path boundary (`/ " ' backtick whitespace` or end-of-line) so a
+#     DIFFERENT repo whose name merely shares this one's prefix is untouched.
+#   * A reference to any OTHER repo under the same handle — a PRIVATE repo such
+#     as `github.com/nfsarch33/cursor-global-kb`, or the bare handle in a
+#     comment or config — carries a different slug (or none), is NOT removed,
+#     and still trips the handle pattern. That is the genuine-leak case, pinned
+#     in tools/deny-pattern-tests.sh next to this one.
+#   * Nothing but this exact public slug is removed, so no credential-shaped
+#     string sharing a line with it can be hidden by the removal.
+#
+# With no github.com origin REPO_SLUG is empty, there is nothing public by
+# construction to neutralize, and the diff is scanned unchanged.
+SCAN_DIFF="$DIFF"
+if [[ -n "$REPO_SLUG" ]]; then
+  # Escape the one ERE metacharacter a GitHub owner/repo slug can carry (`.`)
+  # so a literal dot in a repo name cannot widen the removal.
+  SLUG_RE="${REPO_SLUG//./\\.}"
+  SCAN_DIFF="$(printf '%s\n' "$DIFF" \
+    | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])#\\1#g; s#github\\.com/${SLUG_RE}\$##g")"
+  echo "Neutralizing this repo's own public module path github.com/$REPO_SLUG before matching (public by construction; see docs/security/anti-leak.md)"
+fi
+
 # PUBLIC deny patterns (case-insensitive extended regex).
 # Format: PATTERN|LABEL (for human-readable output)
 #
@@ -375,8 +430,10 @@ MATCHED=0
 for entry in "${PATTERNS[@]}"; do
   PATTERN="${entry%%|*}"
   LABEL="${entry##*|}"
-  # Use grep -iE with -- to delimit
-  MATCHES=$(echo "$DIFF" | grep -iE -- "$PATTERN" 2>/dev/null || true)
+  # Use grep -iE with -- to delimit. SCAN_DIFF is DIFF with this repo's own
+  # public module path neutralized (see the v18797 note above); it equals DIFF
+  # when there is no github.com origin to derive that path from.
+  MATCHES=$(echo "$SCAN_DIFF" | grep -iE -- "$PATTERN" 2>/dev/null || true)
   if [[ -n "$MATCHES" ]]; then
     # tr -d: `wc -l` pads its count on some platforms, and the arithmetic
     # below needs a bare integer.
