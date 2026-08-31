@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nfsarch33/llm-cluster-router/internal/crypto"
 )
 
 // AuditEvent is one NDJSON line describing a proxied request.
@@ -1310,6 +1311,48 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	return s.Serve(ctx, ln)
+}
+
+// ServeWrapped runs the AES-256-GCM leg on an already-bound listener: it wraps
+// ln so every accepted connection is AES-decrypted before net/http sees it, and
+// serves the SAME handler — routes and gateway_auth — as the reverse-proxy leg.
+// The caller supplies ln already carrying the outer transport; in production
+// that is a tls.Listener, so the on-wire stack is TCP → TLS → AES → HTTP, with
+// AES nested inside TLS.
+//
+// The AES leg is not a second trust boundary. gateway_auth is enforced by the
+// shared handler exactly as on the reverse-proxy leg, and this method applies
+// the SAME tokenless-relay bind refusal as Serve — judged from the socket ln
+// actually bound, not from a config string — so a public AES bind with no token
+// configured is refused rather than served as an open relay. ln is closed on
+// refusal, mirroring Serve.
+func (s *Server) ServeWrapped(ctx context.Context, ln net.Listener, key [32]byte) error {
+	scope := boundListenScope(ln.Addr())
+	if why := s.bindRefusal(ln.Addr(), scope); why != "" {
+		_ = ln.Close()
+		return errors.New(why)
+	}
+	wrapped := crypto.WrapListener(ln, key)
+	srv := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		err := srv.Serve(wrapped)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		errCh <- err
+	}()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		return err
+	}
 }
 
 // Serve runs the gateway on an already-bound listener until ctx is cancelled,

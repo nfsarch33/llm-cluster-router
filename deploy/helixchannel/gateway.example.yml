@@ -233,3 +233,21 @@ connect:
     - api.anthropic.com:443
     - statsig.anthropic.com:443
     - api.minimaxi.com:443
+
+# Optional second leg: AES-256-GCM nested inside TLS, for a network path that
+# terminates and inspects TLS (a corporate intercepting proxy on a managed
+# laptop). It carries the SAME routes and the SAME X-HLXN-Token gateway token as
+# the reverse-proxy leg; a middlebox that peels the outer TLS still sees only
+# ciphertext, because the pre-shared key is not derived from the TLS session. A
+# stock HTTP client cannot speak it -- a caller reaches it with
+# `helixchannel aes-bridge`. Disabled here; enabling it needs its own public
+# port, a paired TLS certificate, and a 32-byte pre-shared key installed on the
+# gateway and, out of band, on each client.
+aes:
+  enabled: false
+  listen: ":8444"                      # public; MUST differ from listen above
+  key_file: /run/secrets/aes.key       # 32 bytes: raw, 64-char hex, or base64
+  # key_ref: op://Infra/helixchannel/aes-key   # takes precedence
+  tls:
+    cert_file: /etc/helixchannel/tls.crt
+    key_file: /etc/helixchannel/tls.key

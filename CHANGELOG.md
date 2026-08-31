@@ -18,6 +18,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An optional AES-256-GCM leg encrypts the reverse-proxy payload _inside_ the
+  outer TLS.** A new `aes:` config block exposes a second listener that carries
+  the same routes and the same `X-HLXN-Token` gateway token, but wraps every
+  connection in application-layer AES-256-GCM nested within TLS. It defends
+  against a network path that terminates and inspects TLS (a corporate
+  intercepting proxy): such a middlebox peels the outer TLS and still sees only
+  ciphertext, because the pre-shared 32-byte key is not derived from the TLS
+  session. It is a separate `Server` from the reverse-proxy leg so its serving
+  scope is judged from its own public socket, and it is refused at startup under
+  the same tokenless-relay bind rule. A stock HTTP client cannot speak it;
+  clients reach it through the new `helixchannel aes-bridge` loopback forwarder,
+  which holds no provider key and injects nothing. Two independent facts gate
+  it — the pre-shared AES key to speak the leg, the gateway token to spend — and
+  neither substitutes for the other. See
+  [`docs/helixchannel.md`](docs/helixchannel.md) and
+  [`docs/kilo-code-setup.md`](docs/kilo-code-setup.md).
+- **`internal/crypto.WrapConn` is now a correct `io.ReadWriter` for arbitrary
+  payloads.** `Read` buffers plaintext that does not fit the caller's buffer and
+  serves it across successive reads instead of dropping it with an error, and
+  `Write` splits payloads larger than one 64 KiB record into consecutive records
+  instead of rejecting them — the two behaviours HTTP over the wrapper requires
+  (net/http reads through 4 KiB buffers; `io.Copy` writes 32 KiB). A latent
+  off-by-nonce in the read-side frame bound (`4+maxFrame+16` where a full record
+  is `nonceSize+maxFrame+16`) that would have rejected a maximum-size record as
+  tampering is fixed at the same time.
 - **A pooled route with no budget now warns at startup.** `Config.UncappedPoolAdvisories()`
   reports every route that declares a key pool (`key_envs`/`key_files`/`key_refs`)
   and carries neither `rotation.budget.requests` nor `rotation.budget.tokens`.

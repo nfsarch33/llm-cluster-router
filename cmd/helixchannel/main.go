@@ -129,6 +129,10 @@ func main() {
 		if err := runProxy(os.Args[2:]); err != nil {
 			fail("proxy", err)
 		}
+	case "aes-bridge":
+		if err := runAESBridge(os.Args[2:]); err != nil {
+			fail("aes-bridge", err)
+		}
 	default:
 		usage()
 		os.Exit(2)
