@@ -311,16 +311,21 @@ func Fuzz6_HeaderInjection(f *testing.F) {
 	})
 }
 
-// Fuzz7_OversizedFrame — fuzzes with payloads at the size boundary.
-// maxFrame is 64KiB; we must accept exactly maxFrame and reject
-// maxFrame+1. The fuzz seed corpus exercises the boundary.
+// Fuzz7_OversizedFrame — fuzzes with payloads at and beyond the
+// single-record size boundary. maxFrame (64 KiB) is the largest
+// plaintext per on-wire record; a larger payload is SPLIT into
+// consecutive records by Write rather than rejected, so Write must
+// accept any size and report the full plaintext length. Round-trip
+// correctness across the split (nothing dropped or corrupted) is
+// proven by TestWrap_LargePayloadRoundTrip and the HTTP-over-wrapper
+// test; here we pin only the "never reject on size" contract.
 func Fuzz7_OversizedFrame(f *testing.F) {
 	f.Add(maxFrame)
 	f.Add(maxFrame + 1)
 	f.Add(0)
 
 	f.Fuzz(func(t *testing.T, payloadLen int) {
-		if payloadLen < 0 || payloadLen > 2*maxFrame {
+		if payloadLen < 0 || payloadLen > 4*maxFrame {
 			t.Skip()
 		}
 		payload := make([]byte, payloadLen)
@@ -329,19 +334,17 @@ func Fuzz7_OversizedFrame(f *testing.F) {
 		defer func() { _ = server.Close() }()
 
 		// Drain the server side so Write does not block on the
-		// unbuffered net.Pipe when payloadLen is large.
+		// unbuffered net.Pipe; a split write emits several records.
 		drainPipe(server)
 
 		wrapped := Wrap(client, fuzzKey)
-		_, err := wrapped.Write(payload)
-		if payloadLen > maxFrame {
-			if err == nil {
-				t.Errorf("oversized payload (len=%d) accepted; want error", payloadLen)
-			}
+		n, err := wrapped.Write(payload)
+		if err != nil {
+			t.Errorf("payload len=%d rejected: %v (Write must split large payloads, not reject them)", payloadLen, err)
 			return
 		}
-		if err != nil {
-			t.Errorf("in-bounds payload (len=%d) rejected: %v", payloadLen, err)
+		if n != payloadLen {
+			t.Errorf("Write reported %d bytes, want %d", n, payloadLen)
 		}
 	})
 }

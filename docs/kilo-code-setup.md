@@ -190,6 +190,27 @@ tail -2 /var/log/helixchannel/gateway.ndjson
 
 `auth_mode: inject` confirms the server-side key was applied, and no credential appears in the log.
 
+## Extra hardening: AES inside TLS (intercepted networks)
+
+On a network that terminates and inspects TLS — a corporate intercepting proxy
+on a managed laptop — the outer HTTPS to the gateway is readable by that proxy,
+including this leg's request bodies. If that is your threat model, run the
+gateway's [AES leg](helixchannel.md#the-aes-leg-defence-in-depth-against-a-tls-intercepting-proxy)
+and point Kilo Code at the local bridge instead of directly at the edge:
+
+```bash
+helixchannel aes-bridge \
+  --listen 127.0.0.1:8788 \
+  --gateway gateway.example.com:8444 \
+  --key-file ~/.config/helixchannel/aes.key
+```
+
+Then in Kilo Code set **Base URL** to `http://127.0.0.1:8788/minimax/v1` and keep
+the same `X-HLXN-Token` header. Everything else is identical; the bridge
+AES-wraps the traffic inside the TLS to the edge, so an intercepting proxy sees
+only ciphertext. Skip this if your path does not intercept TLS — standard HTTPS
+already encrypts the hop end to end and the bridge is pure overhead.
+
 ## Adding another provider
 
 Append a route and restart the gateway:

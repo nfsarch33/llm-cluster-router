@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -105,7 +107,65 @@ func runGateway(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return srv.ListenAndServe(ctx)
+
+	// Optional AES-256-GCM leg: a second public listener carrying the same
+	// reverse-proxy routes with AES nested inside TLS. It is a SEPARATE Server
+	// so its serving scope is judged from its own public socket, never from the
+	// (loopback) reverse-proxy leg's — the two must not share s.scope. CONNECT
+	// is disabled on it: the AES leg exists for the reverse-proxy routes.
+	var aesSrv *channel.Server
+	var aesLn net.Listener
+	var aesKey [32]byte
+	if cfg.AES.Enabled {
+		key, err := channel.ResolveAESKey(cfg.AES)
+		if err != nil {
+			return err
+		}
+		aesKey = key
+
+		aesCfg := *cfg
+		aesCfg.Connect = channel.ConnectConfig{}
+		aesCfg.Listen = cfg.AES.Listen
+		aesCfg.AES = channel.AESConfig{}
+		aesSrv, err = channel.NewServer(&aesCfg, channel.NewHTTPForwarder(), channel.NewAuditor(auditWriter))
+		if err != nil {
+			return fmt.Errorf("aes leg server: %w", err)
+		}
+
+		cert, err := tls.LoadX509KeyPair(cfg.AES.TLS.CertFile, cfg.AES.TLS.KeyFile)
+		if err != nil {
+			return fmt.Errorf("aes leg tls: %w", err)
+		}
+		raw, err := net.Listen("tcp", cfg.AES.Listen)
+		if err != nil {
+			return fmt.Errorf("aes leg listen: %w", err)
+		}
+		aesLn = tls.NewListener(raw, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+		fmt.Fprintf(os.Stderr, "helixchannel AES leg listening on %s (aes-256-gcm inside tls) routes=%v proxy_auth=%s\n",
+			cfg.AES.Listen, aesSrv.RouteNames(), aesSrv.ProxyAuthMode())
+	}
+
+	// Run the reverse-proxy leg and, if configured, the AES leg concurrently,
+	// returning the first non-nil error and bringing the other leg down with it
+	// so a failure of either fails the process rather than degrading silently.
+	errCh := make(chan error, 2)
+	legs := 1
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+	if aesLn != nil {
+		legs++
+		go func() { errCh <- aesSrv.ServeWrapped(ctx, aesLn, aesKey) }()
+	}
+	var firstErr error
+	for i := 0; i < legs; i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			stop()
+		}
+	}
+	return firstErr
 }
 
 // warnUnauthenticatedProxyLeg prints the loud startup warning for the two
@@ -216,6 +276,50 @@ func runProxy(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return p.ListenAndServe(ctx)
+}
+
+// runAESBridge serves the client-side AES leg forwarder: an OpenAI-compatible
+// client (Kilo Code) points its base URL at this loopback HTTP listener, and
+// every request is forwarded to the gateway's AES leg over TCP → TLS → AES, so
+// the payload is AES-encrypted inside the outer TLS. The gateway token still
+// travels as an X-HLXN-Token header set by the client; this bridge injects
+// nothing and holds no provider key.
+func runAESBridge(args []string) error {
+	fs := flag.NewFlagSet("aes-bridge", flag.ContinueOnError)
+	listen := fs.String("listen", envOrDefault("HELIXCHANNEL_AES_BRIDGE_LISTEN", "127.0.0.1:8788"),
+		"loopback HTTP listen address for the client's base URL, e.g. 127.0.0.1:8788")
+	gateway := fs.String("gateway", envOrDefault("HELIXCHANNEL_AES_GATEWAY", ""),
+		"AES leg edge as host:port (TLS), e.g. helixchannel.example.com:8444")
+	keyEnv := fs.String("key-env", "HELIXCHANNEL_AES_KEY",
+		"environment variable holding the 32-byte pre-shared AES key (hex, base64, or raw)")
+	keyFile := fs.String("key-file", "", "file holding the pre-shared AES key")
+	keyRef := fs.String("key-ref", "", "op:// (or other seam) reference to the pre-shared AES key")
+	insecure := fs.Bool("insecure", false,
+		"skip verification of the OUTER TLS certificate only; the inner AES still protects the payload (needed under a TLS-intercepting proxy)")
+	if err := fs.Parse(filterTestFlags(args)); err != nil {
+		return err
+	}
+
+	if *gateway == "" {
+		return fmt.Errorf("--gateway is required (or set HELIXCHANNEL_AES_GATEWAY)")
+	}
+	key, err := channel.ResolveAESKey(channel.AESConfig{KeyEnv: *keyEnv, KeyFile: *keyFile, KeyRef: *keyRef})
+	if err != nil {
+		return err
+	}
+
+	b := &channel.AESBridge{
+		Listen:             *listen,
+		Gateway:            *gateway,
+		Key:                key,
+		InsecureSkipVerify: *insecure,
+	}
+	fmt.Fprintf(os.Stderr, "helixchannel aes-bridge listening on %s -> %s (aes-256-gcm inside tls)\n", *listen, *gateway)
+	fmt.Fprintf(os.Stderr, "point the client's base URL at: http://%s/<route>/v1  (send X-HLXN-Token as a header)\n", *listen)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return b.ListenAndServe(ctx)
 }
 
 // resolveConnectToken reads the CONNECT token from an environment variable or

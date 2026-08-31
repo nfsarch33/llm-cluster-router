@@ -24,6 +24,8 @@
 package channel
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -326,6 +328,36 @@ type TLSConfig struct {
 // Enabled reports whether a certificate pair is configured.
 func (t TLSConfig) Enabled() bool { return t.CertFile != "" && t.KeyFile != "" }
 
+// AESConfig configures the application-layer AES-256-GCM leg: a second
+// public listener that carries the same reverse-proxy routes but wraps
+// every connection in AES-256-GCM INSIDE the outer TLS. A TLS-terminating
+// middlebox on the path (a corporate intercepting proxy, say) that peels
+// the outer TLS still sees only ciphertext, because the AES key is
+// pre-shared out of band and is not derived from the TLS session.
+//
+// A stock HTTP client cannot speak this leg; a caller reaches it through
+// the `helixchannel aes-bridge` local forwarder, which holds the same key
+// and AES-wraps on the client side. The leg is otherwise identical to the
+// reverse-proxy leg — same routes, same gateway_auth token — so it is not
+// a second trust boundary, only a second, more-armoured way in.
+type AESConfig struct {
+	// Enabled turns the AES leg on. False binds no second listener.
+	Enabled bool `yaml:"enabled"`
+	// Listen is the AES leg's public bind address, e.g. ":8444". It must
+	// differ from Config.Listen; the AES records travel inside TLS on it.
+	Listen string `yaml:"listen"`
+	// Key sources for the 32-byte pre-shared AES-256 key, resolved through
+	// the same secret seam as route keys. The resolved material may be 32
+	// raw bytes, 64 hex characters, or base64 of 32 bytes.
+	KeyEnv  string `yaml:"key_env"`
+	KeyFile string `yaml:"key_file"`
+	KeyRef  string `yaml:"key_ref"`
+	// TLS is the OUTER TLS for this leg, required when enabled: the leg
+	// still presents a valid certificate and blends in as ordinary HTTPS,
+	// with AES nested inside.
+	TLS TLSConfig `yaml:"tls"`
+}
+
 // Config is the gateway's on-disk configuration.
 type Config struct {
 	// Listen is the gateway bind address. Bind loopback when a TLS
@@ -346,6 +378,10 @@ type Config struct {
 	GatewayAuth GatewayAuthConfig `yaml:"gateway_auth"`
 	// TLS optionally terminates TLS on the gateway itself.
 	TLS TLSConfig `yaml:"tls"`
+
+	// AES optionally exposes a second listener that carries the same routes
+	// with application-layer AES-256-GCM nested inside the outer TLS.
+	AES AESConfig `yaml:"aes"`
 
 	// TrustForwardedForAudit records the AUDIT LOG's client_addr from
 	// X-Forwarded-For instead of the accepted TCP peer, when (and only when)
@@ -431,6 +467,9 @@ func (c *Config) Validate() error {
 	if err := c.validateConnect(); err != nil {
 		return err
 	}
+	if err := c.validateAES(); err != nil {
+		return err
+	}
 	// LAST, and it has to stay last: it is the check that turns `listen` into
 	// the gateway's whole admission posture, so raising it first would mask the
 	// route and connect mistakes an operator is far likelier to have actually
@@ -438,6 +477,75 @@ func (c *Config) Validate() error {
 	// allowlist entry points back at this machine, and that IS a connect
 	// mistake — it belongs with the block the operator got wrong.
 	return c.validateGatewayAuth()
+}
+
+// validateAES checks the AES leg. Enabled requires a distinct public bind, a
+// paired outer-TLS certificate (the AES records ride inside TLS), and exactly
+// one resolvable key source. The key value itself is not resolved here — that
+// happens at startup via ResolveAESKey, so a validate on a host without the
+// secret still passes shape checks.
+func (c *Config) validateAES() error {
+	a := c.AES
+	if !a.Enabled {
+		return nil
+	}
+	if a.Listen == "" {
+		return fmt.Errorf("aes: listen is required when aes.enabled is true")
+	}
+	if a.Listen == c.Listen {
+		return fmt.Errorf("aes: listen %q must differ from the reverse-proxy listen %q", a.Listen, c.Listen)
+	}
+	if (a.TLS.CertFile == "") != (a.TLS.KeyFile == "") {
+		return fmt.Errorf("aes: tls.cert_file and tls.key_file must be set together")
+	}
+	if !a.TLS.Enabled() {
+		return fmt.Errorf("aes: tls.cert_file and tls.key_file are required when aes.enabled is true; the AES records travel inside TLS")
+	}
+	if a.KeyEnv == "" && a.KeyFile == "" && a.KeyRef == "" {
+		return fmt.Errorf("aes: one of key_env, key_file, key_ref is required when aes.enabled is true")
+	}
+	return nil
+}
+
+// ResolveAESKey resolves and parses the 32-byte pre-shared AES-256 key from the
+// configured source, through the same secret seam as route keys. It is called
+// once at startup; the resolved key is never stored on Config.
+func ResolveAESKey(a AESConfig) ([32]byte, error) {
+	var key [32]byte
+	refs := secretRefs(a.KeyRef, a.KeyEnv, a.KeyFile)
+	if len(refs) == 0 {
+		return key, fmt.Errorf("aes key: no key source configured")
+	}
+	material, err := resolveFirst(NewDefaultSecretProvider(), refs)
+	if err != nil {
+		return key, fmt.Errorf("aes key: %w", err)
+	}
+	return parseAESKey(material)
+}
+
+// parseAESKey accepts the resolved key material as 32 raw bytes, 64 hex
+// characters, or base64 of 32 bytes, and returns the 32-byte key.
+func parseAESKey(material string) ([32]byte, error) {
+	var key [32]byte
+	s := strings.TrimSpace(material)
+	switch {
+	case len(s) == 64:
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return key, fmt.Errorf("aes key: 64-char value is not valid hex: %w", err)
+		}
+		copy(key[:], b)
+		return key, nil
+	case len(s) == 32:
+		copy(key[:], s)
+		return key, nil
+	default:
+		if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) == 32 {
+			copy(key[:], b)
+			return key, nil
+		}
+		return key, fmt.Errorf("aes key: expected 32 raw bytes, 64 hex chars, or base64 of 32 bytes (got %d chars)", len(s))
+	}
 }
 
 // validateRouteAuth is the SINGLE entry point for a route's credential, auth

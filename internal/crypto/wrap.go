@@ -64,6 +64,20 @@ const maxFrame = 64 * 1024
 // default).
 const nonceSize = 12
 
+// gcmTagSize is the AES-GCM authentication tag length appended by
+// Seal. Used to size the on-wire frame bound so a legitimate
+// maxFrame-sized record is not misread as an out-of-bounds (tamper)
+// frame.
+const gcmTagSize = 16
+
+// maxRecord is the largest on-wire sealed record we will accept on a
+// Read: one nonce + up to maxFrame ciphertext bytes + the GCM tag.
+// The previous bound used the 4-byte length prefix in place of the
+// 12-byte nonce, which rejected any full-size record as tampering;
+// splitting Writes at maxFrame and accepting up to maxRecord here
+// makes the two sides agree exactly.
+const maxRecord = nonceSize + maxFrame + gcmTagSize
+
 // Wrap returns a net.Conn that encrypts writes and decrypts reads
 // using AES-256-GCM. key must be 32 bytes (AES-256); the caller is
 // responsible for key lifecycle (rotation, zeroisation on shutdown).
@@ -120,6 +134,16 @@ type WrapConn struct {
 
 	// tamper counter; read via TamperCount().
 	tamperCount atomic.Uint64
+
+	// readBuf holds plaintext decrypted from a record that did not
+	// fit in the caller's Read buffer. The next Read drains this
+	// before decrypting a new record, so a WrapConn is a correct
+	// io.Reader for callers of any buffer size (net/http reads
+	// through 4 KiB bufio buffers; a record's plaintext can exceed
+	// that). Touched only by Read, which the io.Reader contract
+	// already forbids calling concurrently with itself, so it needs
+	// no lock of its own.
+	readBuf []byte
 }
 
 // SetTap installs (or clears, with nil) a write-side observer. The
@@ -143,21 +167,44 @@ func (w *WrapConn) TamperCount() uint64 {
 	return w.tamperCount.Load()
 }
 
-// Write encrypts p into a single length-prefixed record and writes
-// it to the underlying socket. The plaintext slice is the entire
-// record body — small writes are sent as one frame.
+// Write encrypts p and writes it to the underlying socket as one or
+// more length-prefixed records. A payload up to maxFrame bytes is one
+// record; a larger payload (net/http and io.Copy issue writes up to
+// 32 KiB, and a caller may hand us more) is split into consecutive
+// maxFrame-sized records rather than rejected, so the wrapper is a
+// correct io.Writer for arbitrary payloads. Each record still carries
+// its own fresh nonce, and the peer's Read reassembles across records.
 func (w *WrapConn) Write(p []byte) (int, error) {
-	if len(p) > maxFrame {
-		return 0, fmt.Errorf("crypto: plaintext %d bytes exceeds maxFrame %d", len(p), maxFrame)
+	written := 0
+	// A zero-length Write still emits one record so the peer observes
+	// the boundary, matching net.Conn semantics for empty writes.
+	for {
+		chunk := p[written:]
+		if len(chunk) > maxFrame {
+			chunk = chunk[:maxFrame]
+		}
+		if err := w.writeRecord(chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		if written >= len(p) {
+			// Report the plaintext byte count: callers expect
+			// Write(n, nil) to match len(p) regardless of on-wire size.
+			return len(p), nil
+		}
 	}
+}
 
+// writeRecord seals a single ≤maxFrame plaintext chunk into one
+// length-prefixed record and writes it to the underlying socket.
+func (w *WrapConn) writeRecord(chunk []byte) error {
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
-		return 0, fmt.Errorf("crypto: read nonce: %w", err)
+		return fmt.Errorf("crypto: read nonce: %w", err)
 	}
 
 	// Seal appends ciphertext + 16-byte tag to nonce.
-	sealed := w.aead.Seal(nonce, nonce, p, nil)
+	sealed := w.aead.Seal(nonce, nonce, chunk, nil)
 
 	// Length prefix covers nonce + ciphertext + tag.
 	frame := make([]byte, 4+len(sealed))
@@ -172,26 +219,42 @@ func (w *WrapConn) Write(p []byte) (int, error) {
 	}
 
 	if _, err := w.Conn.Write(frame); err != nil {
-		return 0, fmt.Errorf("crypto: write frame: %w", err)
+		return fmt.Errorf("crypto: write frame: %w", err)
 	}
-	// Report the plaintext byte count: callers expect Write(n, nil)
-	// to match len(p) regardless of the on-wire size.
-	return len(p), nil
+	return nil
 }
 
-// Read consumes one length-prefixed record from the underlying
-// socket and decrypts it. Authentication failures return an error
-// wrapping ErrTampered and increment the tamper counter so the
-// release-gate test can assert the post-condition.
+// Read delivers decrypted plaintext into p. It first drains any
+// plaintext left over from a previous record that did not fit the
+// caller's buffer; only when that is exhausted does it consume and
+// decrypt the next length-prefixed record from the socket. A record's
+// plaintext larger than p is returned across successive Reads rather
+// than dropped, so a WrapConn is a correct io.Reader for callers of
+// any buffer size. Authentication failures return an error wrapping
+// ErrTampered and increment the tamper counter.
 func (w *WrapConn) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// Serve leftover plaintext from a prior oversized record first.
+	if len(w.readBuf) > 0 {
+		n := copy(p, w.readBuf)
+		w.readBuf = w.readBuf[n:]
+		if len(w.readBuf) == 0 {
+			w.readBuf = nil
+		}
+		return n, nil
+	}
+
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(w.Conn, lenBuf[:]); err != nil {
 		return 0, fmt.Errorf("crypto: read length: %w", err)
 	}
 	frameLen := binary.BigEndian.Uint32(lenBuf[:])
-	if frameLen == 0 || frameLen > 4+maxFrame+16 {
-		// Frame length includes nonce + ciphertext + tag (16 bytes).
-		// Anything outside the expected envelope is a wire attack.
+	if frameLen == 0 || frameLen > maxRecord {
+		// A legitimate record is nonce + ciphertext + tag, at most
+		// maxRecord bytes. Anything outside that envelope is a wire
+		// attack (or a desynchronised stream), counted as tampering.
 		w.tamperCount.Add(1)
 		return 0, fmt.Errorf("%w: length %d out of bounds", ErrTampered, frameLen)
 	}
@@ -202,7 +265,7 @@ func (w *WrapConn) Read(p []byte) (int, error) {
 		w.tamperCount.Add(1)
 		return 0, fmt.Errorf("%w: %w", ErrShortFrame, err)
 	}
-	if len(frame) < nonceSize+16 {
+	if len(frame) < nonceSize+gcmTagSize {
 		w.tamperCount.Add(1)
 		return 0, fmt.Errorf("%w: nonce+tag underrun (%d bytes)", ErrTampered, len(frame))
 	}
@@ -217,17 +280,13 @@ func (w *WrapConn) Read(p []byte) (int, error) {
 
 	n := copy(p, plaintext)
 	if n < len(plaintext) {
-		// Partial read: caller buffer too small. Drain the rest
-		// into a side buffer so the next Read starts at a frame
-		// boundary. This matches io.Reader semantics for partial
-		// reads (return what fits, save the rest).
+		// Caller buffer smaller than this record's plaintext: stash
+		// the remainder so the next Read continues at the exact byte,
+		// never dropping data. copy into a fresh slice so we do not
+		// retain the whole decrypt buffer.
 		rest := make([]byte, len(plaintext)-n)
 		copy(rest, plaintext[n:])
-		// We cannot really "save the rest" with the current API
-		// surface; callers should pass a buffer at least maxFrame
-		// bytes long. We surface this as a wrapped error so the
-		// test harness catches it.
-		return n, fmt.Errorf("crypto: short read buffer (%d bytes plaintext, %d returned): wrap with bytes.Buffer for partial-frame reads", len(plaintext), n)
+		w.readBuf = rest
 	}
 	return n, nil
 }

@@ -523,6 +523,57 @@ connect:
 tls:                        # only needed when the gateway owns a public socket
   cert_file: /etc/helixchannel/tls.crt
   key_file: /etc/helixchannel/tls.key
+
+aes:                        # OPTIONAL second leg: AES-256-GCM nested inside TLS
+  enabled: true
+  listen: ":8444"           # public bind, MUST differ from listen above
+  key_file: /run/secrets/aes.key   # 32-byte key: raw, 64-char hex, or base64
+  tls:                      # required: the AES records ride inside this TLS
+    cert_file: /etc/helixchannel/tls.crt
+    key_file: /etc/helixchannel/tls.key
+```
+
+### The AES leg (defence-in-depth against a TLS-intercepting proxy)
+
+The `aes:` block exposes a second listener that carries the **same routes and
+the same `gateway_auth` token** as the reverse-proxy leg, but wraps every
+connection in application-layer AES-256-GCM **inside** the outer TLS. It exists
+for one threat: a network path that terminates and inspects TLS — a corporate
+intercepting proxy on a managed laptop. Such a proxy peels the outer TLS and,
+on the plain leg, would see the request in clear; on the AES leg it sees only
+ciphertext, because the AES key is pre-shared out of band and is **not** derived
+from the TLS session.
+
+It is not a second trust boundary and grants nothing extra: a caller still needs
+the `X-HLXN-Token` gateway token, and the AES leg is refused at startup if the
+tokenless-relay bind rule would be violated, exactly like the reverse-proxy leg.
+What it adds is confidentiality of the payload against whoever holds the outer
+TLS session. Two independent facts gate it — the pre-shared AES key (to speak
+the leg at all) and the gateway token (to spend) — and neither substitutes for
+the other.
+
+A stock HTTP client cannot speak this leg. A caller reaches it through the
+client-side forwarder:
+
+```bash
+helixchannel aes-bridge \
+  --listen 127.0.0.1:8788 \
+  --gateway gateway.example.com:8444 \
+  --key-file ~/.config/helixchannel/aes.key
+```
+
+The client then points its base URL at `http://127.0.0.1:8788/<route>/v1` and
+still sends `X-HLXN-Token` as a normal header. The bridge holds no provider key
+and injects nothing; it only AES-wraps the loopback traffic on its way to the
+edge. Its `--listen` must be loopback — the client→bridge hop is unencrypted and
+must never leave the machine.
+
+Generate the shared key once and install it, root-owned, on the gateway and, by
+a secure out-of-band channel, on each client:
+
+```bash
+openssl rand -hex 32 | sudo tee /run/secrets/aes.key >/dev/null
+sudo chmod 640 /run/secrets/aes.key
 ```
 
 Adding a provider is one entry. Turning it on is one boolean. Nothing is compiled in: route names, prefixes, upstreams and auth modes are all data, and the config is validated at startup so a typo in a route that is switched off today does not become an outage the day it is switched on.
