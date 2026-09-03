@@ -591,8 +591,27 @@ func (s *Server) writeNotFound(w http.ResponseWriter) {
 // so the next selection already skips it.
 func (s *Server) settleLease(rt *boundRoute, lease *KeyLease, status int, usage UsageExtractor, event *AuditEvent) {
 	sample := chargeableSample(status, usage.Result())
-	if isQuotaStatus(status) {
-		if kl, ok := rt.Auth.(keyLeaser); ok {
+	if kl, ok := rt.Auth.(keyLeaser); ok {
+		// The vendor's own code is MORE SPECIFIC than the HTTP status and wins
+		// where both are present. MiniMax-family upstreams report the real
+		// reason in the body, often alongside HTTP 200, and the three failures
+		// that arrive as one 429 need opposite handling: a burst limit clears
+		// in seconds, a plan cap holds for the window, and a balance signal
+		// needs a human. A vendor code that says the KEY is healthy (auth or
+		// malformed-request) suppresses the status-based retire entirely,
+		// because retiring there would drain a funded pool over a caller bug.
+		if sig, found := vendorSignalFrom(usage); found {
+			if sig.Retires() {
+				if sig.Class == VendorQuotaWindow && sig.ResetAt.IsZero() {
+					// No vendor-named reset: the store already derives the
+					// window end from the route's budget. Keep that path.
+					kl.retire(lease.Index(), ReasonQuota)
+				} else {
+					kl.retireUntil(lease.Index(),
+						vendorRetireUntil(sig, time.Now(), time.Time{}), sig.Reason())
+				}
+			}
+		} else if isQuotaStatus(status) {
 			kl.retire(lease.Index(), ReasonQuota)
 		}
 	}
@@ -679,6 +698,17 @@ func chargedTokensFor(r Route, sample UsageSample) int64 {
 // class) commonly signal an exhausted plan with Payment Required. Treating that
 // as a generic upstream error would keep re-selecting the dead key until the
 // window rolled.
+// vendorSignalFrom asks an extractor for a vendor error code, when it can
+// answer. A nil or non-signalling extractor yields no signal, which leaves the
+// previous HTTP-status-only behaviour untouched.
+func vendorSignalFrom(ue UsageExtractor) (VendorSignal, bool) {
+	vs, ok := ue.(VendorSignaler)
+	if !ok || vs == nil {
+		return VendorSignal{}, false
+	}
+	return vs.VendorSignal()
+}
+
 func isQuotaStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
 }

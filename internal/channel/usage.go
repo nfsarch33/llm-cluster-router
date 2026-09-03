@@ -35,6 +35,22 @@ type UsageExtractor interface {
 	Result() UsageSample
 }
 
+// VendorSignaler is an OPTIONAL capability of a UsageExtractor: reporting a
+// vendor error code seen in the same observed tail.
+//
+// It is a separate interface rather than a method on UsageExtractor so that
+// third-party extractors keep compiling, and so the caller must opt in with a
+// type assertion — an extractor that cannot answer simply leaves the previous
+// HTTP-status-only behaviour in place.
+//
+// Reusing the usage tail is the whole point: MiniMax-family upstreams report
+// errors in the body, frequently alongside HTTP 200, and the rolling tail that
+// already streams past for token accounting carries base_resp too. Inspecting
+// it costs no extra buffering and cannot interfere with streaming.
+type VendorSignaler interface {
+	VendorSignal() (VendorSignal, bool)
+}
+
 // tailExtractor keeps a rolling UsageTailBytes window of the body.
 //
 // One implementation serves both plain JSON and SSE, because a rolling tail is
@@ -42,8 +58,14 @@ type UsageExtractor interface {
 type tailExtractor struct{ tail []byte }
 
 // NewUsageExtractor returns the default extractor: a rolling UsageTailBytes
-// window scanned for the last "total_tokens": N.
+// window scanned for the last "total_tokens": N. It also implements
+// VendorSignaler over the same window.
 func NewUsageExtractor() UsageExtractor { return &tailExtractor{} }
+
+// VendorSignal reports a vendor error code found in the retained tail. It reads
+// the same bytes Result does, retains nothing further, and is the optional
+// VendorSignaler half of this extractor.
+func (e *tailExtractor) VendorSignal() (VendorSignal, bool) { return parseVendorSignal(e.tail) }
 
 func (e *tailExtractor) Observe(b []byte) {
 	if len(b) == 0 {
