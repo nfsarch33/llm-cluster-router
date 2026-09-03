@@ -48,11 +48,46 @@ jobs:
         if: env.SKIP_STACK != '1'
         run: curl -sf --max-time 5 http://127.0.0.1:8010/health
 
+      # The router authenticates /v1/*. This step is the NEGATIVE control and
+      # needs no credential: it asserts the gate is actually enforcing, so a
+      # router that silently stopped requiring auth reds the build instead of
+      # passing the authenticated probes below for the wrong reason.
+      - name: Auth gate regression (unauthenticated must be refused)
+        if: env.SKIP_STACK != '1'
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            http://127.0.0.1:8787/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model":"qwen3.8-27b-local","messages":[{"role":"user","content":"hi"}],"max_tokens":8}')
+          if [ "$CODE" != "401" ]; then
+            echo "::error::unauthenticated /v1/chat/completions returned $CODE, want 401 — the router auth gate is not enforcing"
+            exit 1
+          fi
+          echo "unauthenticated request correctly refused (401)"
+
+      # Fail rather than skip when the stack is serving but no token is
+      # configured: skipping here would turn the only real end-to-end
+      # assertion into a step that cannot fail, which is how this workflow
+      # went red-then-unnoticed in the first place.
+      - name: Require router token when the stack is serving
+        if: env.SKIP_STACK != '1'
+        env:
+          LLM_ROUTER_TOKEN: ${{ secrets.LLM_ROUTER_TOKEN }}
+        run: |
+          if [ -z "${LLM_ROUTER_TOKEN:-}" ]; then
+            echo "::error::the router is serving on :8787 and requires auth, but secret LLM_ROUTER_TOKEN is not set for this repository; the authenticated probes below cannot run and must not be skipped"
+            exit 1
+          fi
+          echo "router token present"
+
       - name: "Chat round-trip through router (regression of the full serving path)"
         if: env.SKIP_STACK != '1'
+        env:
+          LLM_ROUTER_TOKEN: ${{ secrets.LLM_ROUTER_TOKEN }}
         run: |
           RESP=$(curl -sf --max-time 240 http://127.0.0.1:8787/v1/chat/completions \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $LLM_ROUTER_TOKEN" \
             -d '{"model":"qwen3.8-27b-local","messages":[{"role":"user","content":"Reply with exactly: E2E-OK"}],"max_tokens":200,"temperature":0}')
           echo "$RESP" | python3 -c "
           import json,sys
@@ -63,16 +98,22 @@ jobs:
 
       - name: Agent gate regression (disabled agent must 403)
         if: env.SKIP_STACK != '1'
+        env:
+          LLM_ROUTER_TOKEN: ${{ secrets.LLM_ROUTER_TOKEN }}
         run: |
           # Only meaningful when the deployed policy gates an agent; probe and
-          # assert consistency rather than assuming the flag's value.
+          # assert consistency rather than assuming the flag's value. The
+          # request is authenticated so a 401 cannot masquerade as a gate
+          # decision — 401 is an auth failure, 403 is the gate refusing.
           CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 240 \
             http://127.0.0.1:8787/v1/chat/completions \
             -H "Content-Type: application/json" -H "X-Helixon-Agent: codex" \
+            -H "Authorization: Bearer $LLM_ROUTER_TOKEN" \
             -d '{"model":"qwen3.8-27b-local","messages":[{"role":"user","content":"hi"}],"max_tokens":8}')
           echo "codex probe -> HTTP $CODE"
           case "$CODE" in
             200|403) echo "agent gate responds deterministically" ;;
+            401) echo "::error::agent-gate probe got 401 — the token is wrong, not a gate decision"; exit 1 ;;
             *) echo "unexpected status $CODE from agent gate"; exit 1 ;;
           esac
 
