@@ -101,6 +101,10 @@ type keyLeaser interface {
 	leaseFor() (Authenticator, *KeyLease, admissionRefusal)
 	retryAfter() time.Duration
 	retire(idx int, reason RetireReason)
+	// retireUntil parks a key until an EXPLICIT instant, for signals that
+	// carry their own recovery time or need a class-specific cooldown. retire
+	// keeps the accounting-window behaviour for everything else.
+	retireUntil(idx int, until time.Time, reason RetireReason)
 	inventory() KeyInventory
 }
 
@@ -187,6 +191,17 @@ func (r *rotatingInjector) retire(idx int, reason RetireReason) {
 		return
 	}
 	r.store.retireForWindow(r.route, idx, reason)
+}
+
+// retireUntil parks the key until an explicit instant. It exists for vendor
+// signals whose recovery time is known more precisely than the accounting
+// window: a burst limit clears in seconds, and a plan cap may name its own
+// reset time.
+func (r *rotatingInjector) retireUntil(idx int, until time.Time, reason RetireReason) {
+	if r.store == nil {
+		return
+	}
+	r.store.RetireWithReason(r.route, idx, until, reason)
 }
 
 // inventory is the /healthz key surface for a pooled route. Counts only: never
