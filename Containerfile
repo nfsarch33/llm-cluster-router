@@ -9,7 +9,7 @@
 # Two listeners (per upstream Dockerfile): :8080 (proxy) and :9091 (metrics).
 # Live systemd unit binds ":8787"; CMD overrides default :8080.
 
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 WORKDIR /build
 COPY go.mod go.sum ./
