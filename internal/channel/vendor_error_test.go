@@ -286,3 +286,25 @@ func TestTailExtractor_ImplementsVendorSignaler(t *testing.T) {
 		t.Errorf("usage tokens = %d, want 11; the vendor scan disturbed the tail", got.Tokens)
 	}
 }
+
+// TestVendorRetireUntil_PlanCapIgnoresShortAccountingWindow is the regression
+// for a defect that shipped in the first cut of this classifier.
+//
+// The public edge configures budget.window: 5m as its own blast-radius bound.
+// A MiniMax 2056 means the PLAN window is spent, and MiniMax documents that as
+// a 5-HOUR window. Parking the key until the end of the 5-minute accounting
+// window returned it almost immediately, drew 2056 again, and walked the pool.
+// The two clocks must not be conflated.
+func TestVendorRetireUntil_PlanCapIgnoresShortAccountingWindow(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	shortWindow := now.Add(5 * time.Minute) // the edge's accounting window
+
+	got := vendorRetireUntil(VendorSignal{Class: VendorQuotaWindow}, now, time.Time{})
+	if got.Sub(now) != VendorQuotaFallbackWindow {
+		t.Fatalf("plan cap parked for %v, want the documented %v", got.Sub(now), VendorQuotaFallbackWindow)
+	}
+	if !got.After(shortWindow) {
+		t.Errorf("a plan cap came back at %v, inside the 5m accounting window ending %v; "+
+			"the key would draw 2056 again and walk the pool", got, shortWindow)
+	}
+}
