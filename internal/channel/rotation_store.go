@@ -21,6 +21,17 @@ const (
 	ReasonQuota RetireReason = "quota"
 	// ReasonError is repeated upstream failure that is not a quota signal.
 	ReasonError RetireReason = "error"
+	// ReasonRateLimit is a BURST limit — requests, tokens or connections per
+	// unit time (MiniMax 1002/1041/2045). It is deliberately distinct from
+	// ReasonQuota: the plan is not spent, so the key comes back in seconds
+	// rather than being parked for an accounting window.
+	ReasonRateLimit RetireReason = "rate"
+	// ReasonBalance is an account balance/entitlement signal (MiniMax 1008).
+	// It needs a human, so it is alertable, but it parks for a bounded period
+	// rather than removing the key: the signal is documented returning false
+	// positives at 0% usage, and a permanent removal on a spurious code would
+	// drain a funded pool.
+	ReasonBalance RetireReason = "balance"
 )
 
 // TokensUnknown is the RecordUsage token value meaning "the upstream reported
