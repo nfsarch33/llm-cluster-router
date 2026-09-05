@@ -210,13 +210,23 @@ func TestRunGateway_ServesAndStopsOnSignal(t *testing.T) {
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("send SIGTERM: %v", err)
 	}
+	// 30s, not 10s, and the number is not arbitrary: it has to exceed the
+	// package's shutdown grace (channel.shutdownGrace, 15s) or this test times
+	// out on its OWN bound before the shutdown it is watching has finished, and
+	// reports "did not stop" for a stop that was still legitimately in progress.
+	//
+	// The grace in turn has to exceed net/http's hard-coded 5s threshold for
+	// reclaiming a connection that was accepted but has not sent a request
+	// header. Before v18815 the grace WAS that same 5s, so this test failed here
+	// with "context deadline exceeded" whenever the readiness loop above left a
+	// connection in that state -- measured 3/3 on pristine main under load.
 	select {
 	case err := <-errCh:
 		if err != nil && !strings.Contains(err.Error(), "context canceled") {
 			t.Fatalf("runGateway exit = %v, want clean shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("gateway did not stop within 10s of SIGTERM")
+	case <-time.After(30 * time.Second):
+		t.Fatal("gateway did not stop within 30s of SIGTERM")
 	}
 }
 
