@@ -73,9 +73,7 @@ func (c *ClientProxy) ListenAndServe(ctx context.Context) error {
 	}()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return c.httpSrv.Shutdown(shutdownCtx)
+		return shutdownHTTPServer(c.httpSrv, errCh)
 	case err := <-errCh:
 		return err
 	}

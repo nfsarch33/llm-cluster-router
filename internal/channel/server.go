@@ -1377,9 +1377,7 @@ func (s *Server) ServeWrapped(ctx context.Context, ln net.Listener, key [32]byte
 	}()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		return shutdownHTTPServer(srv, errCh)
 	case err := <-errCh:
 		return err
 	}
@@ -1427,9 +1425,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return s.httpSrv.Shutdown(shutdownCtx)
+		return shutdownHTTPServer(s.httpSrv, errCh)
 	case err := <-errCh:
 		return err
 	}
