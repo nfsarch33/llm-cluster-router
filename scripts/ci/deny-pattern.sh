@@ -169,11 +169,82 @@
 # at the DIFF extraction below for why the one-line textual narrowing was
 # measured and rejected.
 #
+# v18814 — the ninth, and the widest of the family: the gate never looked at
+# an added file that git classed as BINARY, and said so as a clean pass.
+#
+# `git diff` renders such a file as one line — `Binary files /dev/null and
+# b/<path> differ` — and NO content lines at all, so the extractor above found
+# nothing, the empty-diff branch fired, and the run printed
+#
+#     OK: no added lines in diff against <ref> - nothing to scan (empty range,
+#     or only scripts/ci/deny-pattern.sh changed)
+#
+# and exited 0. Not one pattern in either set ran, against a file whose bytes
+# were going into a public repository verbatim. Reproduced 2026-09-05 against
+# pristine origin/main, with the PUBLIC set alone, so it needed no secret and
+# no estate identifier:
+#
+#   a file whose first byte is NUL, carrying `<rsa-key-format> <blob> user@host`
+#     -> exit 0, "no added lines"
+#   the identical payload in a .txt -> exit 1, MATCH [SSH RSA public key]
+#
+# Nothing about that is exotic. Git calls a blob binary on ANY of:
+#
+#   * a NUL byte anywhere in the first 8k — every archive, image, database,
+#     compiled object, and any text file that picked one up;
+#   * a `-diff` or `binary` attribute in a COMMITTED .gitattributes — which is
+#     content a pull request can add, so the bypass was reachable BY THE DIFF
+#     BEING SCANNED;
+#   * a blob over core.bigFileThreshold.
+#
+# A fourth rendering hid content just as completely: a `diff=<driver>` textconv
+# rewriting the added lines before the gate saw them. (A fifth, an external
+# diff driver, was closed by v18813's --no-ext-diff just above; it is the one
+# that leaves no "Binary files" line behind at all, so it had no tell.)
+#
+# So the diff options are now a single list used by BOTH invocations:
+#
+#   --text          render every blob as text, whatever the heuristic, the
+#                   attribute or the size say.
+#   --no-textconv   ignore a configured textconv driver; the gate reads what is
+#                   committed, never a rendering of it.
+#   --no-ext-diff   from v18813, kept here so one list is the whole answer.
+#
+# THAT WAS NOT ENOUGH ON ITS OWN, and the half that was missing looked exactly
+# like the half that was fixed. Once binary content reaches the added lines it
+# carries invalid UTF-8, and GNU grep treats input with encoding errors as
+# binary and stops printing matching lines — writing its notice to stderr since
+# 3.5, so the caller sees an empty result and NO diagnostic. Measured on grep
+# 3.11 under LANG=C.UTF-8, eight invalid bytes ahead of a verbatim public key
+# were enough to take `grep -niE` from one match to zero. Hence LC_ALL=C below,
+# and `-a` at the point of use. (v18813's awk extractor is unaffected: gawk
+# 5.2.1 was measured on the same input and reads it correctly either way.)
+#
+# The trade-off is deliberate and in the documented direction (see "Responding
+# to a finding" in docs/security/anti-leak.md): genuine binary assets are now
+# scanned as text, so a byte sequence inside a PNG or a tarball can trip a
+# pattern. That is a false positive, and false positives are cheap here; the
+# thing it replaces is a permanent, silent false negative on every opaque file
+# ever added. Measured over every tracked binary blob in both public repos
+# before landing — 0 of 0 and 0 of 1 tripping — see docs/security/anti-leak.md.
+#
 # Regression pins: tools/deny-pattern-tests.sh (registered in
 # tools/workspace-doctor.sh). The installer that ships this scanner into other
 # repos is pinned by tools/install-deny-pattern-tests.sh.
 
 set -euo pipefail
+
+# v18814 — every regex in this file matches BYTES, not characters.
+#
+# Once --text renders opaque blobs (see the v18814 note above), the added lines
+# carry arbitrary bytes, and in a UTF-8 locale those are ENCODING ERRORS. GNU
+# grep treats such input as binary and stops printing matching lines, writing
+# its notice to stderr, so a caller sees an empty result and no diagnostic --
+# which is the same false negative this file keeps rediscovering, wearing the
+# same clothes. C is also simply the right locale for a leak gate: byte-oriented
+# matching cannot be steered by how a file happens to be encoded, and the
+# patterns in both sets are ASCII.
+export LC_ALL=C
 
 # The single repository whose contents are exempt. It is internal and holds
 # operator handles, internal IPs and host names by design.
@@ -328,12 +399,76 @@ fi
 # gate off by accident. The old prefix filter degraded differently rather than
 # better; it would have matched whatever the external tool happened to print
 # with a leading `+`. Pinned in tools/deny-pattern-tests.sh.
-if RAW_DIFF="$(git diff --no-ext-diff "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
+# v18814 — the diff options live in ONE list used by BOTH invocations below,
+# so the three-dot form and the two-dot fallback cannot drift apart. The
+# fallback runs only on repos with no merge base, which is exactly where a
+# divergence would be least likely to be noticed and most likely to matter.
+# See the v18814 note in this file's header for what each option closes.
+DIFF_FLAGS=(--text --no-textconv --no-ext-diff)
+
+# `tr -d '\000'`: --text renders binary blobs verbatim, so RAW_DIFF can now
+# carry NUL bytes. Bash drops them from a command substitution ANYWAY and warns
+# on stderr while doing it ("command substitution: ignored null byte in
+# input"), so the removal is not a choice -- only whether it happens visibly
+# here or invisibly in the assignment, and a P0 gate should not have a silent
+# content transformation in it, nor emit a warning that reads like a fault.
+#
+# It is a removal, and a removal before matching is how v18797 became v18811,
+# so: it DELETES rather than substituting a separator, which is the safe
+# direction here. Deleting can only splice neighbouring bytes together, and
+# splicing can create a match but not destroy one -- a key or token interrupted
+# by a NUL becomes contiguous and is now caught. Substituting would do the
+# opposite. It also cannot shift a line number (NUL is not a newline), so the
+# DIFF/SCAN_DIFF alignment check further down still holds.
+if RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
   :
-elif RAW_DIFF="$(git diff --no-ext-diff "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
+elif RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
   echo "NOTE: no merge base with $BASE_REF; scanning the two-dot diff instead."
 else
   echo "ERROR: git diff against '$BASE_REF' failed; nothing was scanned." >&2
+  exit 2
+fi
+
+# v18814 — the tripwire on the guarantee those options provide.
+#
+# With --text, git does not take the binary branch in builtin_diff() and so
+# cannot emit this line; every rendering measured for v18814 confirms that.
+# This is therefore an ASSERTION, not a live code path, and it is here because
+# of how this file travels: scripts/ci/install-deny-pattern.sh COPIES it into
+# public repositories, where the copy can be hand-edited, reverted, or left
+# behind by a newer upstream. If any of that drops an option, the failure mode
+# is the ORIGINAL defect -- a whole file unscanned, reported as a clean pass --
+# which is precisely the shape that survives review. So the invariant is
+# checked rather than assumed, and a violation is exit 2: nothing was scanned
+# for that path, and "we could not look" must never leave by the same door as
+# "we looked and it was clean".
+#
+# `^`-anchored: an added line carrying this text is prefixed with `+` by git and
+# a context line with a space, so only git's own unprefixed rendering matches.
+#
+# The `and b/<path>` half of the anchor is load-bearing too, and it is why this
+# does not simply grep for "Binary files". Measured 2026-09-05, the three
+# renderings git produces are:
+#
+#   added     Binary files /dev/null and b/<path> differ    -> captured
+#   modified  Binary files a/<path>  and b/<path> differ    -> captured
+#   DELETED   Binary files a/<path>  and /dev/null differ   -> NOT captured
+#
+# A deletion adds no content, so there is nothing for a deny pattern to have
+# missed; firing on one would be a false alarm on the routine removal of an
+# image. This gate scans added lines and only added lines, and the tripwire
+# holds the same line. tools/deny-pattern-tests.sh drives it with a git stub, so
+# it is pinned as wired-up rather than assumed to be.
+OPAQUE_FILES="$(printf '%s\n' "$RAW_DIFF" \
+  | sed -n 's/^Binary files .* and b\/\(.*\) differ$/\1/p' || true)"
+if [[ -n "$OPAQUE_FILES" ]]; then
+  echo "ERROR: git rendered these path(s) as opaque despite --text, so their" >&2
+  echo "       added content was NOT scanned by any deny pattern:" >&2
+  printf '%s\n' "$OPAQUE_FILES" | sed 's/^/         /' >&2
+  echo "       This should be unreachable while ${DIFF_FLAGS[*]} are passed;" >&2
+  echo "       if it fired, this scanner has drifted from the upstream copy in" >&2
+  echo "       $INTERNAL_SLUG. Re-install it with that repo's" >&2
+  echo "       scripts/ci/install-deny-pattern.sh rather than editing it here." >&2
   exit 2
 fi
 
@@ -681,7 +816,10 @@ for entry in "${PATTERNS[@]}"; do
   # offending line that existed in no file — so `grep -F` on the evidence found
   # nothing and the column offsets were wrong. The two copies are line-for-line
   # aligned (asserted where SCAN_DIFF is built), so the line number transfers.
-  MATCH_LINES=$(printf '%s\n' "$SUBJECT" | grep -niE -- "$PATTERN" 2>/dev/null \
+  # v18814 - `-a`. On added lines holding arbitrary bytes this grep returns
+  # NOTHING without it, which reads as "this pattern did not match". See the
+  # LC_ALL note at the top of this file for the measurement.
+  MATCH_LINES=$(printf '%s\n' "$SUBJECT" | grep -aniE -- "$PATTERN" 2>/dev/null \
                 | cut -d: -f1 || true)
   if [[ -n "$MATCH_LINES" ]]; then
     # tr -d: `wc -l` pads its count on some platforms, and the arithmetic
@@ -689,8 +827,21 @@ for entry in "${PATTERNS[@]}"; do
     LINES="$(printf '%s\n' "$MATCH_LINES" | wc -l | tr -d '[:space:]')"
     echo ""
     echo "MATCH [$LABEL] ($LINES matching line(s)):"
+    # v18814 - DISPLAY ONLY: replace every non-printable byte with '.'. Since
+    # --text, a matching line can be a slice of a binary blob, and this output
+    # goes verbatim into a public CI log, a PR comment and the operator's
+    # terminal. Raw control bytes there are at best unreadable and at worst
+    # forgeable -- an ANSI escape can repaint or erase the surrounding lines of
+    # the very report that is quoting it.
+    #
+    # It changes nothing about what was matched: MATCH_LINES was decided above
+    # against the untouched bytes, and this only reformats what is echoed back.
+    # Tabs survive because indentation carries meaning in the file the line came
+    # from. Under LC_ALL=C `[:print:]` is ASCII, so a non-ASCII character in a
+    # legitimate text finding is dotted as well; the label, the line count and
+    # the line number are all still exact, and the file itself is the evidence.
     printf '%s\n' "$MATCH_LINES" | head -3 | while read -r n; do
-      printf '%s\n' "$DIFF" | sed -n "${n}p"
+      printf '%s\n' "$DIFF" | sed -n "${n}p" | tr -c '[:print:]\t\n' '.'
     done | sed 's/^/  /'
     # The block is capped at three lines. Say what was hidden, for the same
     # reason the summary must not undercount: a gate that shows less than it
