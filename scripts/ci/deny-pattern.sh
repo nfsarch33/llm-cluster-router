@@ -228,6 +228,25 @@
 # ever added. Measured over every tracked binary blob in both public repos
 # before landing — 0 of 0 and 0 of 1 tripping — see docs/security/anti-leak.md.
 #
+# v18814 (the path half) — the added file's PATH is never scanned, and every
+# version above shares it, the binary fix included. The extraction is
+# hunk-scoped, so `+++ b/<path>` is skipped — and it is the ONLY line in a
+# unified diff that carries a new file's name. The other path-bearing lines
+# (`diff --git`, `new file mode`, `rename to`) sit outside the hunks too. So a
+# deny pattern present only in a file or directory NAME was invisible to every
+# pattern in both sets.
+#
+# This estate names evidence directories after the host they were captured on,
+# so the internal host-naming patterns are precisely the ones a path carries;
+# helixon-platform, a PUBLIC repo, already tracks 28 such paths. A pure rename
+# was sharper still: it adds no lines at all, so the run took the "nothing to
+# scan" branch and exited 0 having loaded no patterns.
+#
+# The header is still not scanned as a diff line — the extraction is untouched.
+# The range's added and renamed PATHS are enumerated SEPARATELY, so a path is
+# scanned because it was asked for rather than as a side effect. See the
+# v18814 path block below the extraction for the --diff-filter=ACR reasoning.
+#
 # Regression pins: tools/deny-pattern-tests.sh (registered in
 # tools/workspace-doctor.sh). The installer that ships this scanner into other
 # repos is pinned by tools/install-deny-pattern-tests.sh.
@@ -420,9 +439,14 @@ DIFF_FLAGS=(--text --no-textconv --no-ext-diff)
 # by a NUL becomes contiguous and is now caught. Substituting would do the
 # opposite. It also cannot shift a line number (NUL is not a newline), so the
 # DIFF/SCAN_DIFF alignment check further down still holds.
+# v18814 (path half) - RANGE_MODE records WHICH of the two forms produced the
+# diff, so the path enumeration below is taken from the same range. Re-deriving
+# it would let the two halves of one scan disagree about what was scanned.
+RANGE_MODE=""
 if RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
-  :
+  RANGE_MODE="three-dot"
 elif RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
+  RANGE_MODE="two-dot"
   echo "NOTE: no merge base with $BASE_REF; scanning the two-dot diff instead."
 else
   echo "ERROR: git diff against '$BASE_REF' failed; nothing was scanned." >&2
@@ -507,14 +531,17 @@ fi
 # begins with `+` except `+++`, which the hunk boundary excludes on its own --
 # so the change can only ever add lines to the scan. It is also prefix-blind,
 # which the alternative above is not. The other direction is pinned too: a file
-# PATH is still never scanned, because turning this false negative into a false
-# positive on every path in the tree would be its own defect.
+# PATH is still never scanned HERE, because turning this false negative into a
+# false positive on every path in the tree would be its own defect. Since
+# v18814 the paths a range INTRODUCES are scanned - but from their own
+# enumeration below, never by relaxing this boundary, and never for a path that
+# was merely modified.
 #
 # The `|| true` is gone with the greps that needed it. awk exits 0 on empty
 # input, so the v18790 empty-range behaviour below is now structural rather
 # than a suppressed exit code -- and an awk that cannot run is a configuration
 # error (exit 2) rather than an empty DIFF that reads as a clean scan.
-if ! DIFF="$(printf '%s\n' "$RAW_DIFF" | awk '
+if ! CONTENT_DIFF="$(printf '%s\n' "$RAW_DIFF" | awk '
   /^diff --git / { in_hunk = 0; next }
   /^@@/          { in_hunk = 1; next }
   in_hunk && /^[+]/ { print }
@@ -524,12 +551,110 @@ if ! DIFF="$(printf '%s\n' "$RAW_DIFF" | awk '
   exit 2
 fi
 
-if [[ -z "$DIFF" ]]; then
+# v18814 (path half) - the added file's PATH is content too, and it was never
+# scanned.
+#
+# The extraction above is hunk-scoped, so every diff header is skipped -
+# including `+++ b/<path>`, the ONLY line in a unified diff carrying a new
+# file's name. The other lines that name a path (`diff --git a/... b/...`,
+# `new file mode`, `rename to <path>`) sit outside the hunks as well. That is
+# correct for reading CONTENT and is left exactly as written; it is also why a
+# deny pattern appearing only in a file or directory NAME was invisible to
+# every pattern in both sets.
+#
+# Not a corner case here: this estate names evidence directories after the host
+# they were captured on, so the internal host-naming patterns are exactly the
+# ones a path carries. Reproduced 2026-09-05 against origin/main with the
+# internal set loaded - a file added at an evidence path carrying a host name,
+# whose CONTENT is innocuous, exited 0 "OK: no deny-pattern matches", while the
+# same host name in the file BODY exited 1. A pure rename was sharper still: it
+# adds no lines, so the run took the empty branch below and exited 0 having
+# loaded no patterns and scanned nothing at all.
+#
+# So the paths are enumerated SEPARATELY and folded in as synthetic lines. The
+# header stays unscanned and the hunk boundary is untouched: a path is scanned
+# because it was asked for, not as a side effect of the extraction. The prefix
+# keeps a path visibly distinct from a content line in a MATCH block and cannot
+# break a pattern - no pattern in either set is anchored (none contains ^ or
+# $), and an added content line already carries a leading `+`, so a
+# start-of-line anchor could never have worked here anyway.
+#
+# --diff-filter=ACR - Added, Copied, Renamed-to. Deliberately NOT M:
+#
+#   * A path that already exists on the base ref is not new disclosure. That is
+#     the same reasoning the removed-lines rule above rests on: this gate scans
+#     what a range INTRODUCES. It is also what keeps the fix deployable -
+#     helixon-platform tracks 28 paths carrying an internal host name (measured
+#     2026-09-05 on origin/main, 780 files). With M included, every PR that
+#     merely edited one of them would fail on a name it did not choose and
+#     could not fix. Over that repo's last 120 commits: 7 would go red under
+#     ACR - each one the commit that ADDED such a path, which is the case this
+#     exists to catch - against 14 under ACMR. It is also the policy the
+#     v18813b path control in tools/deny-pattern-tests.sh defers to: that
+#     control pins the EXTRACTION on a modified path, which is outside this
+#     filter either way, so the two hold simultaneously.
+#   * R reports only the DESTINATION path, so renaming AWAY from a bad name is
+#     never flagged: the cleanup commit is not blocked by the gate that asked
+#     for it.
+#   * If rename detection is off, a rename is reported as A plus D instead, and
+#     the A still carries the destination. Either way the new name is scanned.
+#
+# The range form is RANGE_MODE, the one the content diff actually used, and the
+# options are the same DIFF_FLAGS list, so no invocation can drift from the
+# others. core.quotePath=false keeps a non-ASCII path as written rather than
+# octal-escaped.
+PATH_LINE_PREFIX="+path: "
+PATHS_RC=0
+if [[ "$RANGE_MODE" == "three-dot" ]]; then
+  ADDED_PATHS="$(git -c core.quotePath=false diff "${DIFF_FLAGS[@]}" --name-only \
+                   --diff-filter=ACR "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" \
+                   2>/dev/null)" || PATHS_RC=$?
+else
+  ADDED_PATHS="$(git -c core.quotePath=false diff "${DIFF_FLAGS[@]}" --name-only \
+                   --diff-filter=ACR "$BASE_REF" HEAD -- "$SELF_EXCLUDE" \
+                   2>/dev/null)" || PATHS_RC=$?
+fi
+# Fail closed. The content diff has already succeeded against this same range,
+# so a failure here is not "no paths" - it is the file names going unscanned
+# while the added lines are scanned, reported as one clean verdict. That is a
+# partial scan presented as a full one, which is the failure mode this whole
+# file keeps rediscovering, so it takes the exit 2 the contract reserves for
+# "the scan did not happen".
+if [[ "$PATHS_RC" -ne 0 ]]; then
+  echo "ERROR: could not enumerate the paths introduced in the range against" >&2
+  echo "       '$BASE_REF' (git exited $PATHS_RC), while the content diff" >&2
+  echo "       succeeded. Scanning the added lines but not the file names" >&2
+  echo "       would report a partial scan as a clean one." >&2
+  exit 2
+fi
+PATH_LINES=""
+PATH_COUNT=0
+if [[ -n "$ADDED_PATHS" ]]; then
+  PATH_COUNT="$(printf '%s\n' "$ADDED_PATHS" | wc -l | tr -d '[:space:]')"
+  PATH_LINES="$(printf '%s\n' "$ADDED_PATHS" | sed "s|^|$PATH_LINE_PREFIX|")"
+fi
+
+if [[ -z "$CONTENT_DIFF" && -z "$PATH_LINES" ]]; then
   # Since v18792 there are two ways to land here, and the message must not
   # claim the wrong one: a genuinely empty range, or a range whose only added
-  # lines were in the one excluded path.
-  echo "OK: no added lines in diff against $BASE_REF - nothing to scan (empty range, or only $SELF_PATH changed)"
+  # lines were in the one excluded path. Since v18814 it also means the range
+  # introduced no path - a rename-only range now has something to scan.
+  echo "OK: no added lines and no added or renamed paths in diff against $BASE_REF - nothing to scan (empty range, or only $SELF_PATH changed)"
   exit 0
+fi
+
+# Say what the path list contributed, on every run and before any verdict. A
+# gate that quietly scans something other than what it claims is the failure
+# mode this file keeps rediscovering.
+echo "Also scanning $PATH_COUNT added/renamed path(s) as text - a deny pattern in a FILE NAME is a leak too"
+
+if [[ -n "$CONTENT_DIFF" && -n "$PATH_LINES" ]]; then
+  DIFF="$CONTENT_DIFF
+$PATH_LINES"
+elif [[ -n "$CONTENT_DIFF" ]]; then
+  DIFF="$CONTENT_DIFF"
+else
+  DIFF="$PATH_LINES"
 fi
 
 # v18797 — neutralize the repo's OWN public module path before matching.
