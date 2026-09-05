@@ -132,6 +132,14 @@
 # including a private one, is untouched and still caught. See the SCAN_DIFF
 # block below and docs/security/anti-leak.md.
 #
+# v18811 — the seventh, and the only one this file caused itself. v18797 above
+# matched EVERY pattern against the shortened lines, so any pattern whose match
+# had to run past the slug went silent: an SSH public key whose comment ended
+# at the repo's own module path passed the gate, in both public repos, with the
+# public set alone. The removal is now applied per pattern — only to a pattern
+# the module path would itself match — and leaves a separator behind. See the
+# v18811 note in the SCAN_DIFF block below.
+#
 # Regression pins: tools/deny-pattern-tests.sh (registered in
 # tools/workspace-doctor.sh). The installer that ships this scanner into other
 # repos is pinned by tools/install-deny-pattern-tests.sh.
@@ -328,20 +336,120 @@ fi
 #     comment or config — carries a different slug (or none), is NOT removed,
 #     and still trips the handle pattern. That is the genuine-leak case, pinned
 #     in tools/deny-pattern-tests.sh next to this one.
-#   * Nothing but this exact public slug is removed, so no credential-shaped
-#     string sharing a line with it can be hidden by the removal.
+#   * Nothing but this exact public slug is removed. On its own that is NOT
+#     enough to make the removal safe — see the v18811 note directly below,
+#     which is what makes it safe.
 #
 # With no github.com origin REPO_SLUG is empty, there is nothing public by
 # construction to neutralize, and the diff is scanned unchanged.
+#
+# v18811 — the seventh, and the only one this file inflicted on itself: v18797
+# above introduced a FALSE NEGATIVE, the class this gate exists to prevent.
+#
+# v18797 removed the own slug from every added line and then matched EVERY
+# pattern against the shortened text. Removing text cannot create a match, but
+# it can DESTROY one: any pattern whose match had to extend past the slug went
+# silent while the payload stayed in the tree verbatim. Reproduced 2026-09-03
+# against the merged scanner, in BOTH public repos, using the PUBLIC set only,
+# so it needed no secret and no estate identifier:
+#
+#   +authorized_key: ssh-rsa AAAA<key> runner@github.com/<owner>/<this-repo>
+#
+# Both SSH-key patterns end `[^@]+@[^@]+`. That trailing `[^@]+` was satisfied
+# by the module path and by nothing else on the line, so deleting the path took
+# the match with it: exit 0, "OK: no deny-pattern matches". The identical line
+# ending `runner@buildhost` exits 1. The Slack-token pattern fails the same way
+# (`xoxb-` immediately followed by the module path at end of line).
+#
+# Two changes. The first is the one that matters:
+#
+#   1. NEUTRALIZE PER PATTERN, NOT GLOBALLY. A pattern reads the neutralized
+#      copy only if the module path is a string that pattern would itself
+#      match; every other pattern reads the added lines EXACTLY as written. The
+#      false positive v18797 existed to fix is by definition such a pattern —
+#      the operator handle IS the owner segment — so none of that fix is lost,
+#      while a credential format, an address range or a vendor token, none of
+#      which match a module path, can no longer be silenced by the removal.
+#      What remains suppressible is only what the public-by-construction string
+#      trips on its own, which is exactly the case this was written for.
+#
+#   2. THE REMOVAL LEAVES A SEPARATOR. Both rules now replace the slug with a
+#      single space rather than one of them deleting it outright, so a removal
+#      can neither splice its neighbours together nor truncate a line to end
+#      one character short of a pattern. This is defence in depth behind (1),
+#      never a substitute for it: a space satisfies `[^@]+` but not
+#      `[0-9a-zA-Z-]+`, so a separator alone would have fixed the SSH case and
+#      left the Slack one open.
+#
+#   3. AN ENTRY CARRYING AN ALTERNATION IS NEVER NEUTRALIZED. An ERE is not one
+#      matcher: a top-level `|` makes it several independent ones, and gating
+#      the whole ENTRY on the fact that ONE branch matches the module path puts
+#      every OTHER branch on the shortened text — the same defect, reappearing
+#      inside a single entry. Measured 2026-09-04 on this scanner with the two
+#      regexes `<handle>` and `<token-format>`: as two entries the payload
+#      exits 1, combined into one entry it exits 0. Deciding which `|` is
+#      top-level needs a regex parser, so the test is the dumber and strictly
+#      safer one — ANY `|` in the pattern disqualifies the entry, which can
+#      only ever neutralize LESS, never more. The cost is a false positive if
+#      someone writes the handle as one branch of an alternation; that is the
+#      cheap direction, and pattern_reads_neutralized() below says so.
+#
+#   4. THE REMOVAL IS CASE-INSENSITIVE, like the matcher. Patterns are matched
+#      with `grep -iE`, so an entry can be gated ON by a case-insensitive match
+#      and then have the removal miss, because a host name is written
+#      `GitHub.com` in prose and a clone URL need not carry the canonical case.
+#      Both `s###` commands take the `I` flag (GNU sed; the runners are
+#      `[self-hosted, linux]`). This is not a widening in the false-negative
+#      direction: only a pattern that itself matches the module path ever reads
+#      the neutralized copy, and that pattern is matched case-insensitively
+#      anyway, so the removal now agrees with the matcher instead of quietly
+#      disagreeing with it.
+#
+# Pinned in tools/deny-pattern-tests.sh, "DEFECT 6 (v18811)", for both public
+# slugs and in both directions.
 SCAN_DIFF="$DIFF"
+OWN_MODULE_PATH=""
 if [[ -n "$REPO_SLUG" ]]; then
+  OWN_MODULE_PATH="github.com/$REPO_SLUG"
   # Escape the one ERE metacharacter a GitHub owner/repo slug can carry (`.`)
   # so a literal dot in a repo name cannot widen the removal.
   SLUG_RE="${REPO_SLUG//./\\.}"
   SCAN_DIFF="$(printf '%s\n' "$DIFF" \
-    | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])#\\1#g; s#github\\.com/${SLUG_RE}\$##g")"
-  echo "Neutralizing this repo's own public module path github.com/$REPO_SLUG before matching (public by construction; see docs/security/anti-leak.md)"
+    | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])# \\1#gI; s#github\\.com/${SLUG_RE}\$# #gI")"
+  # The two copies must stay line-for-line aligned: a MATCH block below is
+  # located in SCAN_DIFF and then REPORTED from DIFF by line number, and a
+  # misattributed line is precisely this file's recurring failure — a gate
+  # saying something other than what it read. sed cannot change the line count
+  # here, but a future edit could, so this is checked rather than assumed.
+  if [[ "$(printf '%s\n' "$DIFF" | wc -l)" != "$(printf '%s\n' "$SCAN_DIFF" | wc -l)" ]]; then
+    echo "ERROR: the neutralized copy is not line-for-line aligned with the" >&2
+    echo "       diff, so a reported line number would name the wrong line." >&2
+    echo "       Refusing to scan rather than report the wrong evidence." >&2
+    exit 2
+  fi
 fi
+
+# v18811 - the one place that decides whether a pattern reads the neutralized
+# copy instead of the added lines as written. Three conditions, all necessary:
+#
+#   * there is a module path to neutralize at all;
+#   * the pattern carries no `|` (see note 3 above — an alternation is several
+#     matchers and must never be gated as one); and
+#   * the module path, on its own, is a string this pattern matches. If it is
+#     not, removing that path cannot change this pattern's verdict, so the
+#     pattern reads the diff exactly as written.
+#
+# Deliberately NOT tested: the module path embedded in surrounding context. A
+# pattern that only matches once the path has a trailing `/` or an adjacent
+# character is classified here as not-gated, so v18797's false positive returns
+# for that pattern alone. That is the cheap direction and it is recorded in
+# docs/security/anti-leak.md; widening this test would suppress MORE, which is
+# the direction that costs false negatives.
+pattern_reads_neutralized() { # $1 = pattern
+  [[ -n "$OWN_MODULE_PATH" ]] || return 1
+  case "$1" in *"|"*) return 1 ;; esac
+  printf '%s\n' "$OWN_MODULE_PATH" | grep -qiE -- "$1"
+}
 
 # PUBLIC deny patterns (case-insensitive extended regex).
 # Format: PATTERN|LABEL (for human-readable output)
@@ -426,21 +534,75 @@ fi
 # "MATCH [...]" blocks printed below. It was a 0/1 flag that the summary then
 # printed as if it were a count, so every failing run ended with "FAIL: 1
 # pattern match(es)" however many blocks it had just printed above that line.
+# v18809 - every pattern must compile before any of them runs.
+#
+# An entry is pattern|label, and the PATTERN is everything before the LAST
+# delimiter, not everything before the first. It used to be `${entry%%|*}`,
+# which truncates at the first `|` INSIDE the pattern: the RFC1918 172.16/12
+# entry carries an alternation, so this loop compiled `172[.](1[6-9]`, grep
+# exited 2 on the unmatched parenthesis, the `2>/dev/null || true` below
+# swallowed the error, and that entry matched nothing for as long as it
+# existed. A dead pattern and a clean diff print the same line, which is why
+# the compile check is not optional: an entry grep cannot parse is an
+# infrastructure failure, never a clean scan.
+for entry in "${PATTERNS[@]}"; do
+  PROBE="${entry%|*}"
+  # `|| PROBE_RC=$?` matters: this script runs under `set -e`, and grep exits 1
+  # on the empty input whenever the pattern is merely valid. Only 2 and above
+  # mean grep could not parse it.
+  PROBE_RC=0
+  grep -qE -- "$PROBE" /dev/null || PROBE_RC=$?
+  if [[ "$PROBE_RC" -ge 2 ]]; then
+    echo "ERROR: deny pattern does not compile: ${entry##*|}" >&2
+    echo "       A pattern grep cannot parse reports nothing, which reads as clean." >&2
+    exit 2
+  fi
+done
+
+# v18811 - which patterns the own-module-path neutralization actually applies
+# to, said out loud before the scan rather than left to be inferred. Only a
+# pattern the module path itself matches can be suppressed by removing that
+# path; for every other pattern the neutralized copy is not consulted at all.
+# The count is printed, never the labels: this output reaches public CI logs.
+NEUTRALIZED_FOR=0
+if [[ -n "$OWN_MODULE_PATH" ]]; then
+  for entry in "${PATTERNS[@]}"; do
+    if pattern_reads_neutralized "${entry%|*}"; then
+      NEUTRALIZED_FOR=$((NEUTRALIZED_FOR + 1))
+    fi
+  done
+  echo "Neutralizing this repo's own public module path github.com/$REPO_SLUG for $NEUTRALIZED_FOR of ${#PATTERNS[@]} pattern(s) - the ones that string trips by itself (public by construction; see docs/security/anti-leak.md)"
+fi
+
 MATCHED=0
 for entry in "${PATTERNS[@]}"; do
-  PATTERN="${entry%%|*}"
+  PATTERN="${entry%|*}"
   LABEL="${entry##*|}"
-  # Use grep -iE with -- to delimit. SCAN_DIFF is DIFF with this repo's own
-  # public module path neutralized (see the v18797 note above); it equals DIFF
-  # when there is no github.com origin to derive that path from.
-  MATCHES=$(echo "$SCAN_DIFF" | grep -iE -- "$PATTERN" 2>/dev/null || true)
-  if [[ -n "$MATCHES" ]]; then
+  # v18811 - the subject is the added lines EXACTLY as written, UNLESS this is
+  # a pattern the repo's own module path would itself match, in which case it
+  # is the neutralized copy. Matching every pattern against the shortened text
+  # is how v18797's removal became a false negative; see the note above.
+  SUBJECT="$DIFF"
+  if pattern_reads_neutralized "$PATTERN"; then
+    SUBJECT="$SCAN_DIFF"
+  fi
+  # Use grep -iE with -- to delimit. Located in SUBJECT, but REPORTED from DIFF
+  # below: for a neutralized pattern the subject line has had the module path
+  # replaced by whitespace, and printing that as the finding quoted an
+  # offending line that existed in no file — so `grep -F` on the evidence found
+  # nothing and the column offsets were wrong. The two copies are line-for-line
+  # aligned (asserted where SCAN_DIFF is built), so the line number transfers.
+  MATCH_LINES=$(printf '%s\n' "$SUBJECT" | grep -niE -- "$PATTERN" 2>/dev/null \
+                | cut -d: -f1 || true)
+  if [[ -n "$MATCH_LINES" ]]; then
     # tr -d: `wc -l` pads its count on some platforms, and the arithmetic
     # below needs a bare integer.
-    LINES="$(printf '%s\n' "$MATCHES" | wc -l | tr -d '[:space:]')"
+    LINES="$(printf '%s\n' "$MATCH_LINES" | wc -l | tr -d '[:space:]')"
     echo ""
     echo "MATCH [$LABEL] ($LINES matching line(s)):"
-    printf '%s\n' "$MATCHES" | head -3 | sed 's/^/  /'
+    printf '%s\n' "$MATCH_LINES" | head -3 | while read -r n; do
+      printf '%s\n' "$DIFF" | sed -n "${n}p"
+    done | sed 's/^/  /'
     # The block is capped at three lines. Say what was hidden, for the same
     # reason the summary must not undercount: a gate that shows less than it
     # found reads as a smaller problem than it is.
