@@ -140,6 +140,35 @@
 # the module path would itself match — and leaves a separator behind. See the
 # v18811 note in the SCAN_DIFF block below.
 #
+# v18813 - the eighth, and the first that was never about the patterns at all.
+# The filter that separates added lines from diff headers was TEXTUAL:
+#
+#     DIFF="$(... | grep -E '^\+' | grep -v '^+++' || true)"
+#
+# git prefixes an added line with ONE `+`, so file content beginning with TWO
+# `+` produces a diff line beginning `+++` -- indistinguishable, to that filter,
+# from the `+++ b/<path>` header it exists to drop. The line was discarded
+# UNSCANNED, anywhere in any file, because nothing anchored the filter to the
+# region where a header can occur. Measured 2026-09-05 against origin/main
+# @f036ca83 with the PUBLIC set alone, same payload line, varying only the
+# leading characters of the file content:
+#
+#     leader ''    -> exit 1  caught
+#     leader '+'   -> exit 1  caught
+#     leader '++'  -> exit 0  BYPASSED
+#     leader '+++' -> exit 0  BYPASSED
+#
+# The carrier is ordinary rather than contrived. A patch that edits a patch has
+# its own added lines prefixed twice; the combined diff `git show` prints for a
+# merge commit marks an added line with two columns. Commit either artefact --
+# an evidence directory is full of them -- and every one of its `++` lines
+# reaches the outer diff as `+++` and is dropped. A patch adding an SSH key, an
+# AWS key ID or an internal address passed the gate.
+#
+# The header is now dropped STRUCTURALLY, by hunk boundary; see the v18813 note
+# at the DIFF extraction below for why the one-line textual narrowing was
+# measured and rejected.
+#
 # Regression pins: tools/deny-pattern-tests.sh (registered in
 # tools/workspace-doctor.sh). The installer that ships this scanner into other
 # repos is pinned by tools/install-deny-pattern-tests.sh.
@@ -287,18 +316,78 @@ fi
 # Only scan ADDED lines (start with +). Removed lines (-) are intentionally
 # not scanned because they represent content that is LEAVING the codebase,
 # which is harmless from a leak-prevention standpoint.
-if RAW_DIFF="$(git diff "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
+#
+# v18813 - `--no-ext-diff`. The extraction below reads the unified diff format
+# STRUCTURALLY, which means the output has to actually be unified diff.
+# `diff.external` and `GIT_EXTERNAL_DIFF` replace what `git diff` prints with
+# whatever a third-party tool emits: no `diff --git`, no `@@`, so the parser
+# would find no hunk, produce no added lines, and the run would report a clean
+# tree having read nothing. Neither is reachable from a pull request -- a driver
+# named in .gitattributes must still be DEFINED in git config -- so this is not
+# an attack path so much as a local setting that must not be able to switch the
+# gate off by accident. The old prefix filter degraded differently rather than
+# better; it would have matched whatever the external tool happened to print
+# with a leading `+`. Pinned in tools/deny-pattern-tests.sh.
+if RAW_DIFF="$(git diff --no-ext-diff "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
   :
-elif RAW_DIFF="$(git diff "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
+elif RAW_DIFF="$(git diff --no-ext-diff "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null)"; then
   echo "NOTE: no merge base with $BASE_REF; scanning the two-dot diff instead."
 else
   echo "ERROR: git diff against '$BASE_REF' failed; nothing was scanned." >&2
   exit 2
 fi
 
-# `|| true`: with no added lines both greps exit 1, which under
-# `set -o pipefail` used to kill the script here, one line into its output.
-DIFF="$(printf '%s\n' "$RAW_DIFF" | grep -E '^\+' | grep -v '^+++' || true)"
+# v18813 - drop the diff headers STRUCTURALLY, not by prefix.
+#
+# The old filter was `grep -E '^\+' | grep -v '^+++'`, and its second stage
+# could not tell a header from content: git prefixes an added line with one
+# `+`, so content beginning `++` arrives as `+++` and was removed with the real
+# `+++ b/<path>` header. See the v18813 note in this file's header for the
+# measurement and the carrier.
+#
+# The narrow textual fix -- `grep -vE '^\+\+\+ (a|b)/'` -- was written,
+# measured and REJECTED. It moves the collision instead of removing it:
+# content beginning `++ b/` still arrives as `+++ b/` and is still eaten
+# (measured 2026-09-05: baseline exit 0, narrowed filter exit 0, the parse
+# below exit 1), and the `a/`,`b/` anchor is not a property of the format --
+# `diff.noprefix`, `--no-prefix` and `--src-prefix`/`--dst-prefix` all retire
+# it, at which point the narrowed filter stops dropping the header and starts
+# scanning every file PATH in the tree instead. A gate whose correctness
+# depends on file content never resembling a header is the defect, not the fix.
+#
+# So the boundary is taken from the format's own structure. An added line
+# exists only inside a hunk, and every header line of a file section precedes
+# that section's first `@@`:
+#
+#   * `diff --git ` at column 0 opens a file section and closes any open hunk.
+#     Inside a hunk that text is `+diff --git `, `-diff --git ` or
+#     ` diff --git `, so the unprefixed form cannot occur there.
+#   * `@@` at column 0 opens a hunk. Inside a hunk every line carries an
+#     indicator (` `, `+`, `-`, `\`), so an added line whose content starts
+#     `@@` is `+@@` and cannot be mistaken for a hunk header either.
+#   * Everything else is scanned iff it is inside a hunk and starts with `+`.
+#     `+++ b/<path>` never is: it sits between `diff --git` and the first `@@`.
+#
+# This is a strict SUPERSET of what the old filter kept -- no header line
+# begins with `+` except `+++`, which the hunk boundary excludes on its own --
+# so the change can only ever add lines to the scan. It is also prefix-blind,
+# which the alternative above is not. The other direction is pinned too: a file
+# PATH is still never scanned, because turning this false negative into a false
+# positive on every path in the tree would be its own defect.
+#
+# The `|| true` is gone with the greps that needed it. awk exits 0 on empty
+# input, so the v18790 empty-range behaviour below is now structural rather
+# than a suppressed exit code -- and an awk that cannot run is a configuration
+# error (exit 2) rather than an empty DIFF that reads as a clean scan.
+if ! DIFF="$(printf '%s\n' "$RAW_DIFF" | awk '
+  /^diff --git / { in_hunk = 0; next }
+  /^@@/          { in_hunk = 1; next }
+  in_hunk && /^[+]/ { print }
+')"; then
+  echo "ERROR: could not extract the added lines from the diff against" >&2
+  echo "       '$BASE_REF'; nothing was scanned." >&2
+  exit 2
+fi
 
 if [[ -z "$DIFF" ]]; then
   # Since v18792 there are two ways to land here, and the message must not
