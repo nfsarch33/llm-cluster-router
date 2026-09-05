@@ -305,8 +305,13 @@ func TestRunProxy_ServesAndStopsOnSignal(t *testing.T) {
 		if err != nil && !strings.Contains(err.Error(), "context canceled") {
 			t.Fatalf("runProxy exit = %v, want clean shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("proxy did not stop within 10s of SIGTERM")
+	// 30s for the same reason as the gateway case above: runProxy shuts down
+	// through the same channel.shutdownGrace (15s), so a bound below it makes
+	// this test time out on ITSELF and report "did not stop" for a stop that was
+	// still legitimately in progress. v18815 raised the sibling and left this
+	// one, which is the inconsistency this fixes.
+	case <-time.After(30 * time.Second):
+		t.Fatal("proxy did not stop within 30s of SIGTERM")
 	}
 }
 
