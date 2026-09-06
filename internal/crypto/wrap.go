@@ -34,7 +34,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -134,6 +133,16 @@ type WrapConn struct {
 
 	// tamper counter; read via TamperCount().
 	tamperCount atomic.Uint64
+
+	// Partial-read state. A framed reader over a conn that carries DEADLINES
+	// must be resumable: net/http sets a read deadline between keep-alive
+	// requests, and a timeout that lands mid-record must not consume framing
+	// the next call still needs. hdrN counts prefix bytes already read; frame
+	// and frameN hold the record body being assembled. Touched only by Read.
+	hdr    [4]byte
+	hdrN   int
+	frame  []byte
+	frameN int
 
 	// readBuf holds plaintext decrypted from a record that did not
 	// fit in the caller's Read buffer. The next Read drains this
@@ -246,29 +255,57 @@ func (w *WrapConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(w.Conn, lenBuf[:]); err != nil {
-		return 0, fmt.Errorf("crypto: read length: %w", err)
-	}
-	frameLen := binary.BigEndian.Uint32(lenBuf[:])
-	if frameLen == 0 || frameLen > maxRecord {
-		// A legitimate record is nonce + ciphertext + tag, at most
-		// maxRecord bytes. Anything outside that envelope is a wire
-		// attack (or a desynchronised stream), counted as tampering.
-		w.tamperCount.Add(1)
-		return 0, fmt.Errorf("%w: length %d out of bounds", ErrTampered, frameLen)
+	// Phase 1 -- length prefix, resumable. A timeout here leaves hdrN where it
+	// got to so the next call continues rather than restarting mid-stream.
+	for w.hdrN < len(w.hdr) {
+		n, err := w.Conn.Read(w.hdr[w.hdrN:])
+		w.hdrN += n
+		if err != nil {
+			if isTimeout(err) {
+				return 0, err
+			}
+			w.resetFraming()
+			return 0, fmt.Errorf("crypto: read length: %w", err)
+		}
 	}
 
-	frame := make([]byte, frameLen)
-	if _, err := io.ReadFull(w.Conn, frame); err != nil {
-		// Truncated frame is also a tamper signal.
-		w.tamperCount.Add(1)
-		return 0, fmt.Errorf("%w: %w", ErrShortFrame, err)
+	if w.frame == nil {
+		frameLen := binary.BigEndian.Uint32(w.hdr[:])
+		if frameLen == 0 || frameLen > maxRecord {
+			// A legitimate record is nonce + ciphertext + tag, at most
+			// maxRecord bytes. Anything outside that envelope is a wire
+			// attack (or a desynchronised stream), counted as tampering.
+			w.resetFraming()
+			w.tamperCount.Add(1)
+			return 0, fmt.Errorf("%w: length %d out of bounds", ErrTampered, frameLen)
+		}
+		if frameLen < nonceSize+gcmTagSize {
+			w.resetFraming()
+			w.tamperCount.Add(1)
+			return 0, fmt.Errorf("%w: nonce+tag underrun (%d bytes)", ErrTampered, frameLen)
+		}
+		w.frame = make([]byte, frameLen)
+		w.frameN = 0
 	}
-	if len(frame) < nonceSize+gcmTagSize {
-		w.tamperCount.Add(1)
-		return 0, fmt.Errorf("%w: nonce+tag underrun (%d bytes)", ErrTampered, len(frame))
+
+	// Phase 2 -- record body, resumable for exactly the same reason.
+	for w.frameN < len(w.frame) {
+		n, err := w.Conn.Read(w.frame[w.frameN:])
+		w.frameN += n
+		if err != nil {
+			if isTimeout(err) {
+				return 0, err
+			}
+			// Not a timeout: the stream really ended mid-record. That is a
+			// truncation, which keeps its tamper semantics.
+			w.resetFraming()
+			w.tamperCount.Add(1)
+			return 0, fmt.Errorf("%w: %w", ErrShortFrame, err)
+		}
 	}
+
+	frame := w.frame
+	w.resetFraming()
 
 	nonce := frame[:nonceSize]
 	sealed := frame[nonceSize:]
@@ -320,4 +357,21 @@ func SealTestFrame(aead cipher.AEAD, plaintext []byte) []byte {
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(sealed)))
 	copy(frame[4:], sealed)
 	return frame
+}
+
+// resetFraming clears the partial-read state so the next Read starts at a
+// record boundary.
+func (w *WrapConn) resetFraming() {
+	w.hdrN = 0
+	w.frame = nil
+	w.frameN = 0
+}
+
+// isTimeout reports whether err is a deadline expiry rather than a real
+// transport failure. A timeout must leave framing state intact: net/http sets
+// read deadlines between keep-alive requests, and treating one as a stream
+// error desynchronises the connection for good.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
