@@ -209,11 +209,27 @@ func TestHandleProxy_ReapedUploadReturnsItsQueueSlot(t *testing.T) {
 			t.Fatalf("stall %d: status = %d, want %d: %d would mean the queue gate refused this request before reading it, so a slot from an earlier stall was never returned",
 				i, got, http.StatusRequestTimeout, http.StatusTooManyRequests)
 		}
-		if got := r.queueDepth.Load(); got != 0 {
-			t.Fatalf("stall %d: queue depth = %d after the handler returned, want 0", i, got)
-		}
-		if got := r.buffering.Load(); got != 0 {
-			t.Fatalf("stall %d: buffered bodies = %d after the handler returned, want 0", i, got)
+		// WAIT for the counters rather than reading them, because "after the
+		// handler returned" is not where this code stands. waitFor above returns
+		// the instant statusSpy.WriteHeader appends the code, and WriteHeader runs
+		// INSIDE http.Error -- so handleProxy has not returned yet and its
+		// `defer dequeue()` and buffering release have not run. Reading at that
+		// instant races the handler's own cleanup.
+		//
+		// Measured 2026-09-06 over 480 observations at this exact point: 14 read
+		// 1, and every one of them settled to 0, worst case 572us. Nothing was
+		// ever lost -- the slot was returned a few hundred microseconds after the
+		// test looked. That is why this is a settle window and not a bigger
+		// timeout for slow work.
+		//
+		// It still fails on the defect it was written for. A slot that is never
+		// returned never settles, so a genuine leak exhausts the whole window and
+		// is reported with the value actually observed. The bound is generous
+		// because it costs nothing when the property holds: the first poll
+		// succeeds.
+		if !waitFor(func() bool { return r.queueDepth.Load() == 0 && r.buffering.Load() == 0 }, 10*time.Second) {
+			t.Fatalf("stall %d: queue depth = %d and buffered bodies = %d never returned to 0 within 10s of the handler answering; a slot that is not returned is permanent, and the router answers %d to everyone from then on",
+				i, r.queueDepth.Load(), r.buffering.Load(), http.StatusTooManyRequests)
 		}
 		stalls.release()
 	}
