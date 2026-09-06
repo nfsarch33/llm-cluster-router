@@ -602,14 +602,16 @@ func (s *Server) settleLease(rt *boundRoute, lease *KeyLease, status int, usage 
 		// because retiring there would drain a funded pool over a caller bug.
 		if sig, found := vendorSignalFrom(usage); found {
 			if sig.Retires() {
-				if sig.Class == VendorQuotaWindow && sig.ResetAt.IsZero() {
-					// No vendor-named reset: the store already derives the
-					// window end from the route's budget. Keep that path.
-					kl.retire(lease.Index(), ReasonQuota)
-				} else {
-					kl.retireUntil(lease.Index(),
-						vendorRetireUntil(sig, time.Now(), time.Time{}), sig.Reason())
-				}
+				// Deliberately NOT kl.retire() for a quota signal. That path
+				// parks until the end of the route's ACCOUNTING window, which
+				// is this gateway's own spend bound (5m on the public edge) and
+				// has nothing to do with the provider's plan window. A 2056
+				// parked for 5 minutes returns, draws 2056 again, and walks the
+				// pool -- the exact under-punishment this classifier removes.
+				// vendorRetireUntil answers on the PROVIDER's clock: its own
+				// reset time when it named one, else the documented window.
+				kl.retireUntil(lease.Index(),
+					vendorRetireUntil(sig, time.Now(), time.Time{}), sig.Reason())
 			}
 		} else if isQuotaStatus(status) {
 			kl.retire(lease.Index(), ReasonQuota)
