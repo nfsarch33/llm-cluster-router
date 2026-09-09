@@ -36,16 +36,48 @@ type httpForwarder struct {
 // responses (server-sent events from chat completions) are not cut off
 // mid-stream by a whole-request deadline; the per-request context supplies
 // the overall bound.
+//
+// ResponseHeaderTimeout IS DELIBERATELY UNSET, and that omission is the fix for
+// a defect that silently capped every non-streaming completion through this
+// gateway at sixty seconds.
+//
+// The transport carried ResponseHeaderTimeout: 60s — below every other budget
+// in the path, so it, and none of them, was the effective ceiling. It fired on
+// the one request shape that cannot avoid it. A non-streaming POST to a chat
+// completions endpoint sends NO response header until the entire completion has
+// been generated, so to a header-phase timer a two-minute answer and a hung
+// upstream are the same event. handleProxy turns the resulting transport error
+// into "502 upstream unavailable", which is how a healthy provider, a correct
+// route and a correct credential presented to callers as an outage — and why
+// the ceiling was read for weeks as a provider fault rather than as this line.
+// Every long generation failed; every short one succeeded; nothing in between
+// distinguished them.
+//
+// The bound is not lost with the constant. Forward builds its outbound request
+// with http.NewRequestWithContext on the context handleProxy derives from
+// rt.Route.Timeout, and Config.Validate guarantees that duration is positive on
+// every route, so an upstream that accepts a connection and then says nothing is
+// still cut — at the budget an operator configured, which is the number they
+// meant and the only number they can see. Raising the constant instead would
+// have kept two ceilings for one question and left the lower one invisible;
+// there is now exactly one, and it lives in the config.
+//
+// Streaming was never governed by this timer either way: a streaming upstream
+// sends its headers immediately and only then withholds bytes.
+//
+// The remaining transport timeouts stay: they bound PHASES that no route budget
+// describes. TLSHandshakeTimeout bounds a handshake, IdleConnTimeout reaps a
+// pooled connection nobody is using, and neither can be confused with "how long
+// may this provider think".
 func NewHTTPForwarder() Forwarder {
 	return &httpForwarder{
 		client: &http.Client{
 			CheckRedirect: refuseRedirect,
 			Transport: &http.Transport{
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 60 * time.Second,
-				IdleConnTimeout:       90 * time.Second,
-				MaxIdleConnsPerHost:   8,
-				ForceAttemptHTTP2:     true,
+				TLSHandshakeTimeout: 10 * time.Second,
+				IdleConnTimeout:     90 * time.Second,
+				MaxIdleConnsPerHost: 8,
+				ForceAttemptHTTP2:   true,
 			},
 		},
 	}
