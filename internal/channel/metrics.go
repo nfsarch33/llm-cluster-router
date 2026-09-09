@@ -60,12 +60,26 @@ var AdmissionRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 //
 // The class label is errorClass(err) verbatim — timeout, canceled, refused,
 // dns, tls, upstream_error — so one vocabulary spans the series, the audit
-// line's error field and the runbook. Note what class="timeout" now means:
-// with no ceiling left in the transport, the deadline that fires is the route
-// budget and nothing else, so the series says "this route's configured budget
-// was too small for what the provider was asked to generate" rather than
-// pointing at a constant no operator can see. That is what makes it worth
-// alerting on.
+// line's error field and the runbook.
+//
+// class="timeout" is worth alerting on, with one caveat stated here rather than
+// discovered later. errorClass cannot tell a route-budget deadline from a
+// transport header ceiling: Go wraps the latter in an error whose Is method
+// reports context.DeadlineExceeded, so both land on this label. The reason the
+// series is nonetheless readable as "this route's budget is too small for what
+// the provider was asked to generate" is that the transport no longer HAS a
+// header ceiling, and NewHTTPForwarder's absence of one is pinned structurally
+// by a test. The guarantee is that pin, not the classifier.
+//
+// EXPOSITION IS NOT WIRED. This family, like the two above it, is registered by
+// the gateway command on the default registerer — and the gateway process
+// serves no /metrics endpoint, so nothing scrapes any of them today. The
+// counter is therefore correct, incremented, and currently unreadable from
+// outside the process. Adding an endpoint is not a drive-by change: this
+// server's public listener answers /healthz anonymously by design, and route
+// names and key-inventory sizes are not things to hand to an unauthenticated
+// caller, so it needs a deliberate decision about where it binds and who may
+// read it.
 var ForwardFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "llm_cluster_router",
 	Name:      "helixchannel_forward_failed_total",

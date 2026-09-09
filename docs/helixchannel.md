@@ -1137,11 +1137,27 @@ twice so the two cannot drift:
 | `canceled` | the caller went away first | do not page |
 | `upstream_error` | anything else the transport reported | investigate |
 
-It exists because until it did, the gateway emitted **nothing countable** for a
-failed request: `handleProxy` wrote its audit line and returned. On the metrics,
-an upstream failing every request and an upstream receiving no requests were the
-same picture — the absence of success — and the NDJSON that held the answer was
-scraped by nothing.
+It exists because until it did, the gateway *recorded* nothing countable for a
+failed request: `handleProxy` wrote its audit line and returned.
+
+**Read the next paragraph before writing an alert against any of these three.**
+The gateway process serves **no `/metrics` endpoint** — `Server.Handler`
+dispatches CONNECT, `/healthz`, `/health` and the proxy, and the `gateway`
+command imports no exposition handler. All three families are registered on the
+default registerer and none of them is scraped from this process today. They are
+correct and they are incremented; they are not yet readable from outside it.
+
+Wiring an endpoint is a deliberate decision, not a follow-up detail. This
+server's public listener answers `/healthz` anonymously on purpose, and route
+names, key-inventory sizes and per-route failure counts are not things to hand
+to an unauthenticated caller — so it needs an answer to *which* listener it
+binds on and who may read it, not just an added route.
+
+A note on reading `class="timeout"`: `errorClass` cannot distinguish a
+route-budget deadline from a transport header ceiling, because Go wraps the
+latter in an error whose `Is` reports `context.DeadlineExceeded`. What makes the
+series unambiguous is that the transport no longer carries a header ceiling, and
+that absence is pinned by a test rather than by the classifier.
 
 That blind spot had a cost worth recording. The outbound transport carried a
 hardcoded `ResponseHeaderTimeout` of 60s, below every other budget in the path.

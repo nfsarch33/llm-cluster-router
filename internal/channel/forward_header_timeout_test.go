@@ -162,12 +162,25 @@ func TestForward_SlowHeaderUpstreamSucceeds(t *testing.T) {
 // fix, and the one that would matter if this change were wrong: removing the
 // transport ceiling must not leave a stalled upstream unbounded.
 //
-// It also pins the classification. The deadline that fires is now the route
-// budget, so the failure arrives as context.DeadlineExceeded and errorClass
-// calls it "timeout" — in the audit line and on the counter alike. Under the
-// old constant the same stall produced "upstream_error", which is a sentence
-// about the provider rather than about the configuration, and it is the reason
-// a mis-set budget was not diagnosable from the telemetry.
+// It records the classification, and is deliberately explicit about what that
+// does NOT prove. The failure arrives as context.DeadlineExceeded, so
+// errorClass calls it "timeout" in the audit line and on the counter alike —
+// but errorClass CANNOT DISTINGUISH THE TWO CLOCKS. Go's transport wraps a
+// ResponseHeaderTimeout in an error whose Is method reports
+// context.DeadlineExceeded, so a header ceiling produced "timeout" too. Every
+// assertion below is satisfied by either clock, and with a 250ms budget against
+// a 3s stall the old 60s constant could never have fired here at all.
+//
+// So this test does not, and cannot, guard the removed constant. The guard is
+// TestNewHTTPForwarder_NoResponseHeaderCeiling, which pins the field
+// structurally; that is the arm the mutation kills. What this one pins is the
+// property that would matter if the change were WRONG — that a stalled upstream
+// is still cut, promptly, by the configured budget, and counted once.
+//
+// Spelling that out is the point. The audit vocabulary has one word for two
+// different clocks, which is exactly why the sixty-second ceiling was never
+// read off the telemetry: the lines said "timeout" truthfully while the only
+// tell that it was the wrong clock was a latency matching no configured budget.
 func TestForward_RouteBudgetStillBoundsASilentUpstream(t *testing.T) {
 	t.Parallel()
 	const (
