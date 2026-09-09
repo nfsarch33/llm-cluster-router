@@ -528,13 +528,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.forwarder.Forward(ctx, r, fwdRoute)
 	if err != nil {
+		// One classification, used twice: the audit line and the counter must
+		// never be able to disagree about why a request failed, and computing
+		// it once is what guarantees that rather than leaving it to a future
+		// edit to keep two call sites in step.
+		class := errorClass(err)
+		ForwardFailedTotal.WithLabelValues(rt.Route.Name, class).Inc()
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		event := AuditEvent{
 			Event: "proxy_request", RequestID: requestID, Route: rt.Route.Name,
 			AuthMode: string(rt.Auth.Mode()), Method: r.Method, Path: r.URL.Path,
 			Upstream: rt.Route.Upstream, Status: http.StatusBadGateway,
 			LatencyMS: time.Since(start).Milliseconds(), ClientAddr: s.auditClientAddr(r),
-			Error: errorClass(err),
+			Error: class,
 		}
 		// The 502 line carries the key index too: during a per-key outage,
 		// which account failed is exactly what an operator needs.

@@ -39,13 +39,46 @@ var AdmissionRefusedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help:      "HelixChannel requests refused before any upstream call, by route and reason (keys_exhausted|admission_limited|tunnels_at_capacity).",
 }, []string{"route", "reason"})
 
+// ForwardFailedTotal counts upstream round trips that produced no response at
+// all, by route and failure class.
+//
+// Registered name: llm_cluster_router_helixchannel_forward_failed_total.
+//
+// Every increment here is a 502 a caller received. Until this existed the
+// gateway emitted NOTHING countable for that outcome — handleProxy wrote its
+// audit line and returned — so on the metrics an upstream failing every request
+// and an upstream receiving no requests were the same picture: the absence of
+// success. That blind spot is how a sixty-second header-phase ceiling in the
+// outbound transport went unattributed while it failed every long completion
+// the gateway was asked to relay. The NDJSON always held the answer; nothing
+// scraped the NDJSON.
+//
+// It is deliberately NOT the inverse of a success counter. Requests refused
+// before any upstream call are AdmissionRefusedTotal's, and keeping the two
+// apart is what lets an operator separate "we could not reach the provider"
+// from "we would not ask it" — different pages, different fixes.
+//
+// The class label is errorClass(err) verbatim — timeout, canceled, refused,
+// dns, tls, upstream_error — so one vocabulary spans the series, the audit
+// line's error field and the runbook. Note what class="timeout" now means:
+// with no ceiling left in the transport, the deadline that fires is the route
+// budget and nothing else, so the series says "this route's configured budget
+// was too small for what the provider was asked to generate" rather than
+// pointing at a constant no operator can see. That is what makes it worth
+// alerting on.
+var ForwardFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "llm_cluster_router",
+	Name:      "helixchannel_forward_failed_total",
+	Help:      "HelixChannel upstream round trips that returned no response, by route and class (timeout|canceled|refused|dns|tls|upstream_error).",
+}, []string{"route", "class"})
+
 // RegisterMetrics registers the channel metrics with reg.
 //
 // Registration is the caller's choice rather than an init() so a test can use
 // prometheus.NewRegistry() and so importing this package never mutates the
 // default registry.
 func RegisterMetrics(reg prometheus.Registerer) error {
-	for _, c := range []prometheus.Collector{KeyRetiredTotal, AdmissionRefusedTotal} {
+	for _, c := range []prometheus.Collector{KeyRetiredTotal, AdmissionRefusedTotal, ForwardFailedTotal} {
 		if err := reg.Register(c); err != nil {
 			return err
 		}

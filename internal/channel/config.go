@@ -429,6 +429,16 @@ func (c *Config) Validate() error {
 	if c.Listen == "" {
 		return fmt.Errorf("listen: required")
 	}
+	// A negative budget is rejected rather than normalised. Since the outbound
+	// transport no longer carries a header-phase ceiling of its own (see
+	// NewHTTPForwarder), the duration validated here is the ONLY thing that
+	// bounds a request against an upstream that has gone quiet — so a value
+	// that cannot express a bound is a configuration error, not a default to
+	// silently substitute. Zero keeps its documented meaning, "use the
+	// default"; there is deliberately no spelling for "never give up".
+	if c.Timeout < 0 {
+		return fmt.Errorf("timeout must not be negative (got %v); omit the key for the default of %v", c.Timeout, DefaultTimeout)
+	}
 	if c.Timeout == 0 {
 		c.Timeout = DefaultTimeout
 	}
@@ -457,6 +467,9 @@ func (c *Config) Validate() error {
 		}
 		seenName[r.Name] = true
 		seenPrefix[r.Prefix] = true
+		if r.Timeout < 0 {
+			return fmt.Errorf("route %q: timeout must not be negative (got %v); omit the key to inherit the server budget of %v", r.Name, r.Timeout, c.Timeout)
+		}
 		if r.Timeout == 0 {
 			r.Timeout = c.Timeout
 		}

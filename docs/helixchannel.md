@@ -480,7 +480,13 @@ single-key route.
 
 ```yaml
 listen: "127.0.0.1:14445"    # a non-loopback bind REQUIRES gateway_auth below
-timeout: 90s
+timeout: 90s                 # the ONLY ceiling on an upstream round trip; a
+                             # per-route timeout overrides it. Size it above the
+                             # longest generation the route must serve — a
+                             # non-streaming completion sends no header until it
+                             # has finished, so this budget, not any transport
+                             # setting, is what cuts a slow answer. Negative is
+                             # rejected; 0 means "inherit".
 audit_log: /var/log/helixchannel/gateway.ndjson   # empty = stdout
 
 # Only when a same-host TLS terminator (nginx, Caddy) relays PUBLIC traffic
@@ -1081,6 +1087,7 @@ answers the same 503 with `Retry-After`.
 ```
 llm_cluster_router_helixchannel_key_retired_total{route,reason}
 llm_cluster_router_helixchannel_admission_refused_total{route,reason}
+llm_cluster_router_helixchannel_forward_failed_total{route,class}
 ```
 
 The first counts **keys leaving rotation**. `reason` is one of:
@@ -1115,6 +1122,47 @@ increments `quota` once, not once per response. Without that rule the minimal
 documented block (`rotation: {}`, no `budget.window`) inflated the series by the
 concurrency factor — 60 increments for two real retirements — which made the
 alerting surface unusable on the default configuration.
+
+The third counts **upstream round trips that produced no response at all** —
+every one of them a `502 upstream unavailable` a caller received. Its `class` is
+the same word the audit line's `error` field carries, computed once and used
+twice so the two cannot drift:
+
+| class | meaning | alert |
+|---|---|---|
+| `timeout` | the route's `timeout` budget was exceeded | investigate — usually the budget, not the provider |
+| `refused` | nothing listening at the upstream address | page |
+| `dns` | the upstream name did not resolve | page |
+| `tls` | handshake or certificate failure | page |
+| `canceled` | the caller went away first | do not page |
+| `upstream_error` | anything else the transport reported | investigate |
+
+It exists because until it did, the gateway emitted **nothing countable** for a
+failed request: `handleProxy` wrote its audit line and returned. On the metrics,
+an upstream failing every request and an upstream receiving no requests were the
+same picture — the absence of success — and the NDJSON that held the answer was
+scraped by nothing.
+
+That blind spot had a cost worth recording. The outbound transport carried a
+hardcoded `ResponseHeaderTimeout` of 60s, below every other budget in the path.
+A non-streaming completion sends no response header until generation finishes,
+so **every generation longer than a minute failed** while every short one
+succeeded, and the failures surfaced to callers as a provider outage. The
+constant is gone: the per-request context derived from the route's `timeout` is
+now the only ceiling on how long an upstream may think, which is why `class`
+`timeout` is worth an alert — it now means *this route's configured budget is
+too small*, a sentence an operator can act on, rather than pointing at a number
+no configuration file contains.
+
+**What bounds a request, after the fix.** The route's `timeout` (or the
+top-level `timeout` it inherits) is the whole of it. `TLSHandshakeTimeout` and
+`IdleConnTimeout` remain on the transport because they bound *phases* no route
+budget describes — a handshake that never completes, a pooled connection nobody
+is using — and neither can be mistaken for "how long may this provider think".
+A budget long enough for the longest generation a route must serve is therefore
+a **required** part of onboarding a completions upstream, not a tuning
+afterthought; `Validate` rejects a negative one, since with no second ceiling
+behind it a budget that cannot express a bound is a configuration error.
 
 Registration is explicit — `channel.RegisterMetrics(reg)` — rather than an
 `init()`, so importing the package never mutates the default Prometheus
