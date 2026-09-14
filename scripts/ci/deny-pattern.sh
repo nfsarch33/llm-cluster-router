@@ -756,15 +756,47 @@ fi
 #
 # Pinned in tools/deny-pattern-tests.sh, "DEFECT 6 (v18811)", for both public
 # slugs and in both directions.
+# v18836 - the repo's own module path is not the only one it is REQUIRED to
+# publish. A Go module that depends on a sibling repository under the same
+# owner must name that path in go.mod, go.sum and every importing file, so the
+# handle appears in the tree by construction and every future diff touching
+# those imports would match the operator-handle pattern forever. Measured on
+# sprintboard-mcp: a single added import line failed the gate while the same
+# path already sat on main in five files.
+#
+# Sibling paths are therefore neutralised TOO -- but only the ones the repo
+# ALREADY declares in go.mod AT THE BASE REF. A dependency the diff itself
+# introduces is not in the base go.mod and still matches, so "this PR starts
+# naming another repository under the handle" remains a finding. That is the
+# whole difference between recognising what the repo already publishes and
+# blanket-suppressing the handle.
+#
+# Only the ROOT go.mod is read. A module in a subdirectory is not consulted,
+# which can only ever neutralize LESS.
 SCAN_DIFF="$DIFF"
 OWN_MODULE_PATH=""
+NEUTRALIZED_SLUGS=()
+SIBLING_SLUG_COUNT=0
 if [[ -n "$REPO_SLUG" ]]; then
   OWN_MODULE_PATH="github.com/$REPO_SLUG"
+  NEUTRALIZED_SLUGS=("$REPO_SLUG")
+  OWNER_RE="${REPO_SLUG%%/*}"
+  OWNER_RE="${OWNER_RE//./\\.}"
+  while IFS= read -r sibling_slug; do
+    [[ -n "$sibling_slug" ]] || continue
+    [[ "$sibling_slug" == "$REPO_SLUG" ]] && continue
+    NEUTRALIZED_SLUGS+=("$sibling_slug")
+    SIBLING_SLUG_COUNT=$((SIBLING_SLUG_COUNT + 1))
+  done < <(git show "${BASE_REF}:go.mod" 2>/dev/null \
+             | grep -aoE "github[.]com/${OWNER_RE}/[A-Za-z0-9._-]+" \
+             | sed -E 's#^github[.]com/##' | sort -u)
   # Escape the one ERE metacharacter a GitHub owner/repo slug can carry (`.`)
   # so a literal dot in a repo name cannot widen the removal.
-  SLUG_RE="${REPO_SLUG//./\\.}"
-  SCAN_DIFF="$(printf '%s\n' "$DIFF" \
-    | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])# \\1#gI; s#github\\.com/${SLUG_RE}\$# #gI")"
+  for neutralized_slug in "${NEUTRALIZED_SLUGS[@]}"; do
+    SLUG_RE="${neutralized_slug//./\\.}"
+    SCAN_DIFF="$(printf '%s\n' "$SCAN_DIFF" \
+      | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])# \\1#gI; s#github\\.com/${SLUG_RE}\$# #gI")"
+  done
   # The two copies must stay line-for-line aligned: a MATCH block below is
   # located in SCAN_DIFF and then REPORTED from DIFF by line number, and a
   # misattributed line is precisely this file's recurring failure — a gate
@@ -795,9 +827,18 @@ fi
 # docs/security/anti-leak.md; widening this test would suppress MORE, which is
 # the direction that costs false negatives.
 pattern_reads_neutralized() { # $1 = pattern
-  [[ -n "$OWN_MODULE_PATH" ]] || return 1
+  [[ ${#NEUTRALIZED_SLUGS[@]} -gt 0 ]] || return 1
   case "$1" in *"|"*) return 1 ;; esac
-  printf '%s\n' "$OWN_MODULE_PATH" | grep -qiE -- "$1"
+  # ANY neutralised path being a string this pattern matches is enough: the
+  # neutralised copy has every one of them removed, so the pattern must read
+  # that copy or it would report a line the scanned text no longer contains.
+  local candidate
+  for candidate in "${NEUTRALIZED_SLUGS[@]}"; do
+    if printf '%s\n' "github.com/$candidate" | grep -qiE -- "$1"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # PUBLIC deny patterns (case-insensitive extended regex).
@@ -921,6 +962,11 @@ if [[ -n "$OWN_MODULE_PATH" ]]; then
     fi
   done
   echo "Neutralizing this repo's own public module path github.com/$REPO_SLUG for $NEUTRALIZED_FOR of ${#PATTERNS[@]} pattern(s) - the ones that string trips by itself (public by construction; see docs/security/anti-leak.md)"
+  if [[ "$SIBLING_SLUG_COUNT" -gt 0 ]]; then
+    # The count, not the paths: this output reaches public CI logs, and the
+    # count is what tells a reader whether the base go.mod was read at all.
+    echo "Also neutralizing $SIBLING_SLUG_COUNT sibling module path(s) this repo's go.mod already declares at $BASE_REF - a dependency ADDED by the diff is NOT neutralized and still matches"
+  fi
 fi
 
 MATCHED=0
