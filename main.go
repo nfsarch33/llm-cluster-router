@@ -160,6 +160,24 @@ type router struct {
 	// restart, like listen and metrics_addr.
 	liveGateOnce sync.Once
 	liveGate     *health.ProbeLimiter
+
+	// attribution records per-agent counts and latencies from the
+	// X-Helixon-Agent identity header (v18846-5). Nil-safe: a router
+	// assembled without newRouter (tests, embedded callers) simply does
+	// not attribute.
+	attribution *proxy.Attribution
+}
+
+// promAttributionSink adapts the attribution drainer to the Prometheus
+// collectors. It runs ONLY on the drainer goroutine, never on the relay path.
+type promAttributionSink struct{}
+
+func (promAttributionSink) Inc(agent string) {
+	metrics.RequestsByAgentTotal.WithLabelValues(agent).Inc()
+}
+
+func (promAttributionSink) Observe(agent string, d time.Duration) {
+	metrics.AgentRequestDuration.WithLabelValues(agent).Observe(d.Seconds())
 }
 
 // routerSnap is the consistent view of the reloadable router state
@@ -628,6 +646,9 @@ func newRouter(cfg config) (*router, error) {
 		client:    client,
 		semaphore: sem,
 		nodes:     nodes,
+		// v18846-5: metadata-only per-agent attribution. The drainer owns
+		// the sink; the relay path only offers events to its buffer.
+		attribution: proxy.NewAttribution(promAttributionSink{}, 1024),
 	}
 	smart, err := loadSmartRoute(cfg)
 	if err != nil {
@@ -1089,6 +1110,12 @@ func (r *router) doUpstream(ctx context.Context, snap routerSnap, node *upstream
 // not an admission one.
 func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
+
+	// v18846-5 seam: metadata-only per-agent attribution. Reads one header,
+	// offers one buffered event, and never holds the relay semaphore; the
+	// drop-on-full path means a wedged drainer cannot wedge the relay.
+	attribAgent := proxy.AgentFromHeader(req.Header)
+	defer r.attribution.Record(attribAgent, start)
 
 	// Snapshot the reloadable state once at the top so the entire
 	// request runs against a consistent config even if SIGHUP fires
