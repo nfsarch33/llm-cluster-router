@@ -94,6 +94,21 @@ var (
 		Help: "Requests rejected by the bearer-token auth middleware (401).",
 	}, []string{"path"})
 
+	// v18846-5 metadata-only attribution: counts and latencies by the
+	// X-Helixon-Agent identity header ONLY. No bodies, no other headers, no
+	// keys; requests without the header are absent from these families by
+	// design (that absence is the signal for the unattributed majority).
+	RequestsByAgentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hlxn_router_requests_by_agent_total",
+		Help: "Requests attributed to a Helixon agent via the X-Helixon-Agent identity header. Metadata only: no bodies, no other headers, no keys.",
+	}, []string{"agent"})
+
+	AgentRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "hlxn_router_agent_request_duration_seconds",
+		Help:    "End-to-end request duration by Helixon agent (identity header label; LLM-tuned buckets).",
+		Buckets: LLMRouterBuckets,
+	}, []string{"agent"})
+
 	// LiveProbeThrottledTotal counts /healthz?live=1 requests that were
 	// served the cached health view because the forced-probe rate bound
 	// was exhausted. Those requests still answer 200, so this counter is

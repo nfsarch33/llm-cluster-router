@@ -220,6 +220,7 @@ Release readiness criteria live in [docs/release-readiness.md](docs/release-read
 ## Security
 
 - Credentials are read from environment variables or files, never from argv, and are not written to logs. Audit records carry request metadata only — no bodies, no headers, no keys.
+- Per-agent attribution counters (`hlxn_router_requests_by_agent_total`, `hlxn_router_agent_request_duration_seconds`) label by the caller-supplied `X-Helixon-Agent` identity header only — a bounded, charset-sanitised label; requests without it are absent from these families.
 - The HelixChannel gateway replaces (rather than appends to) the caller's `Authorization` header in `inject` mode, so a client cannot reach the upstream as a different account.
 - The CONNECT tunnel requires a shared token and an explicit host allowlist; an empty allowlist is rejected at startup rather than becoming an open relay.
 - Container images run as a non-root user with a read-only root filesystem and no added capabilities.
