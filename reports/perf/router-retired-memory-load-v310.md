@@ -1,11 +1,11 @@
-# v310 Router + Mem0 Synthetic Load Evidence
+# v310 Router + Retired-Memory-Service Synthetic Load Evidence
 
 Recorded: 2026-05-07T23:56:00+10:00
 
 ## Scope
 
 This report records the v310 synthetic-load evidence that is safe to run without
-touching external Mem0 admin surfaces.
+touching the retired memory service admin surfaces.
 
 ## Router Synthetic Load
 
@@ -24,16 +24,16 @@ Validation command:
 runx worktree run --repo router --branch test/v310-synthetic-load-smoke-2026-05-07 -- go test ./...
 ```
 
-## Mem0 OSS Load
+## Retired-Memory-Service OSS Load
 
-Live Mem0 OSS `/search` load was not run in this story. The active external
-blockers remain Mem0 admin setup/quota and OCI compute capacity/subscription,
+Live retired-service `/search` load was not run in this story. The active external
+blockers remained the retired service admin setup/quota and OCI compute capacity/subscription,
 as recorded in the v309 KPI and v308 RED handoff. Git KB evidence remains the
-source of truth until Mem0 dual-store and live load are unblocked.
+source of truth until the Engram cutover and live load were unblocked.
 
 ## Acceptance Status
 
 Router synthetic load: implemented and testable.
 
-Mem0 OSS sustained hit-rate proof: deferred until Mem0 admin/quota state is
+Sustained hit-rate proof for the retired service: deferred until its admin/quota state was
 green.
