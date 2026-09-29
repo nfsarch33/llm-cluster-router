@@ -862,6 +862,12 @@ PATTERNS=(
   '10\.[0-9]+\.[0-9]+\.[0-9]+|RFC1918 internal IP'
   '192[.]168[.][0-9]+\.[0-9]+|RFC1918 internal IP'
   '172[.](1[6-9]|2[0-9]|3[01])[.][0-9]+\.[0-9]+|RFC1918 internal IP'
+  # The retired memory service term (ADR-063): written as a character class
+  # so THIS pattern line does not itself contain the literal the repo-wide
+  # git-grep gate forbids (that gate has no allowlist; the class also cannot
+  # match its own bracketed text, so the scanner never self-matches). The
+  # trailing character is the DIGIT zero: 'memory'/'memo' must not match.
+  '[mM]em0|retired memory service term (use Engram; ADR-063)'
 )
 PUBLIC_COUNT="${#PATTERNS[@]}"
 
