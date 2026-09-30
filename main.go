@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -411,13 +412,7 @@ func (n *upstreamNode) AllowsClass(c proxy.WorkloadClass) bool {
 	if len(n.cfg.Workloads) == 0 {
 		return true
 	}
-	want := string(c)
-	for _, w := range n.cfg.Workloads {
-		if w == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(n.cfg.Workloads, string(c))
 }
 
 // nextAPIKey returns the next API key via round-robin when multiple
@@ -1252,14 +1247,17 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 
 	class := proxy.ClassFromRequest(req)
 	if class == proxy.ClassCustomer {
-		// Section C item 2: customer requests carry a tenant id; the
-		// router logs it and the cost ledger keys on it. Without it the
-		// request cannot be attributed and is refused.
-		if strings.TrimSpace(req.Header.Get("X-HLXN-Tenant")) == "" {
+		// Paid client work must be attributable: customer requests carry
+		// a tenant id (the cost ledger keys on it) and are refused
+		// without one. The tenant labels the request counter so usage is
+		// attributable per client in the metrics.
+		tenant := strings.TrimSpace(req.Header.Get("X-HLXN-Tenant"))
+		if tenant == "" {
 			http.Error(w, `{"error":"X-HLXN-Tenant header required for customer requests"}`, http.StatusBadRequest)
 			requestsTotal.WithLabelValues("unknown", "none", "customer_tenant_missing").Inc()
 			return
 		}
+		slog.Info("router.customer_request", "tenant", tenant, "model_hint", extractModel(body), "tier", req.Header.Get("X-Tier"))
 	}
 	tier := req.Header.Get("X-Tier")
 	if snap.smart != nil {
@@ -1281,7 +1279,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	model := extractModel(body)
 	node := r.selectNodeFromSnap(snap, model, tier, "", class)
 	if node == nil {
-		// Section C item 4: fail closed per class. A customer request
+		// Fail closed per class. A customer request
 		// with no healthy customer-eligible node must never spill to an
 		// internal-only (token-plan) node: it gets a retryable 503 and
 		// the job queue holds it.
@@ -1641,8 +1639,8 @@ func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier 
 	buckets := make(map[int]*bucket)
 	for _, node := range snap.nodes {
 		// Workload class filters BEFORE tier, weight and model: a
-		// customer request can never land on an internal-only node,
-		// whatever tier or model it asks for (section C item 3).
+		// customer request can never land on an internal-only node
+		// (the paid-plan nodes), whatever tier or model it asks for.
 		if !node.AllowsClass(class) {
 			continue
 		}

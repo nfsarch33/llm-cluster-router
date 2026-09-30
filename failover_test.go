@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 )
 
 // testCtx returns a background context for direct runHealthPass calls in unit

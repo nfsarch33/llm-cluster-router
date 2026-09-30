@@ -2,9 +2,10 @@ package main
 
 import (
 	"errors"
-	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"testing"
 	"time"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 )
 
 // TestCircuitBreaker_OpensOnConsecutiveFailures asserts that after

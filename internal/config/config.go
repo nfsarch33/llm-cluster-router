@@ -515,8 +515,26 @@ func LoadConfig(path string) (Config, error) {
 		if err := validateAuthHeader(cfg.Nodes[i]); err != nil {
 			return cfg, err
 		}
+		if err := validateWorkloads(cfg.Nodes[i]); err != nil {
+			return cfg, err
+		}
 	}
 	return cfg, nil
+}
+
+// validateWorkloads rejects unknown workload classes at LOAD time: a typo
+// like "internl" would otherwise remove the node from both classes
+// silently, and the failure would only surface as missing capacity at
+// dispatch.
+func validateWorkloads(n NodeConfig) error {
+	for _, w := range n.Workloads {
+		switch w {
+		case "internal", "customer":
+		default:
+			return fmt.Errorf("node %s: workloads entry %q is not one of internal|customer", n.Name, w)
+		}
+	}
+	return nil
 }
 
 // validateAuthHeader enforces the auth_header admission rules described

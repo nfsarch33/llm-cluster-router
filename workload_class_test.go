@@ -19,7 +19,7 @@ func tokenPlanNode(t *testing.T, hits *atomic.Int64) *upstreamNode {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"m3","choices":[{"message":{"role":"assistant","content":"token-plan"}}]}`)
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"m3","choices":[{"message":{"role":"assistant","content":"token-plan"}}]}`)
 	}))
 	t.Cleanup(srv.Close)
 	n := newTestNode(t, "token-plan", srv.URL, "3", 1, 1, []string{"m3"}, 0, 0, nil)
@@ -39,24 +39,12 @@ func classRouter(nodes ...*upstreamNode) *router {
 }
 
 func doChatClass(r *router, model, token, tenant string, spoofHeader bool) (*httptest.ResponseRecorder, string) {
-	body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}]}`, model)
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	if tenant != "" {
-		req.Header.Set("X-HLXN-Tenant", tenant)
-	}
+	// the spoofing wrapper: a customer caller relabelling itself internal
+	classHeader := ""
 	if spoofHeader {
-		// a caller trying to relabel itself internal — must be ignored
-		req.Header.Set("X-Workload-Class", "internal")
+		classHeader = "internal"
 	}
-	w := httptest.NewRecorder()
-	// run the class middleware exactly as the server does, then the proxy
-	proxy.ClassBearerAuthFunc(func() string { return "internal-tok" }, func() []string { return []string{"customer-tok"} })(
-		r.handleProxy)(w, req)
-	return w, w.Body.String()
+	return doChatClassHeader(r, model, token, tenant, classHeader)
 }
 
 // TestCustomerTrafficNeverReachesTokenPlanNode (section C item 8, the
@@ -160,7 +148,7 @@ func TestCustomerRoutesToEligibleNodeWhenHealthy(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		custHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"x","model":"qwen","choices":[{"message":{"role":"assistant","content":"local"}}]}`)
+		_, _ = fmt.Fprint(w, `{"id":"x","model":"qwen","choices":[{"message":{"role":"assistant","content":"local"}}]}`)
 	}))
 	t.Cleanup(up.Close)
 	r := classRouter(tp, customerNode(t, up, true))
