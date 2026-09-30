@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"testing"
 	"time"
 )
@@ -139,7 +140,7 @@ func TestSelectNode_SkipsBrokenCircuit(t *testing.T) {
 	}
 
 	snap := r.snap()
-	picked := r.selectNodeFromSnap(snap, "alpha", "", "")
+	picked := r.selectNodeFromSnap(snap, "alpha", "", "", proxy.ClassInternal)
 	if picked == nil {
 		t.Fatal("selectNodeFromSnap returned nil even though one node is healthy")
 	}

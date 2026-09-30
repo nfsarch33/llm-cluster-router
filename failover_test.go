@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -168,12 +169,12 @@ func TestSelectNodeFromSnapExcluding_SkipsExcludedSet(t *testing.T) {
 	snap := r.snap()
 
 	excluded := map[string]struct{}{"a": {}}
-	got := r.selectNodeFromSnapExcluding(snap, model, "", excluded)
+	got := r.selectNodeFromSnapExcluding(snap, model, "", excluded, proxy.ClassInternal)
 	if got == nil || got.cfg.Name != "b" {
 		t.Fatalf("expected node b when a excluded, got %v", got)
 	}
 	excluded["b"] = struct{}{}
-	if got := r.selectNodeFromSnapExcluding(snap, model, "", excluded); got != nil {
+	if got := r.selectNodeFromSnapExcluding(snap, model, "", excluded, proxy.ClassInternal); got != nil {
 		t.Fatalf("expected nil when all nodes excluded, got %s", got.cfg.Name)
 	}
 }
