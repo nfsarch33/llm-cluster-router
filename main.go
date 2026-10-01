@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -221,6 +222,14 @@ func (r *router) AuthToken() string {
 	return r.cfg.AuthToken
 }
 
+// CustomerTokens snapshots the credentials that map to the customer
+// workload class (SIGHUP-rotatable like the auth token).
+func (r *router) CustomerTokens() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]string(nil), r.cfg.CustomerTokens...)
+}
+
 // Reload re-reads the on-disk config at path, builds a new node set
 // + http.Client + semaphore from it, and atomically swaps them in.
 // On any error -- file read, YAML parse, validation, node URL parse
@@ -397,6 +406,15 @@ type upstreamNode struct {
 	tunnelClient *http.Client
 }
 
+// AllowsClass reports whether the node may serve the workload class. An
+// empty Workloads list accepts both classes (backwards compatible).
+func (n *upstreamNode) AllowsClass(c proxy.WorkloadClass) bool {
+	if len(n.cfg.Workloads) == 0 {
+		return true
+	}
+	return slices.Contains(n.cfg.Workloads, string(c))
+}
+
 // nextAPIKey returns the next API key via round-robin when multiple
 // keys are configured (api_keys), falls back to the single api_key,
 // or returns "" when no key is set.
@@ -515,7 +533,7 @@ func runServe(args []string) error {
 	proxy.SetAuthRejectHook(func(path string) {
 		metrics.AuthRejectedTotal.WithLabelValues(path).Inc()
 	})
-	authWrap := bearerAuthFunc(r.AuthToken)
+	authWrap := proxy.ClassBearerAuthFunc(r.AuthToken, r.CustomerTokens)
 
 	mux := serveMux(r, authWrap)
 
@@ -935,11 +953,15 @@ func warnUnboundedBodyRead(err error) {
 	})
 }
 
-func (r *router) handleModels(w http.ResponseWriter, _ *http.Request) {
+func (r *router) handleModels(w http.ResponseWriter, req *http.Request) {
 	snap := r.snap()
+	class := proxy.ClassFromRequest(req)
 	seen := make(map[string]struct{})
 	models := make([]map[string]string, 0)
 	for _, node := range snap.nodes {
+		if !node.AllowsClass(class) {
+			continue
+		}
 		if !node.healthy.Load() {
 			continue
 		}
@@ -1223,6 +1245,20 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	class := proxy.ClassFromRequest(req)
+	if class == proxy.ClassCustomer {
+		// Paid client work must be attributable: customer requests carry
+		// a tenant id (the cost ledger keys on it) and are refused
+		// without one. The tenant labels the request counter so usage is
+		// attributable per client in the metrics.
+		tenant := strings.TrimSpace(req.Header.Get("X-HLXN-Tenant"))
+		if tenant == "" {
+			http.Error(w, `{"error":"X-HLXN-Tenant header required for customer requests"}`, http.StatusBadRequest)
+			requestsTotal.WithLabelValues("unknown", "none", "customer_tenant_missing").Inc()
+			return
+		}
+		slog.Info("router.customer_request", "tenant", tenant, "model_hint", extractModel(body), "tier", req.Header.Get("X-Tier"))
+	}
 	tier := req.Header.Get("X-Tier")
 	if snap.smart != nil {
 		agent := smartroute.DetectAgent(req)
@@ -1241,8 +1277,18 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	model := extractModel(body)
-	node := r.selectNodeFromSnap(snap, model, tier, "")
+	node := r.selectNodeFromSnap(snap, model, tier, "", class)
 	if node == nil {
+		// Fail closed per class. A customer request
+		// with no healthy customer-eligible node must never spill to an
+		// internal-only (token-plan) node: it gets a retryable 503 and
+		// the job queue holds it.
+		if class == proxy.ClassCustomer {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, `{"error":"no customer-eligible upstream available; request held for retry"}`, http.StatusServiceUnavailable)
+			requestsTotal.WithLabelValues(model, "none", "customer_no_node").Inc()
+			return
+		}
 		http.Error(w, "no healthy upstream available for requested model", http.StatusServiceUnavailable)
 		requestsTotal.WithLabelValues(model, "none", "unavailable").Inc()
 		return
@@ -1344,7 +1390,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 				candidate.breaker.RecordFailure()
 			}
 			lastErr = err
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1384,7 +1430,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 					// Retry the SAME node once more on the next healthy key
 					// by not adding it to the exclude set this pass.
 					delete(tried, candidate.cfg.Name)
-					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
 					tried[candidate.cfg.Name] = struct{}{}
 					if next != nil && next.cfg.Name == candidate.cfg.Name {
 						requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
@@ -1403,7 +1449,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 			heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
 			lastErr = nil
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1561,15 +1607,15 @@ func (r *router) selectNode(model, targetTier string) *upstreamNode {
 // still takes an RLock for tests that don't have a snapshot in
 // hand. New production code paths take a snap up front.
 func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *upstreamNode {
-	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName)
+	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName, proxy.ClassInternal)
 }
 
-func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string) *upstreamNode {
+func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string, class proxy.WorkloadClass) *upstreamNode {
 	var excluded map[string]struct{}
 	if excludeName != "" {
 		excluded = map[string]struct{}{excludeName: {}}
 	}
-	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded)
+	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded, class)
 }
 
 // selectNodeFromSnapExcluding is the set-aware form of node selection used by
@@ -1583,7 +1629,7 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 // either unhealthy, breaker-open, or already excluded — which is exactly how
 // the strict M3 -> fallback ordering is expressed in config (M3 keys share the
 // lowest priority; the fallback tier sits at a higher priority number).
-func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}) *upstreamNode {
+func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}, class proxy.WorkloadClass) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -1592,6 +1638,12 @@ func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier 
 	targetTier = strings.TrimSpace(targetTier)
 	buckets := make(map[int]*bucket)
 	for _, node := range snap.nodes {
+		// Workload class filters BEFORE tier, weight and model: a
+		// customer request can never land on an internal-only node
+		// (the paid-plan nodes), whatever tier or model it asks for.
+		if !node.AllowsClass(class) {
+			continue
+		}
 		if !node.healthy.Load() {
 			continue
 		}

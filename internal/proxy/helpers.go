@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 )
@@ -96,3 +97,63 @@ var onReject func(path string)
 // rejection. Passing nil clears the hook (useful in tests). The callback
 // runs synchronously on the hot path; keep it cheap (one prom Counter Inc).
 func SetAuthRejectHook(fn func(path string)) { onReject = fn }
+
+// WorkloadClass is the traffic class derived from credentials: every valid
+// token is either "internal" or "customer". It is carried in the request
+// context; callers cannot set it.
+type WorkloadClass string
+
+const (
+	ClassInternal WorkloadClass = "internal"
+	ClassCustomer WorkloadClass = "customer"
+)
+
+type classCtxKey struct{}
+
+// ClassFromRequest reports the workload class derived at auth time.
+// Requests that skipped auth (no configured token) read as internal.
+func ClassFromRequest(r *http.Request) WorkloadClass {
+	if c, ok := r.Context().Value(classCtxKey{}).(WorkloadClass); ok {
+		return c
+	}
+	return ClassInternal
+}
+
+// ClassBearerAuthFunc is BearerAuthFunc extended with workload classes:
+// the internal token (or an unset token) authenticates as internal; every
+// token in customerTokens authenticates as customer. Any other bearer is
+// rejected exactly like BearerAuthFunc. The class rides the request
+// context — a caller-set header can never change it.
+func ClassBearerAuthFunc(getInternalToken func() string, customerTokens func() []string) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			internal := getInternalToken()
+			auth := r.Header.Get("Authorization")
+			if internal == "" && len(customerTokens()) == 0 {
+				next(w, r)
+				return
+			}
+			var class WorkloadClass
+			match := false
+			if internal != "" && auth == "Bearer "+internal {
+				class, match = ClassInternal, true
+			}
+			if !match {
+				for _, t := range customerTokens() {
+					if t != "" && auth == "Bearer "+t {
+						class, match = ClassCustomer, true
+						break
+					}
+				}
+			}
+			if !match {
+				if onReject != nil {
+					onReject(r.URL.Path)
+				}
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+			next(w, r.WithContext(context.WithValue(r.Context(), classCtxKey{}, class)))
+		}
+	}
+}

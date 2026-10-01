@@ -32,6 +32,11 @@ type Config struct {
 	DebugAddr string `yaml:"debug_addr"`
 	LogLevel  string `yaml:"log_level"`
 	AuthToken string `yaml:"auth_token"`
+	// CustomerTokens maps router credentials to the "customer" workload
+	// class: a request bearing one of these tokens is class customer,
+	// every other valid token is internal. The class is derived from
+	// credentials only — never from a caller-set header.
+	CustomerTokens []string `yaml:"customer_tokens"`
 	// SlackWebhookURL, when non-empty, is the Slack Incoming Webhook URL the
 	// router posts quota-fallback alerts to. The webhook URL is loaded from
 	// the LLM_ROUTER_SLACK_WEBHOOK_URL env var at startup; the YAML field is
@@ -203,6 +208,11 @@ type NodeConfig struct {
 	Models  []string `yaml:"models"`
 	APIKey  string   `yaml:"api_key"`
 	APIKeys []string `yaml:"api_keys"`
+	// Workloads restricts which request classes may use this node:
+	// "internal", "customer", or both. Empty (or absent) means the node
+	// accepts both classes. The token-plan node is configured
+	// workloads: [internal] so customer traffic can never reach it.
+	Workloads []string `yaml:"workloads"`
 	// Vendor is the canonical upstream type. Empty (or "openai_compat") means the
 	// existing LocalOpenAICompatible path; values like "minimax" toggle the
 	// vendor-specific URL builder, auth header, and quota classifier.
@@ -505,8 +515,26 @@ func LoadConfig(path string) (Config, error) {
 		if err := validateAuthHeader(cfg.Nodes[i]); err != nil {
 			return cfg, err
 		}
+		if err := validateWorkloads(cfg.Nodes[i]); err != nil {
+			return cfg, err
+		}
 	}
 	return cfg, nil
+}
+
+// validateWorkloads rejects unknown workload classes at LOAD time: a typo
+// like "internl" would otherwise remove the node from both classes
+// silently, and the failure would only surface as missing capacity at
+// dispatch.
+func validateWorkloads(n NodeConfig) error {
+	for _, w := range n.Workloads {
+		switch w {
+		case "internal", "customer":
+		default:
+			return fmt.Errorf("node %s: workloads entry %q is not one of internal|customer", n.Name, w)
+		}
+	}
+	return nil
 }
 
 // validateAuthHeader enforces the auth_header admission rules described
