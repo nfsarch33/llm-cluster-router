@@ -47,19 +47,22 @@ func doChatClass(r *router, model, token, tenant string, spoofHeader bool) (*htt
 	return doChatClassHeader(r, model, token, tenant, classHeader)
 }
 
-// TestCustomerTrafficNeverReachesTokenPlanNode (section C item 8, the
-// fail-closed case): every customer-eligible node is DOWN, the internal
-// token-plan node is healthy — the customer request must get 503 +
-// Retry-After and the token-plan node must record ZERO hits.
+// TestCustomerTrafficNeverReachesTokenPlanNode (the fail-closed case):
+// every customer-eligible node is DOWN, the internal-only (paid-plan)
+// node is healthy — the customer request must get 503 + Retry-After and
+// the paid-plan node must record ZERO hits.
 // Mutant: removing the workloads filter (or the class check) lets the
-// customer request through to the token-plan node and fails this test.
+// customer request through to the internal-only node and fails this test.
 func TestCustomerTrafficNeverReachesTokenPlanNode(t *testing.T) {
 	var tpHits atomic.Int64
 	tp := tokenPlanNode(t, &tpHits)
 	down := customerNode(t, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {})), false)
+	down.cfg.Models = []string{"m3", "qwen"} // serves m3 too: the class filter is the only guard
 	r := classRouter(tp, down)
 
-	w, _ := doChatClass(r, "qwen", "customer-tok", "acme", false)
+	// model m3 is served by BOTH nodes: only the class filter can keep
+	// this customer request off the token-plan node.
+	w, _ := doChatClass(r, "m3", "customer-tok", "acme", false)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (fail closed, never spill to the token-plan node)", w.Code)
 	}
@@ -153,7 +156,9 @@ func TestCustomerRoutesToEligibleNodeWhenHealthy(t *testing.T) {
 	t.Cleanup(up.Close)
 	r := classRouter(tp, customerNode(t, up, true))
 
-	w, body := doChatClass(r, "qwen", "customer-tok", "acme", false)
+	// m3 again: both nodes serve it, so reaching the customer node (not
+	// the token-plan one) proves the class routing.
+	w, body := doChatClass(r, "m3", "customer-tok", "acme", false)
 	if w.Code != http.StatusOK || !strings.Contains(body, "local") {
 		t.Fatalf("customer request: status %d body %q", w.Code, body)
 	}
