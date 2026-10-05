@@ -46,3 +46,29 @@ func MetricLabel(value, fallback string) string {
 	}
 	return value
 }
+
+// ApplyModelRewrite returns body with its "model" field replaced when the
+// node carries a rewrite for the requested name, and nil when the body's
+// model matches no rewrite key (or rewriting would be a no-op) — so the
+// caller forwards the original bytes untouched instead of re-marshalling
+// every request. All other fields are preserved verbatim.
+func ApplyModelRewrite(body []byte, rewrites map[string]string) []byte {
+	if len(rewrites) == 0 {
+		return nil
+	}
+	from := ExtractModel(body)
+	to, ok := rewrites[from]
+	if !ok || to == "" || to == from {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	payload["model"] = to
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return out
+}

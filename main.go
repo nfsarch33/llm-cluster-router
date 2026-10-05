@@ -1372,7 +1372,15 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	for ; candidate != nil && attemptIdx < maxFailoverAttempts; attemptIdx++ {
 		tried[candidate.cfg.Name] = struct{}{}
 		attemptCtx, attemptCancel := context.WithTimeout(req.Context(), snap.cfg.Defaults.RequestTimeout.Duration)
-		resp, usedKeyIdx, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, body, model)
+		// Per-candidate model rewrite: a strict engine (vLLM) joining an
+		// alias pool receives the name it actually serves. Metrics and the
+		// failover chain keep the CALLER's model — the rewrite is a wire
+		// detail of this one hop, not a change of what was asked for.
+		fwdBody := body
+		if rewritten := rtr.ApplyModelRewrite(body, candidate.cfg.ModelRewrite); rewritten != nil {
+			fwdBody = rewritten
+		}
+		resp, usedKeyIdx, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, fwdBody, model)
 		if err != nil {
 			attemptCancel()
 			// Self-heal: only the health loop can flip `healthy` back to true.
