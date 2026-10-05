@@ -61,11 +61,20 @@ func ApplyModelRewrite(body []byte, rewrites map[string]string) []byte {
 	if !ok || to == "" || to == from {
 		return nil
 	}
-	var payload map[string]any
+	// RawMessage, not map[string]any: numbers must not become float64 on
+	// the round trip — a seed or logit_bias token id above 2^53 would be
+	// silently altered, which is data corruption the caller cannot see.
+	// Every other field's VALUE passes through byte-for-byte; only the
+	// rewritten key changes.
+	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil
 	}
-	payload["model"] = to
+	encoded, err := json.Marshal(to)
+	if err != nil {
+		return nil
+	}
+	payload["model"] = encoded
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return nil

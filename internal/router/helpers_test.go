@@ -176,4 +176,22 @@ func TestApplyModelRewrite(t *testing.T) {
 	if got := ApplyModelRewrite([]byte(`not json`), map[string]string{"alias": "served"}); got != nil {
 		t.Fatalf("an unparseable body must forward verbatim rather than be mangled, got %s", got)
 	}
+
+	// A number above 2^53 must survive the rewrite EXACTLY: a map[string]any
+	// decode would re-encode it as a float64 and corrupt it.
+	big := []byte(`{"model":"alias","seed":9007199254740993}`)
+	outBig := ApplyModelRewrite(big, map[string]string{"alias": "served"})
+	if outBig == nil {
+		t.Fatal("big-int row must rewrite")
+	}
+	var bigPayload map[string]json.RawMessage
+	if err := json.Unmarshal(outBig, &bigPayload); err != nil {
+		t.Fatalf("rewritten big-int body invalid: %v", err)
+	}
+	if string(bigPayload["seed"]) != "9007199254740993" {
+		t.Fatalf("seed must round-trip exactly, got %s", bigPayload["seed"])
+	}
+	if got := ExtractModel(outBig); got != "served" {
+		t.Fatalf("model must be rewritten, got %q", got)
+	}
 }

@@ -1148,14 +1148,14 @@ func TestHandleProxyAppliesNodeModelRewrite(t *testing.T) {
 
 	parsed, _ := url.Parse(upstream.URL)
 	node := &upstreamNode{
-		// The v18870-6 shape: a strict vLLM engine (serves ONE pinned name)
-		// joining the tier-0 alias pool — it lists the alias so it is
-		// selected, and the rewrite swaps the body to the served name.
+		// A strict vLLM engine (serves ONE pinned name) joining an alias
+		// pool — it lists the alias so it is selected, and the rewrite
+		// swaps the body to the served name.
 		cfg: nodeConfig{
-			Name:    "strict-engine",
-			Tier:    "0",
-			Models:  []string{"qwen3.8-27b", "qwen3.8-27b-local"},
-			Weight:  1,
+			Name:         "strict-engine",
+			Tier:         "0",
+			Models:       []string{"qwen3.8-27b", "qwen3.8-27b-local"},
+			Weight:       1,
 			ModelRewrite: map[string]string{"qwen3.8-27b-local": "qwen3.8-27b"},
 		},
 		baseURL: parsed,
