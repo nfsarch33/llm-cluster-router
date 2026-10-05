@@ -231,6 +231,14 @@ type NodeConfig struct {
 	// register the vendor peer in the active routing pool; "false" (or
 	// omitted) leaves the peer unreachable but parseable.
 	EnabledVendor string `yaml:"enabled_vendor"`
+	// ModelRewrite maps a requested model name to the name this node's
+	// engine actually serves, applied to the request body on forward. Lets
+	// a strict engine (vLLM validates --served-model-name) join an alias
+	// pool without serving the alias itself: the node lists the alias in
+	// `models` so it is selected, and the body is rewritten before the hop.
+	// Empty (or absent) forwards the caller's model verbatim, exactly as
+	// before — the field is additive and ignored by older router builds.
+	ModelRewrite map[string]string `yaml:"model_rewrite"`
 	// QuotaDetectRegex, when non-empty, is the regular expression applied to
 	// 4xx/5xx response bodies to flag the response as a quota event. A quota
 	// event triggers the route's fallback chain and increments

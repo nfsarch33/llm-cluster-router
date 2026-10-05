@@ -1,6 +1,9 @@
 package router
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestNodeEnabled_TruthyValues(t *testing.T) {
 	cases := []struct {
@@ -138,5 +141,57 @@ func TestMetricLabel_WhitespaceOnlyUsesFallback(t *testing.T) {
 func TestMetricLabel_TabAndNewlineTrimmed(t *testing.T) {
 	if got := MetricLabel("\tlabel\n", "fallback"); got != "label" {
 		t.Errorf("MetricLabel = %q, want label", got)
+	}
+}
+
+func TestApplyModelRewrite(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"alias","temperature":0.3,"messages":[{"role":"user","content":"hi"}]}`)
+
+	out := ApplyModelRewrite(body, map[string]string{"alias": "served"})
+	if out == nil {
+		t.Fatal("a matching rewrite must return a rewritten body")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("rewritten body is not valid JSON: %v", err)
+	}
+	if payload["model"] != "served" {
+		t.Fatalf("model must be swapped to the served name, got %v", payload["model"])
+	}
+	if payload["temperature"] != 0.3 {
+		t.Fatalf("every other field must survive the rewrite, temperature=%v", payload["temperature"])
+	}
+
+	if got := ApplyModelRewrite(body, map[string]string{"other": "x"}); got != nil {
+		t.Fatalf("a model with no rewrite key must forward verbatim, got %s", got)
+	}
+	if got := ApplyModelRewrite(body, map[string]string{"alias": "alias"}); got != nil {
+		t.Fatalf("a rewrite to the same name is a no-op, got %s", got)
+	}
+	if got := ApplyModelRewrite(body, nil); got != nil {
+		t.Fatalf("an empty rewrite map must forward verbatim, got %s", got)
+	}
+	if got := ApplyModelRewrite([]byte(`not json`), map[string]string{"alias": "served"}); got != nil {
+		t.Fatalf("an unparseable body must forward verbatim rather than be mangled, got %s", got)
+	}
+
+	// A number above 2^53 must survive the rewrite EXACTLY: a map[string]any
+	// decode would re-encode it as a float64 and corrupt it.
+	big := []byte(`{"model":"alias","seed":9007199254740993}`)
+	outBig := ApplyModelRewrite(big, map[string]string{"alias": "served"})
+	if outBig == nil {
+		t.Fatal("big-int row must rewrite")
+	}
+	var bigPayload map[string]json.RawMessage
+	if err := json.Unmarshal(outBig, &bigPayload); err != nil {
+		t.Fatalf("rewritten big-int body invalid: %v", err)
+	}
+	if string(bigPayload["seed"]) != "9007199254740993" {
+		t.Fatalf("seed must round-trip exactly, got %s", bigPayload["seed"])
+	}
+	if got := ExtractModel(outBig); got != "served" {
+		t.Fatalf("model must be rewritten, got %q", got)
 	}
 }

@@ -46,3 +46,38 @@ func MetricLabel(value, fallback string) string {
 	}
 	return value
 }
+
+// ApplyModelRewrite returns body with its "model" field replaced when the
+// node carries a rewrite for the requested name, and nil when the body's
+// model matches no rewrite key (or rewriting would be a no-op) — so the
+// caller forwards the original bytes untouched instead of re-marshalling
+// every request. All other fields are preserved verbatim.
+func ApplyModelRewrite(body []byte, rewrites map[string]string) []byte {
+	if len(rewrites) == 0 {
+		return nil
+	}
+	from := ExtractModel(body)
+	to, ok := rewrites[from]
+	if !ok || to == "" || to == from {
+		return nil
+	}
+	// RawMessage, not map[string]any: numbers must not become float64 on
+	// the round trip — a seed or logit_bias token id above 2^53 would be
+	// silently altered, which is data corruption the caller cannot see.
+	// Every other field's VALUE passes through byte-for-byte; only the
+	// rewritten key changes.
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	encoded, err := json.Marshal(to)
+	if err != nil {
+		return nil
+	}
+	payload["model"] = encoded
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return out
+}
