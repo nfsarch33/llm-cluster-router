@@ -195,3 +195,41 @@ func TestApplyModelRewrite(t *testing.T) {
 		t.Fatalf("model must be rewritten, got %q", got)
 	}
 }
+
+// per-node request defaults — added when absent, caller's value
+// kept when set, nil (original bytes) when nothing applies.
+func TestMergeRequestDefaults(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"seed":9007199254740993}`)
+	tr := json.RawMessage(`true`)
+
+	out := MergeRequestDefaults(body, map[string]json.RawMessage{"reasoning_split": tr})
+	if out == nil {
+		t.Fatal("absent key must be merged")
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["reasoning_split"]) != "true" {
+		t.Fatalf("reasoning_split = %s", got["reasoning_split"])
+	}
+	if string(got["seed"]) != "9007199254740993" {
+		t.Fatalf("big seed corrupted: %s", got["seed"]) // float64 round-trip guard
+	}
+	if string(got["model"]) != `"m"` {
+		t.Fatalf("model disturbed: %s", got["model"])
+	}
+
+	callerSet := []byte(`{"model":"m","reasoning_split":false}`)
+	out = MergeRequestDefaults(callerSet, map[string]json.RawMessage{"reasoning_split": tr})
+	if out != nil {
+		t.Fatalf("caller-set key must be kept verbatim, got %s", out)
+	}
+
+	if out := MergeRequestDefaults(body, nil); out != nil {
+		t.Fatal("no defaults: original bytes")
+	}
+	if out := MergeRequestDefaults([]byte(`not json`), map[string]json.RawMessage{"k": tr}); out != nil {
+		t.Fatal("unparseable body: original bytes, never a guess")
+	}
+}

@@ -81,3 +81,40 @@ func ApplyModelRewrite(body []byte, rewrites map[string]string) []byte {
 	}
 	return out
 }
+
+// MergeRequestDefaults returns body with the node's request_defaults
+// merged in, and nil when there is nothing to merge — the same contract
+// as ApplyModelRewrite, so the caller forwards the original bytes unless
+// a default actually landed. A default is applied ONLY when the caller
+// did not set the key (the smartroute params rule); it is a wire detail
+// of this one hop: metrics and the failover chain keep the caller's
+// request as sent. RawMessage throughout: values pass byte-for-byte, so
+// a numeric default never becomes a float64 round-trip artefact.
+func MergeRequestDefaults(body []byte, defaults map[string]json.RawMessage) []byte {
+	if len(defaults) == 0 {
+		return nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	changed := false
+	for k, v := range defaults {
+		if k == "" {
+			continue
+		}
+		if _, set := payload[k]; set {
+			continue
+		}
+		payload[k] = v
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return out
+}
