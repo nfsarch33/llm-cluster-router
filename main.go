@@ -1380,6 +1380,13 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		if rewritten := rtr.ApplyModelRewrite(body, candidate.cfg.ModelRewrite); rewritten != nil {
 			fwdBody = rewritten
 		}
+		// Per-node request defaults: a node whose engine needs a body key
+		// the caller cannot send (reasoning_split for agents that build no
+		// request fields) gets it here — set only when absent, so a caller
+		// who DID set it keeps their value. Wire detail of this hop.
+		if merged := rtr.MergeRequestDefaults(fwdBody, candidate.cfg.RequestDefaults); merged != nil {
+			fwdBody = merged
+		}
 		resp, usedKeyIdx, err := r.doUpstream(attemptCtx, snap, candidate, req.Method, req.URL.Path, req.URL.RawQuery, req.Header, fwdBody, model)
 		if err != nil {
 			attemptCancel()

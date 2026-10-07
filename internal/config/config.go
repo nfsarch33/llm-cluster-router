@@ -4,6 +4,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -239,6 +240,12 @@ type NodeConfig struct {
 	// Empty (or absent) forwards the caller's model verbatim, exactly as
 	// before — the field is additive and ignored by older router builds.
 	ModelRewrite map[string]string `yaml:"model_rewrite"`
+
+	// RequestDefaults carries per-node request-body defaults applied after
+	// node selection, only for keys the caller did not set (v18870-6: the
+	// reasoning_split pin for nodes whose engines embed reasoning in content
+	// unless told to split it). RawMessage keeps values byte-exact.
+	RequestDefaults map[string]json.RawMessage `yaml:"request_defaults"`
 	// QuotaDetectRegex, when non-empty, is the regular expression applied to
 	// 4xx/5xx response bodies to flag the response as a quota event. A quota
 	// event triggers the route's fallback chain and increments
