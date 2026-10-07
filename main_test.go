@@ -1215,7 +1215,7 @@ func TestHandleProxyAppliesNodeRequestDefaults(t *testing.T) {
 			Tier:   "1",
 			Models: []string{"reasoning-model"},
 			Weight: 1,
-			RequestDefaults: map[string]json.RawMessage{
+			RequestDefaults: cfg.RequestDefaultsMap{
 				"reasoning_split": json.RawMessage(`true`),
 			},
 		},

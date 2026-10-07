@@ -186,6 +186,39 @@ type DurationValue struct {
 	time.Duration
 }
 
+// RequestDefaultsMap is the yaml-decodable form of per-node request-body
+// defaults: yaml.v3 cannot decode a scalar into a json.RawMessage byte
+// slice, so the map decodes as nodes and each value marshals to JSON once
+// here. MergeRequestDefaults keeps consuming map[string]json.RawMessage.
+type RequestDefaultsMap map[string]json.RawMessage
+
+// Raw returns the defaults as the merge helper's consumption type.
+func (m RequestDefaultsMap) Raw() map[string]json.RawMessage { return m }
+
+// UnmarshalYAML decodes the defaults map value-by-value, converting each
+// to its JSON encoding; a YAML scalar true becomes the JSON literal true.
+func (m *RequestDefaultsMap) UnmarshalYAML(node *yaml.Node) error {
+	*m = RequestDefaultsMap{}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("request_defaults must be a mapping, got %v at line %d", node.Kind, node.Line)
+	}
+	out := make(RequestDefaultsMap, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		var val any
+		if err := node.Content[i+1].Decode(&val); err != nil {
+			return fmt.Errorf("request_defaults.%s: %w", key, err)
+		}
+		enc, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Errorf("request_defaults.%s: %w", key, err)
+		}
+		out[key] = enc
+	}
+	*m = out
+	return nil
+}
+
 func (d *DurationValue) UnmarshalYAML(node *yaml.Node) error {
 	var value string
 	if err := node.Decode(&value); err != nil {
@@ -242,10 +275,11 @@ type NodeConfig struct {
 	ModelRewrite map[string]string `yaml:"model_rewrite"`
 
 	// RequestDefaults carries per-node request-body defaults applied after
-	// node selection, only for keys the caller did not set (v18870-6: the
-	// reasoning_split pin for nodes whose engines embed reasoning in content
-	// unless told to split it). RawMessage keeps values byte-exact.
-	RequestDefaults map[string]json.RawMessage `yaml:"request_defaults"`
+	// node selection, only for keys the caller did not set. A node whose
+	// engine embeds reasoning in content unless told to split it carries
+	// the split flag here once, for every caller. Values are kept
+	// byte-exact via a custom unmarshaler (see RequestDefaultsMap).
+	RequestDefaults RequestDefaultsMap `yaml:"request_defaults"`
 	// QuotaDetectRegex, when non-empty, is the regular expression applied to
 	// 4xx/5xx response bodies to flag the response as a quota event. A quota
 	// event triggers the route's fallback chain and increments

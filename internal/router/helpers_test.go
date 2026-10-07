@@ -196,7 +196,7 @@ func TestApplyModelRewrite(t *testing.T) {
 	}
 }
 
-// v18870-6: per-node request defaults — added when absent, caller's value
+// per-node request defaults — added when absent, caller's value
 // kept when set, nil (original bytes) when nothing applies.
 func TestMergeRequestDefaults(t *testing.T) {
 	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"seed":9007199254740993}`)
