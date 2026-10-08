@@ -234,3 +234,26 @@ Issues and pull requests are welcome. Please include tests with behaviour change
 ## License
 
 [MIT](LICENSE) © nfsarch33
+
+## PII-local routing rule
+
+Requests whose body carries personal information (emails, Australian
+phone numbers, street addresses, order data, named enquiries —
+`internal/piiroute`) are served ONLY by nodes marked `pii_local: true`,
+which exist to point at local hardware. The filter sits beside the
+workload-class filter, before tier, weight and model; when no pii-local
+node can serve the request the router refuses it with 503
+(`pii_no_local_node`) — a cloud endpoint never receives a personal
+payload, by construction. `llm_router_pii_local_requests_total{outcome}`
+counts detections and refusals; the guarantee is structural, so the
+counters make it observable rather than enforce it.
+
+Privacy-notice line (for client-facing material):
+
+> Personal information in your requests is processed only on our own
+> hardware; cloud services receive no personal request content. Our
+> processing is not exclusively Australia-based.
+
+The notice deliberately makes NO Australian-residency claim while any
+cloud model receives inputs.
+

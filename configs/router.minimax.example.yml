@@ -40,6 +40,10 @@ nodes:
   - name: qwen-local
     url: "http://127.0.0.1:8010"
     tier: "0"
+    # pii_local: this node may serve requests whose body carries
+    # personal information; nodes without the mark never receive one
+    # (the router refuses rather than spill).
+    pii_local: true
     models:
       - "qwen3.8-27b-local"
 

@@ -141,7 +141,7 @@ func TestSelectNode_SkipsBrokenCircuit(t *testing.T) {
 	}
 
 	snap := r.snap()
-	picked := r.selectNodeFromSnap(snap, "alpha", "", "", proxy.ClassInternal)
+	picked := r.selectNodeFromSnap(snap, "alpha", "", "", proxy.ClassInternal, false)
 	if picked == nil {
 		t.Fatal("selectNodeFromSnap returned nil even though one node is healthy")
 	}

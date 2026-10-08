@@ -49,6 +49,7 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/keypool"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
+	"github.com/nfsarch33/llm-cluster-router/internal/piiroute"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"github.com/nfsarch33/llm-cluster-router/internal/quota"
 	"github.com/nfsarch33/llm-cluster-router/internal/relcheck"
@@ -460,6 +461,7 @@ var (
 	nodeHealthyGauge          = metrics.NodeHealthyGauge
 	healthLatency             = metrics.HealthLatency
 	fairShareRejectedTotal    = metrics.FairShareRejectedTotal
+	piiLocalRequests          = metrics.PIILocalRequests
 )
 
 // Keep bridge aliases referenced for golangci-lint unused check.
@@ -1246,6 +1248,15 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	class := proxy.ClassFromRequest(req)
+	// PII-local rule: classify BEFORE any smartroute rewrite so the
+	// detector sees the payload as the client wrote it. Personal
+	// payloads are local-only and refused when no pii-local node serves
+	// the model — a cloud endpoint never receives one.
+	personal := piiroute.DetectPersonal(body)
+	if personal {
+		slog.Info("router.pii_local", "model_hint", extractModel(body))
+		piiLocalRequests.WithLabelValues("detected").Inc()
+	}
 	if class == proxy.ClassCustomer {
 		// Paid client work must be attributable: customer requests carry
 		// a tenant id (the cost ledger keys on it) and are refused
@@ -1277,7 +1288,14 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	model := extractModel(body)
-	node := r.selectNodeFromSnap(snap, model, tier, "", class)
+	node := r.selectNodeFromSnap(snap, model, tier, "", class, personal)
+	if node == nil && personal {
+		// Fail closed: never spill a personal payload to a cloud node.
+		piiLocalRequests.WithLabelValues("no_local_node_refused").Inc()
+		http.Error(w, `{"error":"no pii-local upstream available for this request"}`, http.StatusServiceUnavailable)
+		requestsTotal.WithLabelValues(model, "none", "pii_no_local_node").Inc()
+		return
+	}
 	if node == nil {
 		// Fail closed per class. A customer request
 		// with no healthy customer-eligible node must never spill to an
@@ -1405,7 +1423,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 				candidate.breaker.RecordFailure()
 			}
 			lastErr = err
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1445,7 +1463,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 					// Retry the SAME node once more on the next healthy key
 					// by not adding it to the exclude set this pass.
 					delete(tried, candidate.cfg.Name)
-					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 					tried[candidate.cfg.Name] = struct{}{}
 					if next != nil && next.cfg.Name == candidate.cfg.Name {
 						requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
@@ -1464,7 +1482,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 			heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
 			lastErr = nil
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1622,15 +1640,15 @@ func (r *router) selectNode(model, targetTier string) *upstreamNode {
 // still takes an RLock for tests that don't have a snapshot in
 // hand. New production code paths take a snap up front.
 func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *upstreamNode {
-	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName, proxy.ClassInternal)
+	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName, proxy.ClassInternal, false)
 }
 
-func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string, class proxy.WorkloadClass) *upstreamNode {
+func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string, class proxy.WorkloadClass, personal bool) *upstreamNode {
 	var excluded map[string]struct{}
 	if excludeName != "" {
 		excluded = map[string]struct{}{excludeName: {}}
 	}
-	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded, class)
+	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded, class, personal)
 }
 
 // selectNodeFromSnapExcluding is the set-aware form of node selection used by
@@ -1644,7 +1662,7 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 // either unhealthy, breaker-open, or already excluded — which is exactly how
 // the strict M3 -> fallback ordering is expressed in config (M3 keys share the
 // lowest priority; the fallback tier sits at a higher priority number).
-func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}, class proxy.WorkloadClass) *upstreamNode {
+func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}, class proxy.WorkloadClass, personal bool) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -1657,6 +1675,12 @@ func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier 
 		// customer request can never land on an internal-only node
 		// (the paid-plan nodes), whatever tier or model it asks for.
 		if !node.AllowsClass(class) {
+			continue
+		}
+		// The PII-local rule filters beside the workload class: a
+		// personal payload can never land on a node without the
+		// pii_local mark, whatever tier, weight or model it offers.
+		if piiroute.PersonalBlocks(personal, node.cfg.PIILocal) {
 			continue
 		}
 		if !node.healthy.Load() {

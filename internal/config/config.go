@@ -247,6 +247,12 @@ type NodeConfig struct {
 	// accepts both classes. The token-plan node is configured
 	// workloads: [internal] so customer traffic can never reach it.
 	Workloads []string `yaml:"workloads"`
+	// PIILocal marks a node as allowed to serve requests whose body
+	// carries personal information (the PII-local routing rule): the
+	// local hardware endpoints. A personal payload is NEVER routed to a
+	// node without this mark — the router refuses instead of spilling
+	// to a cloud endpoint.
+	PIILocal bool `yaml:"pii_local"`
 	// Vendor is the canonical upstream type. Empty (or "openai_compat") means the
 	// existing LocalOpenAICompatible path; values like "minimax" toggle the
 	// vendor-specific URL builder, auth header, and quota classifier.

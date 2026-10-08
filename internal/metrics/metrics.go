@@ -24,6 +24,15 @@ var (
 		Name: "llm_router_quota_fallback_total",
 		Help: "Vendor quota-exhaustion events that triggered failover off a vendor peer.",
 	}, []string{"model", "node", "vendor"})
+	// PIILocalRequests counts the PII-local rule's decisions: personal
+	// payloads detected, and refusals for want of a pii-local node. The
+	// "zero personal payloads to cloud models" guarantee is structural
+	// (selection filters them out); this counter makes it observable.
+	PIILocalRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "llm_router_pii_local_requests_total",
+		Help: "Personal payloads detected by the PII-local rule (detected) and refused for want of a pii-local node (no_local_node_refused); cloud endpoints never receive one by construction.",
+	}, []string{"outcome"})
+
 	RequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "llm_router_requests_total",
 		Help: "Total routed requests.",
