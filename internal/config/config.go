@@ -19,6 +19,15 @@ import (
 // Config is the top-level router configuration loaded from YAML.
 type Config struct {
 	Listen string `yaml:"listen"`
+	// PIILocalRule governs the personal-payload routing constraint:
+	//   ""  or "auto"  — armed only when at least one node carries
+	//                     pii_local: true (the safe default: configs
+	//                     without a marked node route exactly as before).
+	//   "enforce"      — ALWAYS armed; if no node carries pii_local the
+	//                     router REFUSES personal payloads (fail closed)
+	//                     rather than letting them reach the cloud.
+	//   "off"          — detection stays observability-only.
+	PIILocalRule string `yaml:"pii_local_rule"`
 	// MetricsAddr is where the Prometheus exposition listener binds.
 	// Omitted selects DefaultMetricsAddr; a host-less value like ":9091"
 	// binds LOOPBACK, not every interface. See DiagnosticListenAddr for

@@ -238,15 +238,19 @@ Issues and pull requests are welcome. Please include tests with behaviour change
 ## PII-local routing rule
 
 Requests whose body carries personal information (emails, Australian
-phone numbers, street addresses, order data, named enquiries —
-`internal/piiroute`) are served ONLY by nodes marked `pii_local: true`,
-which exist to point at local hardware. The filter sits beside the
-workload-class filter, before tier, weight and model; when no pii-local
-node can serve the request the router refuses it with 503
-(`pii_no_local_node`) — a cloud endpoint never receives a personal
-payload, by construction. `llm_router_pii_local_requests_total{outcome}`
-counts detections and refusals; the guarantee is structural, so the
-counters make it observable rather than enforce it.
+phone numbers, street addresses, order data, named enquiries, card PANs
+and TFNs — `internal/piiroute`) are routed only to nodes marked
+`pii_local: true` WHILE THE RULE IS ARMED. Arming is configuration:
+`pii_local_rule: auto` (default) arms only when a config marks at least
+one node; `enforce` arms always and refuses personal payloads with 503
+(`pii_no_local_node`) when no marked node can serve them; `off` keeps
+detection observability-only. When armed, a personal payload cannot
+reach a node without the mark; when not armed, routing is unchanged —
+the rule never silently changes behaviour for configs that have not
+opted in. `llm_router_pii_rule_armed` exposes the mode and
+`llm_router_pii_local_requests_total{outcome}` counts detections,
+unarmed detections (`detected_rule_off` — alert on a sustained rate)
+and refusals.
 
 Privacy-notice line (for client-facing material):
 

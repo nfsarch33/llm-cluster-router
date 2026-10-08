@@ -75,3 +75,41 @@ func TestPersonalNeverClouds(t *testing.T) {
 		t.Fatalf("a non-personal payload must keep all nodes, got %v", open)
 	}
 }
+
+// Round 2: the detector sees through JSON escapes and one nesting
+// level, and the new shapes (dotted mobiles, card PANs, TFNs) match.
+func TestDetectPersonal_Round2(t *testing.T) {
+	rows := map[string]string{
+		"json-escaped email": `{"prompt":"email user\"@example.com about the order"}`,
+		"nested content":     `{"messages":[{"role":"user","content":"Ship to 8 Wattle St, NSW 3000"}]}`,
+		"dotted mobile":      `call 0412.345.678 now`,
+		"card pan":           `card 4242 4242 4242 4242 charged`,
+		"tfn":                `TFN 123 456 789 provided`,
+	}
+	for class, body := range rows {
+		if !DetectPersonal([]byte(body)) {
+			t.Errorf("%s payload must be personal: %q", class, body)
+		}
+	}
+	// A clean JSON payload with long numbers that are NOT personal
+	// shapes (token counts, ids without grouping) stays non-personal.
+	if DetectPersonal([]byte(`{"max_tokens":4096,"id":"chatcmpl-1234567890"}`)) {
+		t.Error("token/id payload must stay non-personal")
+	}
+}
+
+// Round 2: the arming policy table.
+func TestRuleArmedModes(t *testing.T) {
+	if !RuleArmed("enforce", false) {
+		t.Error("enforce arms even with no marked node (then personal is refused, fail closed)")
+	}
+	if RuleArmed("off", true) {
+		t.Error("off never arms, even with a marked node")
+	}
+	if !RuleArmed("", true) || !RuleArmed("auto", true) {
+		t.Error("auto arms when a node is marked")
+	}
+	if RuleArmed("", false) || RuleArmed("auto", false) {
+		t.Error("auto stays off with no marked node")
+	}
+}

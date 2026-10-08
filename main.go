@@ -267,14 +267,9 @@ func (r *router) Reload(path string) error {
 	r.nodes = nodes
 	// Re-arm on reload: a config that adds (or removes) its last
 	// pii_local node flips the rule with the config, not the process.
-	anyPIILocal := false
-	for _, n := range nodes {
-		if n.cfg.PIILocal {
-			anyPIILocal = true
-			break
-		}
-	}
-	r.piiRuleArmed.Store(piiroute.RuleArmed(anyPIILocal))
+	anyPIILocal := anyNodePIILocal(nodes)
+	r.piiRuleArmed.Store(piiroute.RuleArmed(cfg.PIILocalRule, anyPIILocal))
+	piiArmedGauge.Set(boolToFloat(r.piiRuleArmed.Load()))
 	r.client = client
 	r.semaphore = sem
 	r.smart = smart
@@ -425,6 +420,24 @@ type upstreamNode struct {
 
 // AllowsClass reports whether the node may serve the workload class. An
 // empty Workloads list accepts both classes (backwards compatible).
+// anyNodePIILocal reports whether any loaded node carries the
+// pii_local mark.
+func anyNodePIILocal(nodes []*upstreamNode) bool {
+	for _, n := range nodes {
+		if n.cfg.PIILocal {
+			return true
+		}
+	}
+	return false
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func (n *upstreamNode) AllowsClass(c proxy.WorkloadClass) bool {
 	if len(n.cfg.Workloads) == 0 {
 		return true
@@ -478,6 +491,7 @@ var (
 	healthLatency             = metrics.HealthLatency
 	fairShareRejectedTotal    = metrics.FairShareRejectedTotal
 	piiLocalRequests          = metrics.PIILocalRequests
+	piiArmedGauge             = metrics.PIIArmedGauge
 )
 
 // Keep bridge aliases referenced for golangci-lint unused check.
@@ -677,13 +691,7 @@ func newRouter(cfg config) (*router, error) {
 	if err != nil {
 		return nil, err
 	}
-	anyPIILocal := false
-	for _, n := range nodes {
-		if n.cfg.PIILocal {
-			anyPIILocal = true
-			break
-		}
-	}
+	anyPIILocal := anyNodePIILocal(nodes)
 	r := &router{
 		cfg:       cfg,
 		client:    client,
@@ -693,7 +701,8 @@ func newRouter(cfg config) (*router, error) {
 		// the sink; the relay path only offers events to its buffer.
 		attribution: proxy.NewAttribution(promAttributionSink{}, 1024),
 	}
-	r.piiRuleArmed.Store(piiroute.RuleArmed(anyPIILocal))
+	r.piiRuleArmed.Store(piiroute.RuleArmed(cfg.PIILocalRule, anyPIILocal))
+	piiArmedGauge.Set(boolToFloat(r.piiRuleArmed.Load()))
 	smart, err := loadSmartRoute(cfg)
 	if err != nil {
 		return nil, err
@@ -1276,13 +1285,16 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	// detector sees the payload as the client wrote it. Personal
 	// payloads are local-only and refused when no pii-local node serves
 	// the model — a cloud endpoint never receives one.
-	personal := piiroute.DetectPersonal(body) && r.piiRuleArmed.Load()
+	bodyPersonal := piiroute.DetectPersonal(body)
+	personal := bodyPersonal && r.piiRuleArmed.Load()
 	if personal {
 		slog.Info("router.pii_local", "model_hint", extractModel(body))
 		piiLocalRequests.WithLabelValues("detected").Inc()
-	} else if piiroute.DetectPersonal(body) {
+	} else if bodyPersonal {
 		// Observability-only on unarmed configs: the detector counts
-		// what it sees, but nothing is refused or diverted.
+		// what it sees, but nothing is refused or diverted. ALERTABLE:
+		// personal payloads routing unconstrained means the rule is off
+		// on a config that carries them — page on a sustained rate.
 		piiLocalRequests.WithLabelValues("detected_rule_off").Inc()
 	}
 	if class == proxy.ClassCustomer {
@@ -1318,7 +1330,8 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	model := extractModel(body)
 	node := r.selectNodeFromSnap(snap, model, tier, "", class, personal)
 	if node == nil && personal {
-		// Fail closed: never spill a personal payload to a cloud node.
+		// Fail closed — the enforce mode with no marked node, or every
+		// pii-local node unhealthy: never spill to a cloud node.
 		piiLocalRequests.WithLabelValues("no_local_node_refused").Inc()
 		http.Error(w, `{"error":"no pii-local upstream available for this request"}`, http.StatusServiceUnavailable)
 		requestsTotal.WithLabelValues(model, "none", "pii_no_local_node").Inc()

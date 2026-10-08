@@ -10,15 +10,27 @@
 // pin shut).
 package piiroute
 
-import "regexp"
+import (
+	"encoding/json"
+	"regexp"
+)
 
 var (
-	emailRe = regexp.MustCompile(`(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}`)
+	// The local part admits a literal quote: JSON-escaped bodies carry
+	// user\"@example.com, and the decoded pass must match it too.
+	emailRe = regexp.MustCompile(`(?i)[a-z0-9._%+\-\"]+@[a-z0-9.-]+\.[a-z]{2,}`)
 	// Australian phone shapes, each branch with its own row in the
 	// tests: mobiles 04xx xxx xxx and the +61 international mobile form
 	// (+61 412 345 678, spaces/dashes optional); landlines (02) 9876
 	// 5432, 02 9876 5432 bare, and 0298765432 compact (4+4 digits).
-	auPhoneRe = regexp.MustCompile(`(?:\+61[\s-]?4\d{2}[\s-]?\d{3}[\s-]?\d{3}|\b04\d{2}[\s-]?\d{3}[\s-]?\d{3}|(?:\+61[\s-]?|\(0[2-8]\)[\s-]?|\b0[2378][\s-]?)\d{4}[\s-]?\d{4})`)
+	// Phones: separators may be spaces, dashes OR dots (0412.345.678).
+	auPhoneRe = regexp.MustCompile(`(?:\+61[\s.-]?4\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|\b04\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|(?:\+61[\s.-]?|\(0[2-8]\)[\s.-]?|\b0[2378][\s.-]?)\d{4}[\s.-]?\d{4})`)
+	// Card numbers: 13-19 digits in groups of 4 (spaces/dashes), the
+	// PAN shape regardless of brand.
+	cardRe = regexp.MustCompile(`\b(?:\d[\s.-]?){13,19}\b`)
+	// AU tax file numbers: 8-9 digits, often spaced 3-3-3 or 2-3-3,
+	// sometimes suffixed with the checksum letter X.
+	tfnRe = regexp.MustCompile(`\b\d{3}[\s]?\d{3}[\s]?\d{3}X?\b|\b\d{2}[\s]?\d{3}[\s]?\d{3}X?\b`)
 	// Address shapes: a number + street word, or an AU state + 4-digit
 	// postcode tail.
 	addressRe  = regexp.MustCompile(`(?i)\b\d{1,4}\s+[A-Z][a-z]+\s(st|street|rd|road|ave|avenue|dr|drive|ln|lane|ct|court|blvd|parade|pde)\b`)
@@ -36,16 +48,62 @@ var (
 )
 
 // DetectPersonal reports whether the request body carries a personal
-// information shape. It scans the body as-is; callers classify before
-// any smartroute rewrite.
+// information shape. Callers classify before any smartroute rewrite.
+// The body is scanned as-is AND with its JSON string values decoded:
+// an e-mail split across JSON escapes (user\"@example.com) or nested
+// one level deep (messages[].content) must not slip past.
 func DetectPersonal(body []byte) bool {
 	s := string(body)
+	if matchesAny(s) {
+		return true
+	}
+	for _, decoded := range decodeJSONStrings(body) {
+		if matchesAny(decoded) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAny(s string) bool {
 	return emailRe.MatchString(s) ||
 		auPhoneRe.MatchString(s) ||
+		cardRe.MatchString(s) ||
+		tfnRe.MatchString(s) ||
 		addressRe.MatchString(s) ||
 		postcodeRe.MatchString(s) ||
 		orderRe.MatchString(s) ||
 		enquiryRe.MatchString(s)
+}
+
+// decodeJSONStrings walks ONE nesting level of a JSON body and returns
+// every string value found on objects and arrays (recursively for
+// nested containers, bounded by the encoding/json parser itself). This
+// is where a payload hides an address inside
+// {"messages":[{"content":"..."}]}.
+func decodeJSONStrings(body []byte) []string {
+	var v any
+	if err := json.Unmarshal(body, &v); err != nil {
+		return nil
+	}
+	var out []string
+	var walk func(x any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case string:
+			out = append(out, t)
+		case map[string]any:
+			for _, c := range t {
+				walk(c)
+			}
+		case []any:
+			for _, c := range t {
+				walk(c)
+			}
+		}
+	}
+	walk(v)
+	return out
 }
 
 // PersonalBlocks is the selection-time predicate: true when this
@@ -56,13 +114,21 @@ func PersonalBlocks(personal, nodePIILocal bool) bool {
 	return personal && !nodePIILocal
 }
 
-// RuleArmed is the blast-radius guard: the PII-local rule ENFORCES only
-// on a config that marks at least one node pii_local (local hardware
-// actually exists to serve personal traffic). On every other config —
-// every existing deployment and every public user of this repo —
-// personal detection stays observability-only and routing is
-// byte-for-byte what it was before the rule existed. The round-1
-// review's probe (a cloud-only config refusing an email body) is the
-// exact failure this closes; the router re-evaluates it per config
-// load and reload.
-func RuleArmed(anyNodePIILocal bool) bool { return anyNodePIILocal }
+// RuleArmed is the arming policy over the configured rule mode:
+//
+//	auto (empty) — armed only when at least one node carries
+//	               pii_local: true; a config without a marked node
+//	               routes exactly as before the rule existed.
+//	enforce      — armed ALWAYS; with no marked node personal payloads
+//	               are REFUSED (fail closed), never routed to a cloud.
+//	off          — detection stays observability-only.
+func RuleArmed(mode string, anyNodePIILocal bool) bool {
+	switch mode {
+	case "enforce":
+		return true
+	case "off":
+		return false
+	default: // "" or "auto"
+		return anyNodePIILocal
+	}
+}

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,10 +51,10 @@ func TestSelectNodePersonalNeverClouds(t *testing.T) {
 	// rule, so the reviewer's probe body — an email in a git commit
 	// --author line — must still ROUTE (the handler's personal flag is
 	// detection && armed, and armed is false with zero pii_local nodes).
-	if piiroute.RuleArmed(false) {
+	if piiroute.RuleArmed("", false) {
 		t.Fatal("the rule must not arm on a config with zero pii_local nodes")
 	}
-	unarmed := piiroute.DetectPersonal([]byte(`git commit --author="dev <dev@users.noreply.github.com>" -m fix`)) && piiroute.RuleArmed(false)
+	unarmed := piiroute.DetectPersonal([]byte(`git commit --author="dev <dev@users.noreply.github.com>" -m fix`)) && piiroute.RuleArmed("", false)
 	if unarmed {
 		t.Fatal("on an unarmed config the email body must stay non-personal for routing (observability-only)")
 	}
@@ -79,5 +83,74 @@ func TestSelectNodePersonalNeverClouds(t *testing.T) {
 	// The detector drives it end to end: a body with an email is personal.
 	if !piiroute.DetectPersonal([]byte(`Reply to sam.wong@example.com`)) {
 		t.Fatal("detector regression: email payload must classify personal")
+	}
+}
+
+// Round 2: END-TO-END handler rows over a real httptest upstream — the
+// armed gate, the fail-closed 503 (enforce with no marked node), the
+// rule-off pass-through, and the personal-payload routing to the
+// marked node.
+func TestPIIRuleHandlerEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+	upURL, _ := url.Parse(upstream.URL)
+
+	personalBody := `{"model":"alpha","messages":[{"role":"user","content":"email sarah@example.com about order #A-10493"}]}`
+	cleanBody := `{"model":"alpha","messages":[{"role":"user","content":"summarise the quarterly trends"}]}`
+
+	newTestRouter := func(mode string, mark bool) *router {
+		r := &router{
+			cfg: config{
+				Defaults:       defaults{MaxQueueDepth: 8, MaxConcurrency: 1, RequestTimeout: durationValue{Duration: time.Second}, MaxBodySize: 1 << 20},
+				PIILocalRule:   mode,
+			},
+			client:    &http.Client{Timeout: time.Second},
+			semaphore: make(chan struct{}, 1),
+		}
+		node := &upstreamNode{
+			cfg:     nodeConfig{Name: "cloud", Tier: "fast", Priority: 1, Weight: 1, Models: []string{"alpha"}, PIILocal: mark},
+			baseURL: upURL,
+		}
+		node.healthy.Store(true)
+		r.nodes = []*upstreamNode{node}
+		armed := piiroute.RuleArmed(mode, mark)
+		r.piiRuleArmed.Store(armed)
+		return r
+	}
+
+	post := func(r *router, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		r.handleProxy(rec, req)
+		return rec.Code
+	}
+
+	// auto + unmarked: the probe body ROUTES (rule off, observability only).
+	if got := post(newTestRouter("", false), personalBody); got != http.StatusOK {
+		t.Fatalf("rule off: personal body must still route, got %d", got)
+	}
+	// enforce + unmarked: FAIL CLOSED — personal is refused 503.
+	if got := post(newTestRouter("enforce", false), personalBody); got != http.StatusServiceUnavailable {
+		t.Fatalf("enforce with no marked node must refuse personal, got %d", got)
+	}
+	// enforce + marked: personal routes (to the marked node).
+	if got := post(newTestRouter("enforce", true), personalBody); got != http.StatusOK {
+		t.Fatalf("enforce with a marked node must route personal, got %d", got)
+	}
+	// off + marked: personal routes freely (rule disabled by config).
+	if got := post(newTestRouter("off", true), personalBody); got != http.StatusOK {
+		t.Fatalf("off must route personal freely, got %d", got)
+	}
+	// Clean traffic routes in every mode.
+	for _, mode := range []string{"", "auto", "enforce", "off"} {
+		if got := post(newTestRouter(mode, false), cleanBody); got != http.StatusOK {
+			t.Fatalf("clean body must route in mode %q, got %d", mode, got)
+		}
 	}
 }
