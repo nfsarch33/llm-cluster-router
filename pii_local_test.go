@@ -1,6 +1,8 @@
 package main
 
 import (
+	"sync/atomic"
+
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -106,8 +108,8 @@ func TestPIIRuleHandlerEndToEnd(t *testing.T) {
 	newTestRouter := func(mode string, mark bool) *router {
 		r := &router{
 			cfg: config{
-				Defaults:       defaults{MaxQueueDepth: 8, MaxConcurrency: 1, RequestTimeout: durationValue{Duration: time.Second}, MaxBodySize: 1 << 20},
-				PIILocalRule:   mode,
+				Defaults:     defaults{MaxQueueDepth: 8, MaxConcurrency: 1, RequestTimeout: durationValue{Duration: time.Second}, MaxBodySize: 1 << 20},
+				PIILocalRule: mode,
 			},
 			client:    &http.Client{Timeout: time.Second},
 			semaphore: make(chan struct{}, 1),
@@ -152,5 +154,65 @@ func TestPIIRuleHandlerEndToEnd(t *testing.T) {
 		if got := post(newTestRouter(mode, false), cleanBody); got != http.StatusOK {
 			t.Fatalf("clean body must route in mode %q, got %d", mode, got)
 		}
+	}
+}
+
+// Round 3: the FAILOVER walk carries the classification. A marked node
+// that FAILS (500) must not spill a personal payload to the healthy
+// unmarked fallback: the request ends 503 (fail closed) or on another
+// marked node — never on the unmarked one.
+// MUTANT: personal dropped to false at the failover call sites and this
+// row goes red exactly there — the payload lands on the unmarked
+// fallback.
+func TestPIIRuleFailoverNeverSpillsToUnmarked(t *testing.T) {
+	t.Parallel()
+
+	markedUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(markedUp.Close)
+	var unmarkedHits int32
+	unmarkedUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&unmarkedHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	t.Cleanup(unmarkedUp.Close)
+	markedURL, _ := url.Parse(markedUp.URL)
+	unmarkedURL, _ := url.Parse(unmarkedUp.URL)
+
+	r := &router{
+		cfg: config{
+			Defaults:     defaults{MaxQueueDepth: 8, MaxConcurrency: 1, RequestTimeout: durationValue{Duration: 2 * time.Second}, MaxBodySize: 1 << 20},
+			PIILocalRule: "enforce",
+		},
+		client:    &http.Client{Timeout: 2 * time.Second},
+		semaphore: make(chan struct{}, 1),
+	}
+	marked := &upstreamNode{
+		cfg:     nodeConfig{Name: "marked", Tier: "fast", Priority: 1, Weight: 1, Models: []string{"alpha"}, PIILocal: true},
+		baseURL: markedURL,
+	}
+	unmarked := &upstreamNode{
+		cfg:     nodeConfig{Name: "cloud-fallback", Tier: "fast", Priority: 2, Weight: 1, Models: []string{"alpha"}},
+		baseURL: unmarkedURL,
+	}
+	marked.healthy.Store(true)
+	unmarked.healthy.Store(true)
+	r.nodes = []*upstreamNode{marked, unmarked}
+	r.piiRuleArmed.Store(true)
+
+	body := `{"model":"alpha","messages":[{"role":"user","content":"email sarah@example.com about the order"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.handleProxy(rec, req)
+
+	// The review's contract: personal ends 503 or on a marked node —
+	// never on the unmarked one. The marked node's own 500 may pass
+	// through (it IS a marked-node outcome); the assertion that bites
+	// is the unmarked upstream NEVER seeing the payload.
+	if got := atomic.LoadInt32(&unmarkedHits); got != 0 {
+		t.Fatalf("personal payload SPILLED to the unmarked fallback (%d hits)", got)
 	}
 }

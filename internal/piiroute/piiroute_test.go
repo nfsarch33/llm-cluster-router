@@ -84,17 +84,39 @@ func TestDetectPersonal_Round2(t *testing.T) {
 		"nested content":     `{"messages":[{"role":"user","content":"Ship to 8 Wattle St, NSW 3000"}]}`,
 		"dotted mobile":      `call 0412.345.678 now`,
 		"card pan":           `card 4242 4242 4242 4242 charged`,
-		"tfn":                `TFN 123 456 789 provided`,
+		"tfn":                `TFN 487 161 275 provided`,
 	}
 	for class, body := range rows {
 		if !DetectPersonal([]byte(body)) {
 			t.Errorf("%s payload must be personal: %q", class, body)
 		}
 	}
-	// A clean JSON payload with long numbers that are NOT personal
-	// shapes (token counts, ids without grouping) stays non-personal.
-	if DetectPersonal([]byte(`{"max_tokens":4096,"id":"chatcmpl-1234567890"}`)) {
-		t.Error("token/id payload must stay non-personal")
+	// Round 3: ordinary agent traffic the old digit-shape rules flagged —
+	// epoch milliseconds, byte counts, commit numbers — must stay
+	// non-personal: the checksum gates reject them and unseparated runs
+	// without a keyword never count.
+	notPersonalRound3 := map[string]string{
+		"epoch ms":   `{"created":1728375600123}`,
+		"bytes":      `allocated 104857600 bytes`,
+		"commit num": `see commit 12345678`,
+		"ns ts":      `ts=1728375600000000000`,
+	}
+	for class, body := range notPersonalRound3 {
+		if DetectPersonal([]byte(body)) {
+			t.Errorf("%s payload must stay non-personal: %q", class, body)
+		}
+	}
+	// And the checksums still CATCH the real thing: a valid Luhn PAN
+	// (grouped, no keyword needed) and a checksum-valid TFN.
+	if !DetectPersonal([]byte(`4111 1111 1111 1111 on file`)) {
+		t.Error("a Luhn-valid grouped PAN must be personal")
+	}
+	if !DetectPersonal([]byte(`TFN 487161275 given`)) {
+		t.Error("a checksum-valid TFN with keyword must be personal")
+	}
+	// The old round-2 rows still hold (keyword-bearing or grouped).
+	if !DetectPersonal([]byte(`card 4242 4242 4242 4242 charged`)) {
+		t.Error("keyword PAN row regressed")
 	}
 }
 

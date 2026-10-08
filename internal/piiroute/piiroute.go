@@ -13,6 +13,7 @@ package piiroute
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 )
 
 var (
@@ -25,12 +26,16 @@ var (
 	// 5432, 02 9876 5432 bare, and 0298765432 compact (4+4 digits).
 	// Phones: separators may be spaces, dashes OR dots (0412.345.678).
 	auPhoneRe = regexp.MustCompile(`(?:\+61[\s.-]?4\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|\b04\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|(?:\+61[\s.-]?|\(0[2-8]\)[\s.-]?|\b0[2378][\s.-]?)\d{4}[\s.-]?\d{4})`)
-	// Card numbers: 13-19 digits in groups of 4 (spaces/dashes), the
-	// PAN shape regardless of brand.
-	cardRe = regexp.MustCompile(`\b(?:\d[\s.-]?){13,19}\b`)
-	// AU tax file numbers: 8-9 digits, often spaced 3-3-3 or 2-3-3,
-	// sometimes suffixed with the checksum letter X.
-	tfnRe = regexp.MustCompile(`\b\d{3}[\s]?\d{3}[\s]?\d{3}X?\b|\b\d{2}[\s]?\d{3}[\s]?\d{3}X?\b`)
+	// Card PANs and TFNs match as CANDIDATE digit runs first and are
+	// confirmed by CHECKSUM (Luhn for cards, the ATO weighted sum for
+	// TFNs): an epoch-ms timestamp or a byte count is digits but never a
+	// valid PAN/TFN, and routine agent traffic carries such numbers
+	// constantly (round-3 finding). Without a card/TFN keyword nearby,
+	// only GROUPED runs (with separators) count — bare unseparated
+	// digit runs stay ordinary numbers.
+	cardCandidateRe = regexp.MustCompile(`\b(?:\d[\s.-]?){12,19}\b|\b\d{3}[\s]?\d{3}[\s]?\d{3}\b|\b\d{2}[\s]?\d{3}[\s]?\d{3}\b`)
+	cardKeywordRe   = regexp.MustCompile(`(?i)\b(card|visa|mastercard|amex|pan|payment)\b`)
+	tfnKeywordRe    = regexp.MustCompile(`(?i)\b(tfn|tax[[:space:]]+file)\b`)
 	// Address shapes: a number + street word, or an AU state + 4-digit
 	// postcode tail.
 	addressRe  = regexp.MustCompile(`(?i)\b\d{1,4}\s+[A-Z][a-z]+\s(st|street|rd|road|ave|avenue|dr|drive|ln|lane|ct|court|blvd|parade|pde)\b`)
@@ -66,14 +71,77 @@ func DetectPersonal(body []byte) bool {
 }
 
 func matchesAny(s string) bool {
-	return emailRe.MatchString(s) ||
+	if emailRe.MatchString(s) ||
 		auPhoneRe.MatchString(s) ||
-		cardRe.MatchString(s) ||
-		tfnRe.MatchString(s) ||
 		addressRe.MatchString(s) ||
 		postcodeRe.MatchString(s) ||
 		orderRe.MatchString(s) ||
-		enquiryRe.MatchString(s)
+		enquiryRe.MatchString(s) {
+		return true
+	}
+	return panOrTFN(s)
+}
+
+// panOrTFN confirms card/TFN candidates by checksum, with the
+// keyword-or-grouping rule from the comment above.
+func panOrTFN(s string) bool {
+	cardCtx := cardKeywordRe.MatchString(s)
+	tfnCtx := tfnKeywordRe.MatchString(s)
+	for _, m := range cardCandidateRe.FindAllString(s, -1) {
+		digits := keepDigits(m)
+		grouped := strings.ContainsAny(m, " .-")
+		switch {
+		case len(digits) == 9 && tfnValid(digits):
+			if tfnCtx || grouped {
+				return true
+			}
+		case len(digits) >= 13 && luhnValid(digits):
+			if cardCtx || grouped {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func keepDigits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// luhnValid is the mod-10 checksum every card PAN carries.
+func luhnValid(digits string) bool {
+	sum, alt := 0, false
+	for i := len(digits) - 1; i >= 0; i-- {
+		d := int(digits[i] - '0')
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+// tfnValid is the ATO weighted checksum (1,4,3,7,5,8,6,9,2; sum % 11 == 0).
+func tfnValid(digits string) bool {
+	if len(digits) != 9 {
+		return false
+	}
+	w := [9]int{1, 4, 3, 7, 5, 8, 6, 9, 2}
+	sum := 0
+	for i := 0; i < 9; i++ {
+		sum += int(digits[i]-'0') * w[i]
+	}
+	return sum%11 == 0
 }
 
 // decodeJSONStrings walks ONE nesting level of a JSON body and returns

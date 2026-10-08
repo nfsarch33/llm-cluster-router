@@ -252,12 +252,13 @@ opted in. `llm_router_pii_rule_armed` exposes the mode and
 unarmed detections (`detected_rule_off` — alert on a sustained rate)
 and refusals.
 
-Privacy-notice line (for client-facing material):
+Privacy-notice line (for client-facing material) — worded to what the
+code guarantees, no more:
 
-> Personal information in your requests is processed only on our own
-> hardware; cloud services receive no personal request content. Our
-> processing is not exclusively Australia-based.
-
-The notice deliberately makes NO Australian-residency claim while any
-cloud model receives inputs.
+> Where this system's routing constraint is enabled, request content it
+> classifies as personal (addresses, contact details, order and payment
+> identifiers) is routed only to infrastructure we control; other
+> content may be processed by external model providers. Classification
+> is pattern-based and not exhaustive. Processing is not exclusively
+> Australia-based.
 
