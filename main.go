@@ -49,6 +49,7 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"github.com/nfsarch33/llm-cluster-router/internal/keypool"
 	"github.com/nfsarch33/llm-cluster-router/internal/metrics"
+	"github.com/nfsarch33/llm-cluster-router/internal/piiroute"
 	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 	"github.com/nfsarch33/llm-cluster-router/internal/quota"
 	"github.com/nfsarch33/llm-cluster-router/internal/relcheck"
@@ -130,6 +131,12 @@ type router struct {
 	rr         atomic.Uint64
 	queueDepth atomic.Int64
 	inflight   atomic.Int64
+
+	// piiRuleArmed is the PII-local blast-radius guard: true only when
+	// the loaded config marks at least one node pii_local. Unarmed
+	// (every existing deployment) keeps routing exactly as before the
+	// rule existed; personal detection stays observability-only.
+	piiRuleArmed atomic.Bool
 
 	// buffering is the number of request bodies handleProxy is holding in
 	// memory right now, and bufferingPeak is the high-water mark since boot.
@@ -258,6 +265,11 @@ func (r *router) Reload(path string) error {
 	r.mu.Lock()
 	r.cfg = cfg
 	r.nodes = nodes
+	// Re-arm on reload: a config that adds (or removes) its last
+	// pii_local node flips the rule with the config, not the process.
+	anyPIILocal := anyNodePIILocal(nodes)
+	r.piiRuleArmed.Store(piiroute.RuleArmed(cfg.PIILocalRule, anyPIILocal))
+	piiArmedGauge.Set(boolToFloat(r.piiRuleArmed.Load()))
 	r.client = client
 	r.semaphore = sem
 	r.smart = smart
@@ -408,6 +420,24 @@ type upstreamNode struct {
 
 // AllowsClass reports whether the node may serve the workload class. An
 // empty Workloads list accepts both classes (backwards compatible).
+// anyNodePIILocal reports whether any loaded node carries the
+// pii_local mark.
+func anyNodePIILocal(nodes []*upstreamNode) bool {
+	for _, n := range nodes {
+		if n.cfg.PIILocal {
+			return true
+		}
+	}
+	return false
+}
+
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func (n *upstreamNode) AllowsClass(c proxy.WorkloadClass) bool {
 	if len(n.cfg.Workloads) == 0 {
 		return true
@@ -460,6 +490,8 @@ var (
 	nodeHealthyGauge          = metrics.NodeHealthyGauge
 	healthLatency             = metrics.HealthLatency
 	fairShareRejectedTotal    = metrics.FairShareRejectedTotal
+	piiLocalRequests          = metrics.PIILocalRequests
+	piiArmedGauge             = metrics.PIIArmedGauge
 )
 
 // Keep bridge aliases referenced for golangci-lint unused check.
@@ -659,6 +691,7 @@ func newRouter(cfg config) (*router, error) {
 	if err != nil {
 		return nil, err
 	}
+	anyPIILocal := anyNodePIILocal(nodes)
 	r := &router{
 		cfg:       cfg,
 		client:    client,
@@ -668,6 +701,8 @@ func newRouter(cfg config) (*router, error) {
 		// the sink; the relay path only offers events to its buffer.
 		attribution: proxy.NewAttribution(promAttributionSink{}, 1024),
 	}
+	r.piiRuleArmed.Store(piiroute.RuleArmed(cfg.PIILocalRule, anyPIILocal))
+	piiArmedGauge.Set(boolToFloat(r.piiRuleArmed.Load()))
 	smart, err := loadSmartRoute(cfg)
 	if err != nil {
 		return nil, err
@@ -1246,6 +1281,22 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	class := proxy.ClassFromRequest(req)
+	// PII-local rule: classify BEFORE any smartroute rewrite so the
+	// detector sees the payload as the client wrote it. Personal
+	// payloads are local-only and refused when no pii-local node serves
+	// the model — a cloud endpoint never receives one.
+	bodyPersonal := piiroute.DetectPersonal(body)
+	personal := bodyPersonal && r.piiRuleArmed.Load()
+	if personal {
+		slog.Info("router.pii_local", "model_hint", extractModel(body))
+		piiLocalRequests.WithLabelValues("detected").Inc()
+	} else if bodyPersonal {
+		// Observability-only on unarmed configs: the detector counts
+		// what it sees, but nothing is refused or diverted. ALERTABLE:
+		// personal payloads routing unconstrained means the rule is off
+		// on a config that carries them — page on a sustained rate.
+		piiLocalRequests.WithLabelValues("detected_rule_off").Inc()
+	}
 	if class == proxy.ClassCustomer {
 		// Paid client work must be attributable: customer requests carry
 		// a tenant id (the cost ledger keys on it) and are refused
@@ -1277,7 +1328,15 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	model := extractModel(body)
-	node := r.selectNodeFromSnap(snap, model, tier, "", class)
+	node := r.selectNodeFromSnap(snap, model, tier, "", class, personal)
+	if node == nil && personal {
+		// Fail closed — the enforce mode with no marked node, or every
+		// pii-local node unhealthy: never spill to a cloud node.
+		piiLocalRequests.WithLabelValues("no_local_node_refused").Inc()
+		http.Error(w, `{"error":"no pii-local upstream available for this request"}`, http.StatusServiceUnavailable)
+		requestsTotal.WithLabelValues(model, "none", "pii_no_local_node").Inc()
+		return
+	}
 	if node == nil {
 		// Fail closed per class. A customer request
 		// with no healthy customer-eligible node must never spill to an
@@ -1405,7 +1464,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 				candidate.breaker.RecordFailure()
 			}
 			lastErr = err
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1445,7 +1504,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 					// Retry the SAME node once more on the next healthy key
 					// by not adding it to the exclude set this pass.
 					delete(tried, candidate.cfg.Name)
-					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+					next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 					tried[candidate.cfg.Name] = struct{}{}
 					if next != nil && next.cfg.Name == candidate.cfg.Name {
 						requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
@@ -1464,7 +1523,7 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 			}
 			heldResp, heldNode, heldCancel = resp, candidate, attemptCancel
 			lastErr = nil
-			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class)
+			next := r.selectNodeFromSnapExcluding(snap, model, tier, tried, class, personal)
 			if next != nil {
 				requestRetries.WithLabelValues(model, candidate.cfg.Name).Inc()
 			}
@@ -1622,15 +1681,15 @@ func (r *router) selectNode(model, targetTier string) *upstreamNode {
 // still takes an RLock for tests that don't have a snapshot in
 // hand. New production code paths take a snap up front.
 func (r *router) selectNodeExcluding(model, targetTier, excludeName string) *upstreamNode {
-	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName, proxy.ClassInternal)
+	return r.selectNodeFromSnap(r.snap(), model, targetTier, excludeName, proxy.ClassInternal, false)
 }
 
-func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string, class proxy.WorkloadClass) *upstreamNode {
+func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeName string, class proxy.WorkloadClass, personal bool) *upstreamNode {
 	var excluded map[string]struct{}
 	if excludeName != "" {
 		excluded = map[string]struct{}{excludeName: {}}
 	}
-	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded, class)
+	return r.selectNodeFromSnapExcluding(snap, model, targetTier, excluded, class, personal)
 }
 
 // selectNodeFromSnapExcluding is the set-aware form of node selection used by
@@ -1644,7 +1703,7 @@ func (r *router) selectNodeFromSnap(snap routerSnap, model, targetTier, excludeN
 // either unhealthy, breaker-open, or already excluded — which is exactly how
 // the strict M3 -> fallback ordering is expressed in config (M3 keys share the
 // lowest priority; the fallback tier sits at a higher priority number).
-func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}, class proxy.WorkloadClass) *upstreamNode {
+func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier string, excluded map[string]struct{}, class proxy.WorkloadClass, personal bool) *upstreamNode {
 	type bucket struct {
 		priority   int
 		candidates []*upstreamNode
@@ -1657,6 +1716,12 @@ func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier 
 		// customer request can never land on an internal-only node
 		// (the paid-plan nodes), whatever tier or model it asks for.
 		if !node.AllowsClass(class) {
+			continue
+		}
+		// The PII-local rule filters beside the workload class: a
+		// personal payload can never land on a node without the
+		// pii_local mark, whatever tier, weight or model it offers.
+		if personal && piiroute.PersonalBlocks(personal, node.cfg.PIILocal) {
 			continue
 		}
 		if !node.healthy.Load() {

@@ -234,3 +234,31 @@ Issues and pull requests are welcome. Please include tests with behaviour change
 ## License
 
 [MIT](LICENSE) © nfsarch33
+
+## PII-local routing rule
+
+Requests whose body carries personal information (emails, Australian
+phone numbers, street addresses, order data, named enquiries, card PANs
+and TFNs — `internal/piiroute`) are routed only to nodes marked
+`pii_local: true` WHILE THE RULE IS ARMED. Arming is configuration:
+`pii_local_rule: auto` (default) arms only when a config marks at least
+one node; `enforce` arms always and refuses personal payloads with 503
+(`pii_no_local_node`) when no marked node can serve them; `off` keeps
+detection observability-only. When armed, a personal payload cannot
+reach a node without the mark; when not armed, routing is unchanged —
+the rule never silently changes behaviour for configs that have not
+opted in. `llm_router_pii_rule_armed` exposes the mode and
+`llm_router_pii_local_requests_total{outcome}` counts detections,
+unarmed detections (`detected_rule_off` — alert on a sustained rate)
+and refusals.
+
+Privacy-notice line (for client-facing material) — worded to what the
+code guarantees, no more:
+
+> Where this system's routing constraint is enabled, request content it
+> classifies as personal (addresses, contact details, order and payment
+> identifiers) is routed only to infrastructure we control; other
+> content may be processed by external model providers. Classification
+> is pattern-based and not exhaustive. Processing is not exclusively
+> Australia-based.
+
