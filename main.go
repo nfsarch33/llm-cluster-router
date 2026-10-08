@@ -132,6 +132,12 @@ type router struct {
 	queueDepth atomic.Int64
 	inflight   atomic.Int64
 
+	// piiRuleArmed is the PII-local blast-radius guard: true only when
+	// the loaded config marks at least one node pii_local. Unarmed
+	// (every existing deployment) keeps routing exactly as before the
+	// rule existed; personal detection stays observability-only.
+	piiRuleArmed atomic.Bool
+
 	// buffering is the number of request bodies handleProxy is holding in
 	// memory right now, and bufferingPeak is the high-water mark since boot.
 	// They exist because that count is the router MEMORY ceiling and nothing
@@ -259,6 +265,16 @@ func (r *router) Reload(path string) error {
 	r.mu.Lock()
 	r.cfg = cfg
 	r.nodes = nodes
+	// Re-arm on reload: a config that adds (or removes) its last
+	// pii_local node flips the rule with the config, not the process.
+	anyPIILocal := false
+	for _, n := range nodes {
+		if n.cfg.PIILocal {
+			anyPIILocal = true
+			break
+		}
+	}
+	r.piiRuleArmed.Store(piiroute.RuleArmed(anyPIILocal))
 	r.client = client
 	r.semaphore = sem
 	r.smart = smart
@@ -661,6 +677,13 @@ func newRouter(cfg config) (*router, error) {
 	if err != nil {
 		return nil, err
 	}
+	anyPIILocal := false
+	for _, n := range nodes {
+		if n.cfg.PIILocal {
+			anyPIILocal = true
+			break
+		}
+	}
 	r := &router{
 		cfg:       cfg,
 		client:    client,
@@ -670,6 +693,7 @@ func newRouter(cfg config) (*router, error) {
 		// the sink; the relay path only offers events to its buffer.
 		attribution: proxy.NewAttribution(promAttributionSink{}, 1024),
 	}
+	r.piiRuleArmed.Store(piiroute.RuleArmed(anyPIILocal))
 	smart, err := loadSmartRoute(cfg)
 	if err != nil {
 		return nil, err
@@ -1252,10 +1276,14 @@ func (r *router) handleProxy(w http.ResponseWriter, req *http.Request) {
 	// detector sees the payload as the client wrote it. Personal
 	// payloads are local-only and refused when no pii-local node serves
 	// the model — a cloud endpoint never receives one.
-	personal := piiroute.DetectPersonal(body)
+	personal := piiroute.DetectPersonal(body) && r.piiRuleArmed.Load()
 	if personal {
 		slog.Info("router.pii_local", "model_hint", extractModel(body))
 		piiLocalRequests.WithLabelValues("detected").Inc()
+	} else if piiroute.DetectPersonal(body) {
+		// Observability-only on unarmed configs: the detector counts
+		// what it sees, but nothing is refused or diverted.
+		piiLocalRequests.WithLabelValues("detected_rule_off").Inc()
 	}
 	if class == proxy.ClassCustomer {
 		// Paid client work must be attributable: customer requests carry
@@ -1680,7 +1708,7 @@ func (r *router) selectNodeFromSnapExcluding(snap routerSnap, model, targetTier 
 		// The PII-local rule filters beside the workload class: a
 		// personal payload can never land on a node without the
 		// pii_local mark, whatever tier, weight or model it offers.
-		if piiroute.PersonalBlocks(personal, node.cfg.PIILocal) {
+		if personal && piiroute.PersonalBlocks(personal, node.cfg.PIILocal) {
 			continue
 		}
 		if !node.healthy.Load() {

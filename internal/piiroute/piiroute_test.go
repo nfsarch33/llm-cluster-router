@@ -7,13 +7,20 @@ import "testing"
 // system prompt or a code body must NOT trip the rule.
 func TestDetectPersonal(t *testing.T) {
 	personal := map[string]string{
-		"email":     `Send the invoice to sarah.chen@example.com.au please`,
-		"au mobile": `Customer called back on 0412 345 678 about the order`,
-		"au land":   `Ring the shop on (02) 9876 5432 before noon`,
-		"address":   `Ship to 42 Wattle Street, Bendigo VIC 3550`,
-		"postcode":  `Delivery region: NSW 2000 metro only`,
-		"order id":  `Order #A-10493 for the merino beanie has shipped`,
-		"enquiry":   `Hi team, my name is Dana and my address is 8/12 King St`,
+		"email": `Send the invoice to sarah.chen@example.com.au please`,
+		// The reviewer's probe body: a noreply address IS an email shape,
+		// so the detector says personal — the OPT-IN rule (not a weaker
+		// detector) is what keeps coding-agent traffic routing on
+		// configs with no pii_local nodes.
+		"git author":    `git commit --author="dev <dev@users.noreply.github.com>" -m fix`,
+		"int'l mobile":  `+61 412 345 678 is the customer's number`,
+		"bare landline": `Ring 02 9876 5432 before noon`,
+		"au mobile":     `Customer called back on 0412 345 678 about the order`,
+		"au land":       `Ring the shop on (02) 9876 5432 before noon`,
+		"address":       `Ship to 42 Wattle Street, Bendigo VIC 3550`,
+		"postcode":      `Delivery region: NSW 2000 metro only`,
+		"order id":      `Order #A-10493 for the merino beanie has shipped`,
+		"enquiry":       `Hi team, my name is Dana and my address is 8/12 King St`,
 	}
 	for class, body := range personal {
 		if !DetectPersonal([]byte(body)) {
@@ -24,6 +31,7 @@ func TestDetectPersonal(t *testing.T) {
 		"system prompt": `You are a shop assistant. Draft a warm product description for a merino beanie. Use Australian spelling.`,
 		"code":          `func main() { fmt.Println("order of operations") }`,
 		"model talk":    `Summarise the quarterly order flow trends by category.`,
+		"order words":   `Summarise order number trends by week for the shop`,
 	}
 	for class, body := range notPersonal {
 		if DetectPersonal([]byte(body)) {

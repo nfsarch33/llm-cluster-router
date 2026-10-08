@@ -43,6 +43,21 @@ func TestSelectNodePersonalNeverClouds(t *testing.T) {
 		t.Fatal("ordinary traffic must still route on the cloud pool")
 	}
 
+	// THE BLAST-RADIUS ROW (round 1): a cloud-only config never arms the
+	// rule, so the reviewer's probe body — an email in a git commit
+	// --author line — must still ROUTE (the handler's personal flag is
+	// detection && armed, and armed is false with zero pii_local nodes).
+	if piiroute.RuleArmed(false) {
+		t.Fatal("the rule must not arm on a config with zero pii_local nodes")
+	}
+	unarmed := piiroute.DetectPersonal([]byte(`git commit --author="dev <dev@users.noreply.github.com>" -m fix`)) && piiroute.RuleArmed(false)
+	if unarmed {
+		t.Fatal("on an unarmed config the email body must stay non-personal for routing (observability-only)")
+	}
+	if got := r.selectNodeFromSnap(snap, "alpha", "", "", proxy.ClassInternal, unarmed); got == nil {
+		t.Fatal("the round-1 probe body must still route on a cloud-only config with the rule off")
+	}
+
 	// With a pii_local node present, personal selects it — and ONLY it,
 	// even at a worse priority than every cloud node.
 	cfg.Nodes = append(cfg.Nodes, nodeConfig{
