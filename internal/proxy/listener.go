@@ -71,9 +71,12 @@ type aesMTLSListenerFactory struct {
 	// different keys and lets future config-based wiring swap
 	// the source.
 	key [32]byte
-	// ephemeralKeys are the server long-term X25519 keys for the
-	// ephemeral handshake (HCX1); empty = static-only listener.
-	ephemeralKeys []crypto.LongTermKey
+	// noiseKeys configure the Noise_IKpsk2 channel (server static +
+	// per-tenant PSKs); zero value = static-only listener.
+	noiseKeys crypto.NoiseKeys
+	// requireEphemeral refuses the legacy static channel (downgrade
+	// resistance after tenant cutover).
+	requireEphemeral bool
 }
 
 // NewAESMTLSListenerFactory returns a ListenerFactory for the
@@ -101,8 +104,8 @@ func NewAESMTLSListenerFactoryWithKey(key [32]byte) ListenerFactory {
 // else falls through to the legacy static wrap on the same port. keys
 // carries the current long-term key first and any previous key kept for
 // rotation; empty = static-only (no ephemeral support advertised).
-func NewAESMTLSListenerFactoryEphemeral(key [32]byte, keys []crypto.LongTermKey) ListenerFactory {
-	return &aesMTLSListenerFactory{key: key, ephemeralKeys: keys}
+func NewAESMTLSListenerFactoryEphemeral(key [32]byte, keys crypto.NoiseKeys, requireEphemeral bool) ListenerFactory {
+	return &aesMTLSListenerFactory{key: key, noiseKeys: keys, requireEphemeral: requireEphemeral}
 }
 
 // defaultDemoAESKey returns a non-secret placeholder key for the
@@ -152,7 +155,7 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 			// anything else stays on the legacy static wrap (one port,
 			// both generations of clients). keys come from the factory's
 			// configured long-term keys; nil = static-only.
-			wrapped, _ := crypto.Negotiate(conn, a.ephemeralKeys, key, 5*time.Second)
+			wrapped, _ := crypto.Negotiate(conn, a.noiseKeys, key, a.requireEphemeral, 5*time.Second)
 			if wrapped == nil {
 				// handshake failure already closed the conn (fail closed)
 				continue

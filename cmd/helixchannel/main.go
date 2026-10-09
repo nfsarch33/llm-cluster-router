@@ -34,6 +34,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -73,19 +74,33 @@ func main() {
 			fail("factory-probe", err)
 		}
 	case "keygen-ephemeral":
-		// Long-term X25519 keypair for the ephemeral handshake: prints
-		// the PRIVATE key base64 (goes to the server env/config) and the
-		// PUBLIC key base64 (goes to client pins). Values only leave via
-		// stdout exactly once; the operator pipes them where they belong.
-		priv, err := crypto.GenerateLongTermKey()
+		// F6: the PRIVATE half never reaches stdout or logs. It is
+		// written to a 0600 file given by -out (default
+		// ./helixchannel-server-key.<id>); stdout carries ONLY the
+		// public key and the key id. PSKs are NOT generated here —
+		// per-tenant PSKs come from the operator's secret store.
+		fs := flag.NewFlagSet("keygen-ephemeral", flag.ExitOnError)
+		outFile := fs.String("out", "", "0600 file for the private half (default ./helixchannel-server-key.<id>)")
+		_ = fs.Parse(os.Args[2:])
+		priv, err := crypto.NoiseStaticKeypair()
 		if err != nil {
 			fail("keygen-ephemeral", err)
 		}
+		id := "hc-" + hex.EncodeToString(crypto.SHA256Bytes(priv.PublicKey().Bytes()))[:8]
+		path := *outFile
+		if path == "" {
+			path = "helixchannel-server-key." + id
+		}
+		if err := os.WriteFile(path,
+			[]byte(base64.StdEncoding.EncodeToString(priv.Bytes())+"\n"), 0o600); err != nil {
+			fail("keygen-ephemeral", err)
+		}
 		env := map[string]string{
-			"subcommand":      "keygen-ephemeral",
-			"private_key_b64": base64.StdEncoding.EncodeToString(priv.Bytes()),
-			"public_key_b64":  base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()),
-			"note":            "private half goes to the server only; public half is the client pin",
+			"subcommand":       "keygen-ephemeral",
+			"key_id":           id,
+			"public_key_b64":   base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()),
+			"private_key_file": path,
+			"note":             "private half written 0600 to " + path + " — never printed",
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(env); err != nil {
 			fail("keygen-ephemeral", err)

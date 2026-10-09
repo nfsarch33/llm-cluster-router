@@ -34,7 +34,8 @@ func main() {
 		upstream  = flag.String("upstream", "", "router host:port")
 		serverPub = flag.String("server-pub", "", "base64 X25519 long-term public key (or HELIXCHANNEL_SERVER_PUB)")
 		keyID     = flag.String("key-id", "", "server key id (or HELIXCHANNEL_KEY_ID)")
-		staticKey = flag.String("static-key", "", "base64 32-byte fallback key (or HELIXCHANNEL_KEY)")
+		staticKey = flag.String("static-key", "", "base64 32-byte legacy key (or HELIXCHANNEL_KEY); used ONLY with -allow-static-fallback")
+		allowFB   = flag.Bool("allow-static-fallback", false, "permit the legacy static channel when noise fails (migration aid; WARN+metric on every use)")
 	)
 	flag.Parse()
 	env := func(name, v string) string {
@@ -68,12 +69,19 @@ func main() {
 		}
 		copy(fallback[:], fb)
 	}
+	var psk []byte
+	if v := os.Getenv("HELIXCHANNEL_PSK"); v != "" {
+		psk = []byte(v)
+	} else {
+		log.Fatal("helixchannel-client: HELIXCHANNEL_PSK (tenant PSK, 32 bytes) is required")
+	}
 	err = hcclient.Forward(hcclient.Options{
-		ListenAddr:   *listen,
-		Upstream:     *upstream,
-		Pin:          crypto.ServerPin{ID: *keyID, Pub: pub},
-		StaticKey:    fallback,
-		HandshakeTTL: 5 * time.Second,
+		ListenAddr:          *listen,
+		Upstream:            *upstream,
+		Pin:                 crypto.NoisePin{StaticID: *keyID, StaticPub: pub, Tenant: os.Getenv("HELIXCHANNEL_TENANT"), PSK: psk},
+		AllowStaticFallback: *allowFB,
+		StaticKey:           fallback,
+		HandshakeTTL:        5 * time.Second,
 	})
 	if err != nil {
 		log.Fatalf("helixchannel-client: %v", err)

@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"bytes"
-	"crypto/ecdh"
 	"net"
 	"testing"
 	"time"
@@ -15,8 +14,7 @@ func TestNegotiateLegacyReplay(t *testing.T) {
 	for i := range staticKey {
 		staticKey[i] = byte(i + 7)
 	}
-	lt, _ := GenerateLongTermKey()
-	keys := []LongTermKey{{ID: "k1", Priv: lt}}
+	keys := NoiseKeys{}
 
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
@@ -27,7 +25,7 @@ func TestNegotiateLegacyReplay(t *testing.T) {
 		_, _ = legacy.Write([]byte("legacy-first-bytes"))
 	}()
 
-	got, mode := Negotiate(server, keys, staticKey, time.Second)
+	got, mode := Negotiate(server, keys, staticKey, false, time.Second)
 	if mode != "static" {
 		t.Fatalf("mode = %q, want static", mode)
 	}
@@ -41,17 +39,20 @@ func TestNegotiateLegacyReplay(t *testing.T) {
 // N2 — HCX1 magic routes to the ephemeral path; garbage routes static.
 func TestNegotiateRouting(t *testing.T) {
 	staticKey := [32]byte{}
-	lt, _ := GenerateLongTermKey()
-	keys := []LongTermKey{{ID: "k2026a", Priv: lt}}
+	keys := NoiseKeys{}
 
-	// ephemeral client
+	// HCX2 magic routes to the noise path; full noise round trips are
+	// covered by noisechannel_test.go
 	c, s := net.Pipe()
 	go func() {
-		_, _ = ClientHandshake(c, ServerPin{ID: "k2026a", Pub: lt.PublicKey()}, time.Second)
+		_, _ = c.Write([]byte(NoiseMagic))
 	}()
-	_, mode := Negotiate(s, keys, staticKey, time.Second)
-	if mode != "ephemeral" {
-		t.Fatalf("HCX1 routed to %q, want ephemeral", mode)
+	got, mode := Negotiate(s, keys, staticKey, false, time.Second)
+	if mode != "noise" {
+		t.Fatalf("HCX2 routed to %q, want noise", mode)
+	}
+	if got != nil {
+		_ = got.Close()
 	}
 	_ = c.Close()
 
@@ -61,7 +62,7 @@ func TestNegotiateRouting(t *testing.T) {
 		_, _ = c2.Write([]byte("GET / HTTP/1.1\r\n"))
 		_, _ = c2.Write(bytes.Repeat([]byte{0xAA}, 200))
 	}()
-	got, mode2 := Negotiate(s2, keys, staticKey, time.Second)
+	got, mode2 := Negotiate(s2, keys, staticKey, false, time.Second)
 	if mode2 != "static" || got == nil {
 		t.Fatalf("garbage routed to %q (conn nil: %v)", mode2, got == nil)
 	}
@@ -73,11 +74,9 @@ func TestNegotiateNoKeysAlwaysStatic(t *testing.T) {
 	staticKey := [32]byte{}
 	c, s := net.Pipe()
 	go func() { _, _ = c.Write([]byte("HCX1")); _, _ = c.Write(bytes.Repeat([]byte{1}, 64)) }()
-	got, mode := Negotiate(s, nil, staticKey, time.Second)
+	got, mode := Negotiate(s, NoiseKeys{}, staticKey, false, time.Second)
 	if mode != "static" || got == nil {
 		t.Fatalf("no-keys mode = %q", mode)
 	}
 	_ = c.Close()
 }
-
-var _ = ecdh.X25519 // keep import parity with future vector work

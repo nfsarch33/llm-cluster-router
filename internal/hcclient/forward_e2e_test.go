@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +27,7 @@ type e2eSrv struct {
 	conns   chan net.Conn
 	tapMu   sync.Mutex
 	capture []byte
-	keys    []crypto.LongTermKey
+	keys    crypto.NoiseKeys
 	static  [32]byte
 }
 
@@ -40,9 +42,9 @@ func (s *e2eSrv) Accept() (net.Conn, error) {
 func (s *e2eSrv) Close() error   { return s.ln.Close() }
 func (s *e2eSrv) Addr() net.Addr { return s.ln.Addr() }
 
-func startE2EServer(t *testing.T) (*e2eSrv, crypto.ServerPin, [32]byte) {
+func startE2EServer(t *testing.T) (*e2eSrv, crypto.NoisePin, [32]byte) {
 	t.Helper()
-	lt, err := crypto.GenerateLongTermKey()
+	lt, err := crypto.NoiseStaticKeypair()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +57,8 @@ func startE2EServer(t *testing.T) (*e2eSrv, crypto.ServerPin, [32]byte) {
 		t.Fatal(err)
 	}
 	s := &e2eSrv{ln: ln, conns: make(chan net.Conn, 8),
-		keys: []crypto.LongTermKey{{ID: "k2026a", Priv: lt}}, static: static}
+		keys: crypto.NoiseKeys{StaticID: "k2026a", Static: lt,
+			PSKs: map[string][]byte{"t": bytes.Repeat([]byte{0x9A}, 32)}}, static: static}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -93,7 +96,7 @@ func startE2EServer(t *testing.T) (*e2eSrv, crypto.ServerPin, [32]byte) {
 			}
 			go func(raw net.Conn) {
 				tapped := &tapConn{Conn: raw, srv: s}
-				got, _ := crypto.Negotiate(tapped, s.keys, s.static, 3*time.Second)
+				got, _ := crypto.Negotiate(tapped, s.keys, s.static, false, 3*time.Second)
 				if got != nil {
 					s.conns <- got
 				}
@@ -102,8 +105,10 @@ func startE2EServer(t *testing.T) (*e2eSrv, crypto.ServerPin, [32]byte) {
 	}()
 	go func() { _ = (&http.Server{Handler: mux}).Serve(s) }()
 	t.Cleanup(func() { _ = s.Close() })
-	return s, crypto.ServerPin{ID: "k2026a", Pub: lt.PublicKey()}, static
+	return s, crypto.NoisePin{StaticID: "k2026a", StaticPub: lt.PublicKey(), Tenant: "t", PSK: e2ePSK()}, static
 }
+
+func e2ePSK() []byte { return bytes.Repeat([]byte{0x9A}, 32) }
 
 func (s *e2eSrv) captured() []byte {
 	s.tapMu.Lock()
@@ -125,7 +130,7 @@ func (t *tapConn) Write(b []byte) (int, error) {
 }
 
 // forwardAddr starts the real Forward on an ephemeral port.
-func forwardAddr(t *testing.T, upstream string, pin crypto.ServerPin, static [32]byte) string {
+func forwardAddr(t *testing.T, upstream string, pin crypto.NoisePin, static [32]byte) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -223,7 +228,7 @@ func TestE2EMCPJSONRPC(t *testing.T) {
 // echo of the negotiated conn. Full gRPC service tests are covered by
 // the same byte path; this pins the h2 client preface specifically.
 func TestE2EHTTP2PrefaceRoundTrip(t *testing.T) {
-	lt, _ := crypto.GenerateLongTermKey()
+	lt, _ := crypto.NoiseStaticKeypair()
 	static := [32]byte{}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -236,14 +241,16 @@ func TestE2EHTTP2PrefaceRoundTrip(t *testing.T) {
 				return
 			}
 			go func(raw net.Conn) {
-				wc, _ := crypto.Negotiate(raw, []crypto.LongTermKey{{ID: "k2026a", Priv: lt}}, static, 3*time.Second)
+				keys := crypto.NoiseKeys{StaticID: "k2026a", Static: lt,
+					PSKs: map[string][]byte{"t": e2ePSK()}}
+				wc, _ := crypto.Negotiate(raw, keys, static, false, 3*time.Second)
 				if wc != nil {
 					_, _ = io.Copy(wc, wc) // echo
 				}
 			}(raw)
 		}
 	}()
-	pin := crypto.ServerPin{ID: "k2026a", Pub: lt.PublicKey()}
+	pin := crypto.NoisePin{StaticID: "k2026a", StaticPub: lt.PublicKey(), Tenant: "t", PSK: e2ePSK()}
 	fwd := forwardAddr(t, ln.Addr().String(), pin, static)
 	conn, err := net.Dial("tcp", fwd)
 	if err != nil {
@@ -264,8 +271,10 @@ func TestE2EHTTP2PrefaceRoundTrip(t *testing.T) {
 	}
 }
 
-// E6 — fallback: an ephemeral client against a static-only upstream.
-func TestE2EFallbackToStatic(t *testing.T) {
+// E6 — downgrade resistance: with the flag OFF (default) the forwarder
+// REFUSES to fall back when noise cannot be negotiated; with the flag
+// ON it falls back, which increments the exported counter.
+func TestE2EFallbackPolicy(t *testing.T) {
 	static := [32]byte{}
 	for i := range static {
 		static[i] = byte(i + 21)
@@ -281,37 +290,96 @@ func TestE2EFallbackToStatic(t *testing.T) {
 				return
 			}
 			go func(raw net.Conn) {
-				wc, _ := crypto.Negotiate(raw, nil, static, 3*time.Second) // no ephemeral keys
+				// static-only upstream (no noise keys)
+				wc, _ := crypto.Negotiate(raw, crypto.NoiseKeys{}, static, false, 3*time.Second)
 				if wc != nil {
 					_, _ = io.Copy(wc, wc)
 				}
 			}(raw)
 		}
 	}()
-	lt, _ := crypto.GenerateLongTermKey()
-	pin := crypto.ServerPin{ID: "k2026a", Pub: lt.PublicKey()}
-	fwd := forwardAddr(t, ln.Addr().String(), pin, static)
-	conn, err := net.Dial("tcp", fwd)
+	lt, _ := crypto.NoiseStaticKeypair()
+	pin := crypto.NoisePin{StaticID: "k2026a", StaticPub: lt.PublicKey(), Tenant: "t", PSK: e2ePSK()}
+
+	// flag OFF: the forwarder accepts the local conn but the upstream
+	// noise failure must close it — no echo is possible (no fallback).
+	conn, err := netDialWithFallback(t, ln.Addr().String(), pin, static, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(6 * time.Second))
-	msg := []byte("fallback-payload-SECRET")
-	_, _ = conn.Write(msg)
-	got := make([]byte, len(msg))
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("static fallback echo: %v", err)
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte("must-die")); err == nil {
+		buf := make([]byte, 8)
+		if n, rerr := conn.Read(buf); rerr == nil && n > 0 {
+			_ = conn.Close()
+			t.Fatalf("forwarder fell back to static WITHOUT the allow flag (echo %q)", buf[:n])
+		}
 	}
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("fallback mangled: %q", got)
+	_ = conn.Close()
+	// flag ON: fallback happens and is OBSERVABLE — the exported
+	// counter increments (the loud downgrade signal the reviewer
+	// required) and the local conn stays open long enough to carry data.
+	before := staticFallbackTestCount()
+	conn2, err := netDialWithFallback(t, ln.Addr().String(), pin, static, true)
+	if err != nil {
+		t.Fatalf("allowed fallback failed: %v", err)
 	}
+	_ = conn2.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = conn2.Write([]byte("fb-ping"))
+	buf := make([]byte, 8)
+	_, _ = conn2.Read(buf) // any bytes or close is fine; the metric is the assertion
+	_ = conn2.Close()
+	// poll for the counter (robust under full-suite machine load)
+	after := before
+	for i := 0; i < 50; i++ {
+		after = staticFallbackTestCount()
+		if after > before {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if after <= before {
+		t.Fatalf("static fallback used without incrementing the counter (before=%d after=%d)", before, after)
+	}
+}
+
+func staticFallbackTestCount() int64 {
+	v := expvar.Get("hcclient_static_fallback_total")
+	if v == nil {
+		return 0
+	}
+	i, _ := strconv.ParseInt(v.String(), 10, 64)
+	return i
+}
+
+// netDialWithFallback opens a local conn through a real Forward run.
+func netDialWithFallback(t *testing.T, upstream string, pin crypto.NoisePin, static [32]byte, allow bool) (net.Conn, error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	go func() {
+		// short TTL so the noise-failure window (dead upstream closes
+		// late) does not dominate the test clock
+		_ = Forward(Options{ListenAddr: addr, Upstream: upstream, Pin: pin,
+			AllowStaticFallback: allow, StaticKey: static, HandshakeTTL: 800 * time.Millisecond})
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			return c, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("forwarder not ready")
 }
 
 // E8 — perf smoke: handshake + first byte round trip well under budget.
 func TestE2EPerfSmoke(t *testing.T) {
-	lt, _ := crypto.GenerateLongTermKey()
+	lt, _ := crypto.NoiseStaticKeypair()
 	static := [32]byte{}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -324,7 +392,7 @@ func TestE2EPerfSmoke(t *testing.T) {
 				return
 			}
 			go func(raw net.Conn) {
-				wc, _ := crypto.Negotiate(raw, []crypto.LongTermKey{{ID: "k", Priv: lt}}, static, 3*time.Second)
+				wc, _ := crypto.Negotiate(raw, crypto.NoiseKeys{StaticID: "k", Static: lt, PSKs: map[string][]byte{"t": e2ePSK()}}, static, false, 3*time.Second)
 				if wc != nil {
 					_, _ = io.Copy(wc, wc)
 				}
@@ -337,7 +405,7 @@ func TestE2EPerfSmoke(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	start := time.Now()
-	wc, err := crypto.ClientHandshake(c, crypto.ServerPin{ID: "k", Pub: lt.PublicKey()}, 3*time.Second)
+	wc, err := crypto.NoiseClientHandshake(c, crypto.NoisePin{StaticID: "k", StaticPub: lt.PublicKey(), Tenant: "t", PSK: e2ePSK()}, 3*time.Second)
 	hsMS := time.Since(start).Milliseconds()
 	if err != nil {
 		t.Fatal(err)

@@ -76,3 +76,33 @@ are follow-up work per the spec, not this drop).
 Metadata protection; company-device deployment; concealing VPN state.
 Lightsail rollout is an operator step; this drop proves the wire at
 loopback fidelity.
+
+## v2 delta (security-review round, 2026-10-09) — what changed and why
+
+The custom handshake was REPLACED by Option A per the frozen threat
+model (docs/design/helixchannel-ephemeral-keys-threat-model.md):
+Noise_IKpsk2_25519_AESGCM_SHA256 via github.com/flynn/noise v1.1.0
+(supply-chain gate PASSED: pinned tag, BSD-2-Clause, govulncheck zero
+findings in the dependency, code-path read recorded in the threat
+model). Changes to this plan:
+
+- Negotiation magic is now `HCX2` (the never-deployed custom `HCX1`
+  protocol is deleted from the branch — no rollout compat owed).
+- NEW properties tested: client auth via per-tenant PSK (U-C, psk2
+  semantics: the server answers blind at m1; a wrong-PSK client can
+  never authenticate m2 — single-PSK listeners reject at handshake),
+  per-direction keys + counter nonces (U-E: replay AND reflection both
+  rejected with tamper-count assertions), downgrade resistance
+  (N-B: marker-strip refused under requireEphemeral; E6 split into
+  E6a flag-OFF = channel unusable, E6b flag-ON = fallback works AND
+  increments hcclient_static_fallback_total).
+- KAT: the Noise state machine is validated by the library's own
+  cacophony-verified suite; OUR layer pins direction separation and
+  channel-binding behaviour (U-A) rather than self-generated vectors.
+- Fuzzing added IN THIS DROP (F5): FuzzHandshakeClientHello,
+  FuzzHandshakeServerHello, FuzzNegotiatePeek, 60 s each; corpus
+  totals 13 / 11 / 10, zero failures.
+- keygen-ephemeral (F6): private half written 0600 to a file, stdout
+  carries ONLY public key + key id.
+- cmd/helixchannel-client requires HELIXCHANNEL_PSK (32 bytes) +
+  HELIXCHANNEL_TENANT; -allow-static-fallback defaults OFF.

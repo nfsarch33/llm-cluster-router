@@ -7,8 +7,10 @@
 package hcclient
 
 import (
+	"expvar"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"time"
 
@@ -19,8 +21,14 @@ import (
 type Options struct {
 	ListenAddr string // local plain listener, e.g. 127.0.0.1:8081
 	Upstream   string // router address, host:port
-	Pin        crypto.ServerPin
-	// StaticKey is the fallback channel key (all-zero = no fallback).
+	Pin        crypto.NoisePin
+	// AllowStaticFallback enables the LEGACY static channel when the
+	// Noise handshake cannot be completed. OFF by default (downgrade
+	// resistance); every use logs WARN and increments
+	// hcclient_static_fallback_total.
+	AllowStaticFallback bool
+	// StaticKey is the legacy channel key (used only when the flag is
+	// set; all-zero = refuse even with the flag).
 	StaticKey    [32]byte
 	HandshakeTTL time.Duration
 }
@@ -58,26 +66,30 @@ func Forward(opts Options) error {
 	}
 }
 
-// dialWrapped connects upstream and returns a wrapped conn: ephemeral
-// first; on handshake failure, one retry on the static channel.
+// dialWrapped connects upstream and returns a secured conn: the
+// Noise_IKpsk2 channel (HCX2). The legacy static channel is used ONLY
+// when AllowStaticFallback is set, and every such use is loudly
+// recorded (WARN log + expvar counter) so downgrade attempts are
+// visible in operations.
 func dialWrapped(opts Options) (net.Conn, string, error) {
 	raw, err := net.DialTimeout("tcp", opts.Upstream, opts.HandshakeTTL)
 	if err != nil {
 		return nil, "", fmt.Errorf("hcclient: dial %s: %w", opts.Upstream, err)
 	}
-	// A healthy upstream answers the handshake in milliseconds; bounding
-	// the first attempt keeps the static fallback snappy when the peer
-	// never speaks HCX1.
 	ephTTL := opts.HandshakeTTL
-	if ephTTL > 2*time.Second {
-		ephTTL = 2 * time.Second
+	if ephTTL <= 0 {
+		ephTTL = 5 * time.Second
 	}
-	wc, err := crypto.ClientHandshake(raw, opts.Pin, ephTTL)
+	wc, err := crypto.NoiseClientHandshake(raw, opts.Pin, ephTTL)
 	if err == nil {
-		return wc, "ephemeral", nil
+		return wc, "noise", nil
 	}
 	_ = raw.Close()
-	// Fallback: static channel (server sniff keeps the same port).
+	if !opts.AllowStaticFallback {
+		return nil, "", fmt.Errorf("hcclient: noise handshake failed (%v) and static fallback is disabled (default; pass -allow-static-fallback during migration only)", err)
+	}
+	log.Printf("WARN hcclient: static fallback used — noise handshake failed: %v", err)
+	staticFallbacks.Add(1)
 	raw2, err := net.DialTimeout("tcp", opts.Upstream, opts.HandshakeTTL)
 	if err != nil {
 		return nil, "", fmt.Errorf("hcclient: redial %s: %w", opts.Upstream, err)
@@ -85,3 +97,9 @@ func dialWrapped(opts Options) (net.Conn, string, error) {
 	sw := crypto.Wrap(raw2, opts.StaticKey)
 	return sw, "static", nil
 }
+
+// staticFallbacks counts downgrade-resistance exceptions: every use of
+// the legacy static channel. Exposed as hcclient_static_fallback_total.
+var staticFallbacks expvar.Int
+
+func init() { expvar.Publish("hcclient_static_fallback_total", &staticFallbacks) }
