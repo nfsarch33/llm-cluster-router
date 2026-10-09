@@ -23,12 +23,34 @@ import (
 // e2eSrv is a dual-mode upstream: Negotiate per conn over a tap so the
 // E2E can assert no plaintext on the wire.
 type e2eSrv struct {
-	ln      net.Listener
-	conns   chan net.Conn
-	tapMu   sync.Mutex
-	capture []byte
-	keys    crypto.NoiseKeys
-	static  [32]byte
+	ln          net.Listener
+	conns       chan net.Conn
+	connsClosed bool
+	tapMu       sync.Mutex
+	capture     []byte
+	keys        crypto.NoiseKeys
+	static      [32]byte
+}
+
+// closeConns closes the capture channel exactly once, under the same mutex
+// the senders hold, so a late negotiate can never send on a closed channel
+// (the -race failure at count>=5).
+func (s *e2eSrv) closeConns() {
+	s.tapMu.Lock()
+	defer s.tapMu.Unlock()
+	if !s.connsClosed {
+		close(s.conns)
+		s.connsClosed = true
+	}
+}
+
+// addConn delivers a negotiated conn unless the server already closed.
+func (s *e2eSrv) addConn(c net.Conn) {
+	s.tapMu.Lock()
+	defer s.tapMu.Unlock()
+	if !s.connsClosed {
+		s.conns <- c
+	}
 }
 
 // Accept/listener interface so http.Server.Serve consumes negotiated conns.
@@ -91,14 +113,14 @@ func startE2EServer(t *testing.T) (*e2eSrv, crypto.NoisePin, [32]byte) {
 		for {
 			raw, err := ln.Accept()
 			if err != nil {
-				close(s.conns)
+				s.closeConns()
 				return
 			}
 			go func(raw net.Conn) {
 				tapped := &tapConn{Conn: raw, srv: s}
 				got, _ := crypto.Negotiate(tapped, s.keys, s.static, false, 3*time.Second)
 				if got != nil {
-					s.conns <- got
+					s.addConn(got)
 				}
 			}(raw)
 		}
