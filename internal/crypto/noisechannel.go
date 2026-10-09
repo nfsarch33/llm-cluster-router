@@ -29,8 +29,8 @@ import (
 // NoiseMagic marks the Noise channel during negotiation.
 const NoiseMagic = "HCX2"
 
-// HandshakeError distinguishes negotiation failures from record tamper.
-var HandshakeError = errors.New("crypto: channel negotiation failed")
+// ErrHandshakeError distinguishes negotiation failures from record tamper.
+var ErrHandshakeError = errors.New("crypto: channel negotiation failed")
 
 // ErrNoiseTampered marks an AEAD authentication failure on a Noise
 // record (replay/reorder/mutation all land here).
@@ -150,18 +150,18 @@ func NoiseServerHandshake(conn net.Conn, keys NoiseKeys, timeout time.Duration) 
 	// tenant selector: 1-byte length + id (cleartext, see client side)
 	var tlen [1]byte
 	if _, err := io.ReadFull(conn, tlen[:]); err != nil {
-		return nil, fmt.Errorf("%w: read tenant id: %v", HandshakeError, err)
+		return nil, fmt.Errorf("%w: read tenant id: %v", ErrHandshakeError, err)
 	}
 	tenant := make([]byte, int(tlen[0]))
 	if int(tlen[0]) > 0 {
 		if _, err := io.ReadFull(conn, tenant); err != nil {
-			return nil, fmt.Errorf("%w: read tenant id: %v", HandshakeError, err)
+			return nil, fmt.Errorf("%w: read tenant id: %v", ErrHandshakeError, err)
 		}
 	}
 	psk, okT := keys.PSKs[string(tenant)]
 	if !okT {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: unknown tenant %q", HandshakeError, string(tenant))
+		return nil, fmt.Errorf("%w: unknown tenant %q", ErrHandshakeError, string(tenant))
 	}
 
 	m1, err := readFrame(conn)
@@ -182,7 +182,7 @@ func NoiseServerHandshake(conn net.Conn, keys NoiseKeys, timeout time.Duration) 
 	}
 	if _, _, _, err := cs.ReadMessage(nil, m1); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: client hello did not authenticate: %v", HandshakeError, err)
+		return nil, fmt.Errorf("%w: client hello did not authenticate: %v", ErrHandshakeError, err)
 	}
 	msg, sc1, sc2, err := cs.WriteMessage(nil, nil)
 	if err != nil {
