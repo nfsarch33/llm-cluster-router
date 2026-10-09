@@ -71,6 +71,9 @@ type aesMTLSListenerFactory struct {
 	// different keys and lets future config-based wiring swap
 	// the source.
 	key [32]byte
+	// ephemeralKeys are the server long-term X25519 keys for the
+	// ephemeral handshake (HCX1); empty = static-only listener.
+	ephemeralKeys []crypto.LongTermKey
 }
 
 // NewAESMTLSListenerFactory returns a ListenerFactory for the
@@ -90,6 +93,16 @@ func NewAESMTLSListenerFactory() ListenerFactory {
 // production callers that load the key from a secret store.
 func NewAESMTLSListenerFactoryWithKey(key [32]byte) ListenerFactory {
 	return &aesMTLSListenerFactory{key: key}
+}
+
+// NewAESMTLSListenerFactoryEphemeral layers the ephemeral-key handshake
+// (spec v1) on top of the static-key factory: each accepted conn is
+// sniffed — HCX1 magic negotiates a per-session X25519 key, everything
+// else falls through to the legacy static wrap on the same port. keys
+// carries the current long-term key first and any previous key kept for
+// rotation; empty = static-only (no ephemeral support advertised).
+func NewAESMTLSListenerFactoryEphemeral(key [32]byte, keys []crypto.LongTermKey) ListenerFactory {
+	return &aesMTLSListenerFactory{key: key, ephemeralKeys: keys}
 }
 
 // defaultDemoAESKey returns a non-secret placeholder key for the
@@ -135,8 +148,18 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 			// metric. The wrapper's Close is sufficient to
 			// release the underlying conn; we do not need a
 			// separate defer.
-			wrapped := crypto.Wrap(conn, key)
-			startTamperForwarder(wrapped)
+			// Ephemeral-key spec v1: sniff HCX1 → ephemeral handshake;
+			// anything else stays on the legacy static wrap (one port,
+			// both generations of clients). keys come from the factory's
+			// configured long-term keys; nil = static-only.
+			wrapped, _ := crypto.Negotiate(conn, a.ephemeralKeys, key, 5*time.Second)
+			if wrapped == nil {
+				// handshake failure already closed the conn (fail closed)
+				continue
+			}
+			if wc, ok := wrapped.(*crypto.WrapConn); ok {
+				startTamperForwarder(wc)
+			}
 			// Production HTTP handling is delegated to the
 			// caller's http.Server. We close the wrapped conn
 			// here so the demo's ServeLoop does not leak
