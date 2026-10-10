@@ -73,7 +73,7 @@ func Ping(ctx context.Context, baseURL string) (Browser, error) {
 	if err != nil {
 		return Browser{}, fmt.Errorf("cdp.Ping: connect %s: %w", endpoint, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return Browser{}, fmt.Errorf("cdp.Ping: %s: status %d", endpoint, resp.StatusCode)
 	}

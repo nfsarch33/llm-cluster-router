@@ -193,12 +193,27 @@ func TestChaos_FairSpreadAcrossTwoM3Keys(t *testing.T) {
 func TestChaos_LatencyTimeoutTriggersFailover(t *testing.T) {
 	t.Parallel()
 	const model = "minimax-m3"
-	slow := newProgrammableUpstream(t, "slow", model, always(upstreamBehavior{delay: 300 * time.Millisecond}))
+	slow := newProgrammableUpstream(t, "slow", model, always(upstreamBehavior{delay: 1500 * time.Millisecond}))
 	fast := newProgrammableUpstream(t, "fast", model, always(upstreamBehavior{}))
 	sNode := newTestNode(t, "m3-slow", slow.URL, "reasoning", 0, 1, []string{model}, 8, time.Minute, nil)
 	fNode := newTestNode(t, "m3-fast", fast.URL, "reasoning", 10, 1, []string{model}, 8, time.Minute, nil)
-	// Router timeout (40ms) << injected latency (300ms) => deterministic timeout.
-	r := newFailoverRouter([]*upstreamNode{sNode, fNode}, 40*time.Millisecond)
+	// Router timeout (200ms) << injected latency (1500ms) => deterministic timeout
+	// on the primary. The 7.5x ratio is what makes the primary's timeout certain;
+	// the ABSOLUTE value is what makes the FALLBACK's success certain, and only
+	// the ratio was being reasoned about before.
+	//
+	// This used to be 40ms/300ms. Same ratio, but 40ms is not a safe budget for
+	// "an instant local round trip": under -race with the whole repo running in
+	// parallel, an httptest server can take longer than that just to be
+	// scheduled, and then the FALLBACK leg times out too and the test reports
+	// 502 "context deadline exceeded" -- a failure that looks like broken
+	// failover and is really a loaded machine. Observed roughly one run in six
+	// at load average ~5 on 16 cores; zero failures in 8 isolated runs.
+	//
+	// Scaled 5x rather than loosened: every assertion below is unchanged, and
+	// the property under test (primary timeout MUST fail over to the fallback)
+	// is asserted exactly as strictly as before.
+	r := newFailoverRouter([]*upstreamNode{sNode, fNode}, 200*time.Millisecond)
 
 	code, body := doChat(r, model)
 	if code != 200 {

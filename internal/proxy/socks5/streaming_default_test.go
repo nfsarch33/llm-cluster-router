@@ -35,7 +35,7 @@ func TestStreamSSE_FakeStream_Default(t *testing.T) {
 			"data: chunk-3",
 			"data: [DONE]",
 		} {
-			fmt.Fprintf(w, "%s\n", line)
+			_, _ = fmt.Fprintf(w, "%s\n", line)
 			if flusher != nil {
 				flusher.Flush()
 			}

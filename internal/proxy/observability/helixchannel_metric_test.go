@@ -12,6 +12,11 @@ import (
 // production-isolated Prometheus registry and increment like the
 // legacy listener families.
 func TestHelixChannelMetrics_RegisterAndIncrement(t *testing.T) {
+	// Absolute-value assertions (series count, byte sum) against
+	// package-level vectors: start from a known zero so test order cannot
+	// change the answer.
+	Reset()
+
 	reg := prometheus.NewRegistry()
 	if err := RegisterMetrics(reg); err != nil {
 		t.Fatalf("RegisterMetrics: %v", err)

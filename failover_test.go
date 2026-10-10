@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/proxy"
 )
 
 // testCtx returns a background context for direct runHealthPass calls in unit
@@ -45,7 +47,7 @@ func newProgrammableUpstream(t *testing.T, name, model string, fault func(hit in
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model"}]}`, model)
+		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model"}]}`, model)
 	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, _ *http.Request) {
 		hit := pu.hits.Add(1)
@@ -63,9 +65,9 @@ func newProgrammableUpstream(t *testing.T, name, model string, fault func(hit in
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		if b.body != "" {
-			fmt.Fprint(w, b.body)
+			_, _ = fmt.Fprint(w, b.body)
 		} else {
-			fmt.Fprintf(w, `{"id":"x","model":%q,"choices":[{"message":{"role":"assistant","content":%q}}]}`, model, "ok-from-"+name)
+			_, _ = fmt.Fprintf(w, `{"id":"x","model":%q,"choices":[{"message":{"role":"assistant","content":%q}}]}`, model, "ok-from-"+name)
 		}
 	})
 	pu.Server = httptest.NewServer(mux)
@@ -168,12 +170,12 @@ func TestSelectNodeFromSnapExcluding_SkipsExcludedSet(t *testing.T) {
 	snap := r.snap()
 
 	excluded := map[string]struct{}{"a": {}}
-	got := r.selectNodeFromSnapExcluding(snap, model, "", excluded)
+	got := r.selectNodeFromSnapExcluding(snap, model, "", excluded, proxy.ClassInternal, false)
 	if got == nil || got.cfg.Name != "b" {
 		t.Fatalf("expected node b when a excluded, got %v", got)
 	}
 	excluded["b"] = struct{}{}
-	if got := r.selectNodeFromSnapExcluding(snap, model, "", excluded); got != nil {
+	if got := r.selectNodeFromSnapExcluding(snap, model, "", excluded, proxy.ClassInternal, false); got != nil {
 		t.Fatalf("expected nil when all nodes excluded, got %s", got.cfg.Name)
 	}
 }

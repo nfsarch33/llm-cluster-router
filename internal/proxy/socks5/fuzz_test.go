@@ -71,7 +71,7 @@ func FuzzSOCKS5(f *testing.F) {
 			t.Skipf("factory.Listen: %v (skipping; retry on next iter)", err)
 			return
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 
 		serveDone := make(chan struct{})
 		go func() {
@@ -89,7 +89,7 @@ func FuzzSOCKS5(f *testing.F) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Write the fuzz input. Ignore short-write errors; the
 		// server is expected to drop the connection on bad input.

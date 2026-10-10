@@ -56,7 +56,7 @@ func TestDualListenerDemo_E2ESmoke_HTTPThroughAesMTLSListener(t *testing.T) {
 		<-done
 		t.Fatalf("http do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		cancel()
@@ -119,7 +119,7 @@ func TestDualListenerDemo_E2ESmoke_SOCKS5ConnectToUpstream(t *testing.T) {
 		<-done
 		t.Fatalf("dial socks5: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	// Step 1: greeting

@@ -1,328 +1,264 @@
 # llm-cluster-router
 
-OpenAI-compatible HTTP reverse-proxy for multi-node vLLM and Ollama clusters with global concurrency limiting and priority-based routing.
+An OpenAI-compatible router that spreads LLM traffic across a fleet of local and hosted model servers, with health checks, queueing, fair-share scheduling and circuit breaking.
 
-> **HelixChannel quickstart** — Build the doctor probe and validate
-> release-readiness before deploying:
-> ```bash
-> go build -o helixchannel ./cmd/helixchannel
-> ./helixchannel doctor   # JSON envelope: release-gate + ADR-085 + AES key + observability
-> ```
-> See [`cmd/helixchannel/`](cmd/helixchannel/) for `version`, `factory-probe`,
-> `key-check`, `header-stamp`, and `endpoint-check` subcommands.
+Point any OpenAI-compatible client at one endpoint. The router picks a healthy upstream, applies per-tenant limits, and keeps a slow or dead node from taking the rest down with it.
 
-> **Production ingress (v18714+)** — The HelixChannel production wire
-> reaches operators and pilot consumers via `TCP/443` (TLS-terminating
-> nginx → `127.0.0.1:14443` on the Lightsail instance `lightsail-tunnel`
-> at `203.0.113.10`), per
-> [ADR-086](../cursor-global-kb/adrs/ADR-086-helixchannel-port-443-migration.md).
-> The application-layer AES-256-GCM channel is unchanged; only the
-> transport moved from SSH-22 (pilot) to TLS/443 (production pilot).
-> Canonical reverse-proxy runbook:
-> [`cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md`](../cursor-global-kb/sop/lightsail-port-443-reverse-proxy.md).
+## Table of Contents
 
-> **Public hostname (v18714-11)** — Pilots (Kilo Code, Peer, and any
-> IDE that refuses to pin an OpenAI-compatible endpoint to a raw IP)
-> target `https://helixchannel.example.com/v1`. The DNS A-record is
-> managed via DreamHost and points at the Lightsail static IP
-> `203.0.113.10`; TLS is terminated by Let's Encrypt via `certbot` on
-> the Lightsail host. See
-> [`docs/helixchannel-deployment.md`](docs/helixchannel-deployment.md)
-> for the full DNS + cert + nginx runbook.
->
-> ```bash
-> # Probes both transports and recommends the better path.
-> ./helixchannel endpoint-check
-> # uses HELIXCHANNEL_BASE_URL env > --base-url flag > default
-> # https://helixchannel.example.com to derive the host.
-> ```
+- [Background](#background)
+- [Features](#features)
+- [Install](#install)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Endpoints](#endpoints)
+- [HelixChannel](#helixchannel)
+- [Observability](#observability)
+- [Development](#development)
+- [Security](#security)
+- [Contributing](#contributing)
+- [License](#license)
 
-### Per-tenant channel preference (v18714-7)
+## Background
 
-Both encrypted channels are simultaneously live and operators / clients
-choose which one to dial. The default for new tenants is the AES-256-GCM
-channel on `helixchannel.example.com:443` (more secure); the SSH-22
-SOCKS5 channel on `lightsail-tunnel:22` is the fallback when AES/mTLS
-fails or when a consumer (e.g. the Kilo Code pilot, CI runners) prefers
-the lower-friction SSH path.
+A homelab or small cluster ends up with several inference endpoints: a couple of GPU boxes running llama.cpp or vLLM, an Ollama instance, and one or two hosted APIs for the jobs local hardware cannot handle. Clients should not have to know which is which, and one saturated node should not stall everything else.
 
-| Preference | Behaviour |
-|---|---|
-| `--channel prefer-aes-mtls` (default) | Try AES-256-GCM first; fall back to SOCKS5 on transport failure. |
-| `--channel prefer-socks5` | Try SSH-22 SOCKS5 first; fall back to AES-256-GCM on transport failure. |
-| `--channel aes-mtls` | Force AES-256-GCM. Hard fail if unreachable. |
-| `--channel socks5` | Force SOCKS5. Hard fail if unreachable. |
-| `--channel auto` | Probe both, pick the faster path per session. |
-
-Equivalent env var: `LLMROUTER_CHANNEL_PREFERENCE` (one of
-`prefer-aes-mtls|prefer-socks5|aes-mtls|socks5|auto`). The default
-when unset is `prefer-aes-mtls`.
-
-The canonical observability signal is
-`helixchannel_session_total{channel="...",outcome="..."}` (per
-v18714-3), and the Grafana dashboard
-`observability/grafana/helixchannel-sessions-dashboard.json`
-visualises the channel mix. Per-tenant routing decisions are
-recorded under the `channel` label so operators can audit which
-tenants lean on which transport.
-
-Decision rationale (full Bayesian analysis): see
-[`cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md`](../cursor-global-kb/reports/research/v18714-7-channel-decision-socks5-vs-aesmtls.md)
-(posterior P(both, configurable per-tenant) = 0.86; second-place
-SOCKS5-only at 0.09; acceptance threshold 0.70).
-
-## HelixChannel (encrypted dual-listener)
-
-HelixChannel is the operator-facing name for the AES-256-GCM
-application-layer encrypted HTTP channel that fronts every router
-deployment. It is the brand name for the dual-listener design
-introduced incrementally across v18704-v18710 and standardised by
-ADR-085 (`adrs/ADR-085-helixchannel-prod-wire.md` in the
-`cursor-global-kb` repo).
-
-### Threat model
-
-- Wire captures on the path between the router and the upstreams
-  see ciphertext only; plaintext LLM prompts, completions, and
-  bearer tokens never appear on the wire.
-- An attacker who can R/W to the TCP socket cannot silently tamper
-  with a request because every frame is AES-GCM authenticated.
-  Tampering events are counted in
-  `llm_cluster_router_decrypt_failed_total{listener="aes-mtls"}`
-  and surface as an incident in Grafana.
-
-### ListenerFactory contract
-
-The router owns a `proxy.ListenerFactory` per channel. The
-factory's `Channel()` returns a stable identifier (currently
-`"aes-mtls"`) used for metrics, logging, and config keys. The
-factory's `Listen(ctx, addr)` returns a bound `net.Listener` plus
-the `ServeLoop` that should be run for it. The production
-`main.go` constructs the AES/mTLS factory by default; the
-`HELIXCHANNEL_ENABLED=false` env override keeps the legacy plain
-HTTP listener for back-compat.
-
-### Operator-facing config
-
-| Key | Default | Notes |
-| --- | --- | --- |
-| `HELIXCHANNEL_ENABLED` | `true` | Toggle the AES/mTLS factory. `false` keeps the legacy plain HTTP listener for back-compat. |
-| `HELIXCHANNEL_KEY` | demo placeholder | 32-byte AES-256 key. Production callers load this from a secret store (see `internal/proxy/listener.go`). |
-| `HELIXCHANNEL_LISTEN` | `cfg.Listen` | Override the bind address (host:port). Falls back to the legacy `listen:` YAML key. |
-
-The response header `HelixChannel-Version: <version>` is stamped
-on every reply; `curl -I https://host/` is the canonical proof-of-name
-artifact.
-
-### Additive metric families (v18712-1)
-
-Both legacy and new label keys are populated by the dual-listener
-ServeLoop, so existing Grafana panels keep working:
-
-- `llm_cluster_router_connections_total{listener="aes-mtls",direction="in"}`
-  — legacy channel label
-- `llm_cluster_router_helixchannel_connections_total{direction="in"}`
-  — operator-facing alias
+`llm-cluster-router` sits in front of them and presents a single OpenAI-compatible API. It tracks upstream health, bounds queue depth and concurrency per node, sheds load when a node degrades, and shares capacity between callers instead of letting one client monopolise a GPU.
 
 ## Features
 
-- **OpenAI-compatible API** — drop-in `/v1/chat/completions` and `/v1/models` proxy
-- **Global queue + concurrency control** — configurable max queue depth and max concurrency protect upstreams from overload
-- **Per-user fair-share queuing** — sliding-window token bucket per user (keyed by `X-User` header or bearer token hash) prevents any single user from monopolising the cluster (v0.2.0)
-- **Multi-upstream** — route to multiple vLLM, Ollama, or any OpenAI-compatible backend
-- **SSE streaming** — full Server-Sent Events pass-through for streaming completions
-- **Tier-based routing** — assign nodes to tiers (agent, fast, reasoning) with priority and weight
-- **Health checking** — automatic health probing with configurable thresholds; supports both vLLM (`/health`) and Ollama (`/v1/models`) backends
-- **Per-upstream circuit breaker** — flapping nodes are dropped from rotation faster than the health-check loop notices; 5-failure threshold, 30s cooldown, exposed via `llm_router_circuit_state` gauge
-- **Prometheus `/metrics`** — request latency + TTFT histograms (LLM-tuned 50ms..120s buckets), queue depth gauges, per-node health status, upstream error counters
-- **Benchmark harness** — built-in `bench` subcommand with TTFT p50/p95, generation tokens/sec, and cancellation probes
-- **GPU probing** — `probe-gpu` subcommand for NVIDIA GPU inventory, VRAM usage, and compute process bindings
-- **Bearer auth** — optional bearer token authentication for `/v1/*` endpoints
-- **Env var expansion** — `${ENV_VAR}` syntax in config YAML for secrets
-- **SIGHUP reload** — atomic config reload (nodes, auth token, timeouts, health-check tuning) without dropping inflight requests; `listen`, `metrics_addr`, `debug_addr`, and `max_body_size` still require restart
+- **OpenAI-compatible surface** — `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`; existing SDKs and tools work unchanged.
+- **Health-aware routing** — periodic probes with configurable thresholds; unhealthy nodes leave the pool and rejoin automatically.
+- **Bounded concurrency and queueing** — per-node `max_concurrency` and `max_queue_depth`, so a slow upstream applies backpressure instead of exhausting memory. Admission is decided before the request body is allocated, and `defaults.body_read_timeout` bounds that read, so a caller that stops sending mid-upload is answered `408` and gives its queue slot straight back instead of holding it against everybody else.
+- **Circuit breaking** — repeated failures trip a breaker with a cooldown, and `/readyz` reflects it.
+- **Fair-share scheduling** — optional per-user weighting so one caller cannot starve the others.
+- **Tiered routing** — route by an `X-Tier` header to steer heavy jobs at bigger nodes.
+- **Smart routing (`smart_route`)** — send `model: "auto"` and a policy file picks the model, tier and sampling parameters per task class (code / long-context / chat). Callers are identified via the `X-Helixon-Agent` header (or User-Agent sniffing) with one boolean per agent to turn its route on or off (`scripts/agent-route.sh <agent> on|off`; a gated-off agent gets `403`). An agent entry may also set `force_class` to pin ALL of that agent's traffic to one class even when its UI insists on its own model ids.
+- **Quota-aware key rotation** — a node may carry several `api_keys` (e.g. three paid token plans). A `429` or a body matching `quota_detect_regex` cools only the key that hit the wall (`defaults.key_cooldown`); the node's breaker is scored only when every key is cooling, and each event increments `llm_router_quota_fallback_total` and posts to Slack when `LLM_ROUTER_SLACK_WEBHOOK_URL` is set. See `configs/router.minimax.example.yml` for the reference three-plan setup.
+- **Version self-check** — release builds (`make build`) compare themselves against the newest upstream tag at startup and log a warning when outdated. Never blocks; dev builds are exempt.
+- **Hot reload** — `SIGHUP` re-reads the config; nodes can be added or drained without dropping traffic.
+- **Prometheus metrics and Grafana dashboards** — request rates, latencies, queue depth, breaker state.
+- **[HelixChannel](#helixchannel)** — an optional encrypted egress path that keeps provider API keys off client machines and off the wire.
 
-## Quickstart
+## Install
+
+Prebuilt binaries are published on the [releases page](https://github.com/nfsarch33/llm-cluster-router/releases).
+
+From source (Go 1.25 or newer):
 
 ```bash
-go install github.com/nfsarch33/llm-cluster-router@latest
-
-# Or build from source
-git clone https://github.com/nfsarch33/llm-cluster-router.git
+git clone https://github.com/nfsarch33/llm-cluster-router
 cd llm-cluster-router
-go build -o llm-cluster-router .
+go build -o llm-router .
+```
 
-# Run with sample config
-./llm-cluster-router serve -config router.sample.yml
+With a container runtime:
+
+```bash
+podman build -t llm-cluster-router:local -f Containerfile .
+```
+
+## Usage
+
+```bash
+# Start with a config file
+./llm-router serve -config router.sample.yml
+
+# Then use it like any OpenAI endpoint
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-27b","messages":[{"role":"user","content":"hello"}]}'
+```
+
+Point a client at it by setting the base URL, for example `OPENAI_BASE_URL=http://127.0.0.1:8787/v1`.
+
+Other subcommands:
+
+```bash
+./llm-router bench      # load-test the configured nodes
+./llm-router probe-gpu  # report GPU capacity discovered on upstream hosts
 ```
 
 ## Configuration
 
-Copy `router.sample.yml` and customise:
+The router reads a YAML file. A minimal example:
 
 ```yaml
-listen: ":8080"
-metrics_addr: ":9091"
+listen: ":8787"
+# Host-less means loopback: ":9091" binds 127.0.0.1:9091, not every
+# interface. Spell an explicit host (0.0.0.0, ::, an address) to opt out.
+metrics_addr: "127.0.0.1:9091"
 log_level: info
-
-# Optional bearer auth for /v1/* endpoints
-# auth_token: ${ROUTER_AUTH_TOKEN}
 
 defaults:
   max_queue_depth: 8
   max_concurrency: 2
   request_timeout: 120s
+  body_read_timeout: 15s   # inactivity bound on reading a request body; 0s or omitted = 15s
+  circuit:
+    threshold: 5
+    cooldown: 30s
+
+nodes:
+  - name: gpu-1
+    url: http://10.0.0.10:8001
+    tier: large
+    models: [qwen3-27b]
+  - name: ollama
+    url: http://10.0.0.11:11434
+    tier: small
+    models: [qwen3-8b, nomic-embed-text]
 
 health_check:
   interval: 15s
-  timeout: 5s
+  timeout: 3s
   path: /health
   unhealthy_threshold: 3
-  healthy_threshold: 1
+  healthy_threshold: 2
+  live_probe:            # bounds /healthz?live=1; 0 or omitted = 10s / 3
+    interval: 10s
+    burst: 3
+```
 
-# Per-user fair-share (disabled by default)
-fair_share:
-  enabled: false
-  max_requests_per_user: 10
-  window: 60s
-  burst: 3
+Smart routing and per-agent gates are configured via `smart_route: {enabled, policy_file}` with the policy documented in [`configs/smartroute.example.yml`](configs/smartroute.example.yml). See [`router.sample.yml`](router.sample.yml) for the full annotated schema, including fair-share and per-tenant options. Secrets are referenced as `${ENV_VAR}` and resolved at load time; the router never stores credentials in its own config.
 
-nodes:
-  - name: gpu-0-agent
-    url: http://127.0.0.1:8001
-    tier: agent
-    priority: 0
-    weight: 4
-    models: ["qwen3.5-27b"]
-  - name: gpu-1-fast
-    url: http://127.0.0.1:8002
-    tier: fast
-    priority: 0
-    weight: 2
-    models: ["qwen3.5-9b"]
+Send `SIGHUP` to reload after an edit:
+
+```bash
+kill -HUP "$(pgrep -f 'llm-router serve')"
 ```
 
 ## Endpoints
 
-| Endpoint | Description |
+| Path | Purpose |
 |---|---|
-| `/v1/chat/completions` | OpenAI-compatible chat completions proxy |
-| `/v1/models` | Aggregated model inventory from healthy upstreams |
-| `/healthz` | Router health plus per-node status |
-| `/metrics` | Prometheus metrics |
-| `/debug/pprof/*` | Optional pprof (when `debug_addr` is set) |
+| `/v1/chat/completions`, `/v1/models`, `/v1/embeddings` | OpenAI-compatible API |
+| `/healthz` (alias `/health`) | Rich per-node health JSON: ok, healthy/total nodes, queue depth, inflight, and a per-node `{name, tier, url, models, healthy, probe_ms}` array. `?live=1` forces a live probe (`&timeout=500ms` optional). |
+| `/readyz` | Readiness; fails while every node is unhealthy or breakers are open |
+| `/metrics` | Prometheus exposition (on `metrics_addr`, loopback by default) |
+| `/debug/pprof/*` | Off unless `debug_addr` is set; loopback by default |
 
-## Grafana dashboard
+### Diagnostic listeners and the anonymous surface
 
-Import `dashboards/llm-cluster-router.json` into Grafana 11+. The
-dashboard exposes a `$datasource` template variable so it works in
-any Grafana org without per-panel edits, plus `$model` and `$node`
-filters wired to the metrics the router exports.
+`/health`, `/healthz` and `/readyz` are anonymous by design -- reverse proxies,
+blackbox exporters and status pages poll them without a credential, and gating
+them would trade a disclosure risk for a monitoring outage. Bearer auth
+(`auth_token`) covers `/v1/*` only.
 
-Panels:
+Two consequences are handled explicitly:
 
-- Healthy upstreams, inflight, queue depth, RPS (top-row stat panels)
-- End-to-end latency p50 / p95 / p99 by model
-- Time-to-first-byte (TTFT) p50 / p95 / p99 by model
-- Requests/sec by node + status (stacked bars)
-- Queue depth and inflight (timeseries)
-- Per-node health (1 = healthy, 0 = unhealthy)
-- Upstream health-probe p95 latency
+- **`metrics_addr` and `debug_addr` bind loopback when the host is omitted.**
+  `":9091"` resolves to `127.0.0.1:9091`; `":6060"` to `127.0.0.1:6060`. Neither
+  listener has an auth layer, and pprof serves heap and goroutine dumps plus a
+  CPU-profile endpoint that blocks for its whole duration. An explicit host --
+  `0.0.0.0:9091`, `[::]:6060`, a specific address -- is honoured verbatim, so the
+  wildcard bind remains available as a deliberate choice. pprof stays off
+  entirely unless `debug_addr` is set.
+- **`?live=1` is rate-limited.** Plain `/healthz` reads a cached flag; `?live=1`
+  makes one inbound request fan out to one outbound probe per upstream, which is
+  an amplification lever rather than a liveness check. It is bounded by a global
+  token bucket (`health_check.live_probe`, default one sweep per 10s with a burst
+  of 3). Exceeding the bound does **not** return 429: the response degrades to
+  the cached view with `"live_probe": false, "live_probe_throttled": true`, and
+  increments `llm_router_health_live_probe_throttled_total`. Plain `/healthz` is
+  never throttled and its response is unchanged.
 
-A test in `dashboards/dashboard_test.go` enforces the dashboard
-references every metric the router exports, so any future metric
-additions must update both the router and the dashboard JSON in
-the same commit.
+## HelixChannel
 
-## Reload
+HelixChannel is an optional component for a specific problem: getting agent traffic to a provider **without putting provider API keys on every client machine**, and without trusting the network in between.
 
-Send `SIGHUP` to the router process to atomically swap config without
-dropping inflight requests:
+A gateway runs on a host you control. Clients send requests with a placeholder credential; the gateway swaps in the real key held server-side and forwards to the provider over TLS. Adding, removing or switching off a provider is an edit to the gateway's config file:
 
-```bash
-kill -HUP $(pgrep -f 'llm-cluster-router serve')
+```yaml
+routes:
+  - name: codex
+    prefix: /codex/
+    upstream: https://api.openai.com
+    auth: inject          # server-held key replaces the client's placeholder
+    key_file: /run/secrets/openai.key
+    enabled: false        # feature flag — flip to true to switch it on
 ```
 
-What reloads:
+Two modes cover the clients you are likely to have:
 
-- `nodes` (add, remove, change models, weights, priority, API keys)
-- `auth_token` (rotate bearer token)
-- `defaults.request_timeout`, `defaults.max_queue_depth`,
-  `defaults.max_concurrency`
-- `health_check.*` (interval, timeout, path, thresholds)
+- **`inject`** — the gateway supplies the credential. Right for API-key providers, and the reason a laptop never needs a copy of the key.
+- **`passthrough`** — the caller's own credential is forwarded untouched. Right for clients holding a session token that must terminate at the provider.
 
-What still requires a process restart:
-
-- `listen`, `metrics_addr`, `debug_addr` (listener sockets)
-- `defaults.max_body_size` (bound at server boot)
-
-A failed reload (file not found, YAML parse error, missing required
-node fields) is rejected and the previous config stays in effect.
-Inflight requests continue using the previous concurrency budget;
-new requests use the new one. Both budgets coexist briefly during
-the swap and resolve naturally as the old requests drain.
-
-## Benchmark
+For clients that cannot be pointed at a rewritten base URL without losing functionality, the gateway also offers an authenticated, allowlisted **CONNECT tunnel**: it pipes bytes without terminating the inner TLS, so the client's session stays end-to-end encrypted and opaque to every hop, gateway included.
 
 ```bash
-./llm-cluster-router bench \
-  -url http://127.0.0.1:8080 \
-  -model qwen3.5-27b \
-  -requests 8 \
-  -concurrency 2 \
-  -output benchmark-report.json
+# Server: one process, all routes
+helixchannel gateway --config /etc/helixchannel/gateway.yml
+
+# Client: a loopback proxy the agent points HTTPS_PROXY at
+helixchannel proxy --gateway gateway.example.com:8443 --token-file ~/.config/helixchannel/connect.token
 ```
 
-Reports include TTFT p50/p95, latency p50/p95, prompt and generation tokens/sec, queue depth, and cancellation probe results.
+Guides: **[HelixChannel](docs/helixchannel.md)** · **[Kilo Code setup](docs/kilo-code-setup.md)** · **[Claude Code setup](docs/claude-code-setup.md)**
 
-## Tests
+## Observability
 
-Two suites:
+Prometheus metrics are exposed on `metrics_addr`, covering request counts and latency by node and model, queue depth, in-flight requests, breaker state and health transitions. Dashboards live in [`dashboards/`](dashboards/); import the JSON into Grafana and point it at your Prometheus.
+
+## Development
 
 ```bash
-# Unit tests (run on every push, fast, default lane)
-go test -race ./...
-
-# Integration tests (build-tagged so the default lane stays fast)
-go test -tags=integration -timeout=2m -count=1 -race -v -run TestIT_ ./...
+go test ./...                       # unit tests
+go test -race ./...                 # race detector
+go test -tags=integration ./...     # integration lane
+golangci-lint run                   # lint
 ```
 
-The integration suite (`it_test.go`, `//go:build integration`) starts the
-router in-process with mock OpenAI-compatible upstream servers
-(`net/http/httptest.NewServer`) and exercises:
+Integration and end-to-end tests are behind build tags so the default lane stays fast. Tests that need a live upstream skip rather than fail when credentials are absent, so a fresh clone is green without any secrets.
 
-- `TestIT_NoStarvationUnderConcurrentLoad` — burst load from multiple
-  X-User producers; asserts every producer completes within ±20% of
-  equal share (no header-based bias).
-- `TestIT_StreamingSSEPassthrough` — Server-Sent Events from upstream
-  reach the client unchanged with a `[DONE]` terminator.
-- `TestIT_FailoverWhenUpstreamReturns502` — when the primary upstream
-  starts returning HTTP 502, traffic continues to flow via the fallback
-  upstream advertising the same model.
-- `TestIT_ModelsAggregation` — `/v1/models` aggregates inventory from
-  every healthy upstream.
-- `TestIT_PrometheusExpositionFormat` — `/metrics` exposes
-  `llm_router_requests_total`, `_request_duration_seconds`,
-  `_queue_depth`, `_inflight_requests`, and `_node_healthy` with the
-  expected types and labels.
+### CI and enforcement
 
-CI runs both suites on every push and PR — see `.github/workflows/ci.yml`.
+Required status checks on `main` (admins included): `leak-scan`, `gitleaks`, `test`, `security` — a PR cannot merge until all four pass on the self-hosted runner. Two E2E lanes run every 6 hours and on push: `live-e2e` (the deployed edge: routing, credential injection, CONNECT boundary) and `local-e2e` (the local serving topology: router health, model health, a real chat round-trip, the agent gate, policy validation). Mirror CI locally with `make vet test integration lint security`, and `make live-e2e` for the live lane.
+
+Release readiness criteria live in [docs/release-readiness.md](docs/release-readiness.md).
 
 ## Security
 
-> **Do not** point this router at corporate or managed AI gateways.
-> This tool is designed for self-hosted local GPU clusters only.
+- Credentials are read from environment variables or files, never from argv, and are not written to logs. Audit records carry request metadata only — no bodies, no headers, no keys.
+- Per-agent attribution counters (`hlxn_router_requests_by_agent_total`, `hlxn_router_agent_request_duration_seconds`) label by the caller-supplied `X-Helixon-Agent` identity header only — a bounded, charset-sanitised label; requests without it are absent from these families.
+- The HelixChannel gateway replaces (rather than appends to) the caller's `Authorization` header in `inject` mode, so a client cannot reach the upstream as a different account.
+- The CONNECT tunnel requires a shared token and an explicit host allowlist; an empty allowlist is rejected at startup rather than becoming an open relay.
+- Container images run as a non-root user with a read-only root filesystem and no added capabilities.
 
-API keys in config support `${ENV_VAR}` expansion — never hardcode secrets in YAML files.
+To report a vulnerability, open a [security advisory](https://github.com/nfsarch33/llm-cluster-router/security/advisories/new) rather than a public issue.
 
-## Lightsail release readiness
+## Contributing
 
-See [`docs/release-readiness.md`](docs/release-readiness.md) for the full
-release gate (`scripts/release-gate.sh`), ADR-083 / ADR-085 cross-links, and
-Lightsail port-443 reverse-proxy procedure.
-
-Quick validation: build `cmd/helixchannel` and run `./helixchannel doctor`
-to confirm release-readiness checks before deploying.
+Issues and pull requests are welcome. Please include tests with behaviour changes, keep `go test ./...` and `golangci-lint run` green, and use [Conventional Commits](https://www.conventionalcommits.org/) for commit subjects.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE) © nfsarch33
+
+## PII-local routing rule
+
+Requests whose body carries personal information (emails, Australian
+phone numbers, street addresses, order data, named enquiries, card PANs
+and TFNs — `internal/piiroute`) are routed only to nodes marked
+`pii_local: true` WHILE THE RULE IS ARMED. Arming is configuration:
+`pii_local_rule: auto` (default) arms only when a config marks at least
+one node; `enforce` arms always and refuses personal payloads with 503
+(`pii_no_local_node`) when no marked node can serve them; `off` keeps
+detection observability-only. When armed, a personal payload cannot
+reach a node without the mark; when not armed, routing is unchanged —
+the rule never silently changes behaviour for configs that have not
+opted in. `llm_router_pii_rule_armed` exposes the mode and
+`llm_router_pii_local_requests_total{outcome}` counts detections,
+unarmed detections (`detected_rule_off` — alert on a sustained rate)
+and refusals.
+
+Privacy-notice line (for client-facing material) — worded to what the
+code guarantees, no more:
+
+> Where this system's routing constraint is enabled, request content it
+> classifies as personal (addresses, contact details, order and payment
+> identifiers) is routed only to infrastructure we control; other
+> content may be processed by external model providers. Classification
+> is pattern-based and not exhaustive. Processing is not exclusively
+> Australia-based.
+

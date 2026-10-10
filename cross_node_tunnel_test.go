@@ -26,136 +26,6 @@ import (
 	"github.com/nfsarch33/llm-cluster-router/internal/tunnel"
 )
 
-// startFakeSSHLLM spawns a fake `ssh` binary in tmpDir that opens an
-// `ssh -L <local>:localhost:<remote>`-style local forward using the
-// `nc` (netcat) trick: bind a loopback listener to the chosen port,
-// write "ok\n" back to the incoming ssh-style stdin pipe so the
-// router's DialContext gets a successful accept.
-//
-// We then arrange the fake ssh to read a one-line "probe" message
-// from its stdin to confirm the parent did invoke ssh; we use the
-// simplest possible behaviour that lets DialContext's Accept return.
-//
-// Returns: the path to the fake ssh, the tunnel config that points
-// at it, and a cleanup func.
-func startFakeSSHLLM(t *testing.T) (string, tunnel.SSHTunnelConfig, func()) {
-	t.Helper()
-	tmp := t.TempDir()
-
-	// Write a fake ssh that just idles — we'll arrange the listener
-	// separately so the router dial loop can connect through it.
-	// The trick: instead of using the real ssh binary's local-forward,
-	// we use socat if available, else a simple Python proxy.
-	//
-	// Actually, simpler: write a fake ssh that opens a listening
-	// socket on the requested -L local-port itself (replacing
-	// sshd's role in this test), then exits after one accept. The
-	// router dial loop won't see a real forward; instead we'll use
-	// socat-style redirection. For testability, the simplest path
-	// is to point the test at a local HTTP test server directly and
-	// have the fake ssh forward bytes to it via a plain TCP proxy.
-	//
-	// The fake ssh binary just acts as a TCP relay: reads the port
-	// from the `-L` flag, opens a TCP connection to localhost:<that
-	// port>, and pipes the parent ssh's stdin/stdout through.
-
-	// The fake will:
-	//   - parse `-L <remotePort>:127.0.0.1:<innerPort>` from $1
-	//   - parse `-i <key>` and ignore it
-	//   - skip host arg (we'll bind to 127.0.0.1 by default)
-	//
-	// It opens a TCP server on 127.0.0.1:<remotePort>, and on accept,
-	// dials 127.0.0.1:<innerPort> (the test server) and pipes both ways.
-
-	fake := `#!/usr/bin/env python3
-import socket, sys, threading, re, os
-args = sys.argv[1:]
-remote_port = None
-inner_port = None
-host = "127.0.0.1"
-i = 0
-while i < len(args):
-    if args[i] == "-L" and i + 1 < len(args):
-        m = re.match(r"(\d+):([^:]+):(\d+)", args[i+1])
-        if m:
-            remote_port = int(m.group(1))
-            inner_host = m.group(2)
-            inner_port = int(m.group(3))
-        i += 2
-    elif args[i] in ("-N", "-i", "-o", "-p"):
-        if args[i] in ("-i", "-o", "-p"):
-            i += 2
-        else:
-            i += 1
-    elif args[i].startswith("-"):
-        i += 1
-    else:
-        host = args[i].split("@")[-1]
-        i += 1
-
-if not remote_port or not inner_port:
-    print("fake ssh: bad args", file=sys.stderr)
-    sys.exit(2)
-
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("127.0.0.1", remote_port))
-srv.listen(8)
-print(f"fake ssh listening on 127.0.0.1:{remote_port} -> 127.0.0.1:{inner_port}", file=sys.stderr, flush=True)
-
-def pipe(a, b):
-    try:
-        while True:
-            data = a.recv(4096)
-            if not data:
-                break
-            b.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try: a.close()
-        except: pass
-        try: b.close()
-        except: pass
-
-def handle(c):
-    try:
-        up = socket.create_connection(("127.0.0.1", inner_port), timeout=2)
-    except Exception as e:
-        print(f"fake ssh: inner connect failed: {e}", file=sys.stderr)
-        c.close()
-        return
-    t1 = threading.Thread(target=pipe, args=(c, up), daemon=True)
-    t2 = threading.Thread(target=pipe, args=(up, c), daemon=True)
-    t1.start(); t2.start()
-
-try:
-    while True:
-        c, _ = srv.accept()
-        threading.Thread(target=handle, args=(c,), daemon=True).start()
-except KeyboardInterrupt:
-    pass
-`
-	sshPath := filepath.Join(tmp, "ssh")
-	if err := os.WriteFile(sshPath, []byte(fake), 0o755); err != nil {
-		t.Fatalf("write fake ssh: %v", err)
-	}
-	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	cfg := tunnel.SSHTunnelConfig{
-		Host:         "jump.example",
-		User:         "ubuntu",
-		IdentityFile: "/k",
-		LocalPort:    8001,
-	}
-	return sshPath, cfg, func() {}
-}
-
-// TestCrossNode_TunnelDialReachesHTTPServer is the E2E proof that
-// the SSH-tunnel path actually carries an HTTP request to a remote
-// loopback service. We don't need a real llama-server — any http
-// handler that echoes the request body is sufficient to prove the
-// tunnel isn't losing bytes.
 func TestCrossNode_TunnelDialReachesHTTPServer(t *testing.T) {
 	// 1. Start an httptest.Server.
 	hit := make(chan string, 8)
@@ -172,7 +42,7 @@ func TestCrossNode_TunnelDialReachesHTTPServer(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		fmt.Fprintf(w, `{"echo":%q,"from":"llama-server-fake"}`, string(body))
+		_, _ = fmt.Fprintf(w, `{"echo":%q,"from":"llama-server-fake"}`, string(body))
 	}))
 	defer srv.Close()
 
@@ -183,7 +53,7 @@ func TestCrossNode_TunnelDialReachesHTTPServer(t *testing.T) {
 		t.Fatalf("bad srv URL: %s", innerAddr)
 	}
 	var innerPort int
-	fmt.Sscanf(parts[1], "%d", &innerPort)
+	_, _ = fmt.Sscanf(parts[1], "%d", &innerPort)
 
 	// 3. Spin up the fake ssh binary that forwards to innerPort.
 	tmp := t.TempDir()
@@ -236,11 +106,11 @@ while True:
 	// then connects to 127.0.0.1:<random>, the fake accepts, and pipes
 	// bytes to innerPort.
 	cfg := tunnel.SSHTunnelConfig{
-		Host:         "jump.example",
-		User:         "ubuntu",
-		IdentityFile: "/k",
-		LocalPort:    innerPort, // tunnel.LocalPort == the server port
-		Port:         22,
+		Host:           "jump.example",
+		User:           "ubuntu",
+		IdentityFile:   "/k",
+		LocalPort:      innerPort, // tunnel.LocalPort == the server port
+		Port:           22,
 		ConnectTimeout: 5 * time.Second,
 	}
 
@@ -352,7 +222,7 @@ t2.join()
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Issue a real HTTP request through that conn.
 	httpClient := &http.Client{
@@ -371,7 +241,7 @@ t2.join()
 	if err != nil {
 		t.Fatalf("HTTP through tunnel: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {

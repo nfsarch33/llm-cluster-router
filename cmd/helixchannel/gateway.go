@@ -1,0 +1,379 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/channel"
+)
+
+// runGateway serves the HelixChannel gateway: the config-driven reverse proxy
+// that carries agent traffic to upstream providers, plus the optional CONNECT
+// tunnel used by agents that hold their own session credential.
+//
+// This is the server-side half of HelixChannel. It replaces the pair of
+// single-upstream daemons the pilot ran by hand: one process, one config file,
+// any number of routes, each with its own feature flag.
+func runGateway(args []string) error {
+	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
+	configPath := fs.String("config", envOrDefault("HELIXCHANNEL_GATEWAY_CONFIG", "/etc/helixchannel/gateway.yml"),
+		"path to the gateway YAML config")
+	listen := fs.String("listen", "", "override the config's listen address")
+	printRoutes := fs.Bool("print-routes", false, "print the enabled route table as JSON and exit")
+	if err := fs.Parse(filterTestFlags(args)); err != nil {
+		return err
+	}
+
+	cfg, err := channel.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
+		// Re-validate: the override replaces the one field gateway_auth's bind
+		// rule reads, so a config that legitimately bound loopback with no token
+		// could otherwise be moved onto a wildcard address from the command line
+		// and skip the check entirely. Validate is idempotent — it re-derives
+		// the same defaults from values already at their defaults.
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+	}
+
+	// Emitted HERE — before the server is built and before --print-routes
+	// returns — because it is an advisory about the CONFIGURATION, not about
+	// this process's runtime posture. An operator inspecting a config with
+	// --print-routes is exactly who needs to hear it, and a config that later
+	// fails to start should still have said what its budgets mean.
+	warnAdvisoryTokenBudgets(os.Stderr, cfg)
+	warnUncappedPools(os.Stderr, cfg)
+
+	auditWriter := io.Writer(os.Stdout)
+	if cfg.AuditLog != "" {
+		f, err := os.OpenFile(cfg.AuditLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return fmt.Errorf("open audit log: %w", err)
+		}
+		defer func() { _ = f.Close() }()
+		auditWriter = f
+	}
+
+	srv, err := channel.NewServer(cfg, channel.NewHTTPForwarder(), channel.NewAuditor(auditWriter))
+	if err != nil {
+		return err
+	}
+
+	// Register the rotation metric on the process registry. Without this call
+	// llm_cluster_router_helixchannel_key_retired_total is never exported and
+	// every alert written against it is dead on arrival — the same failure
+	// mode as a rule file that looks real and routes to nobody.
+	//
+	// AlreadyRegisteredError is tolerated so that a second gateway invocation
+	// inside one process (the in-process CLI tests do exactly this) is not a
+	// startup failure; the collector is a package-level var, so the first
+	// registration is the one that counts.
+	if err := channel.RegisterMetrics(prometheus.DefaultRegisterer); err != nil {
+		var dup prometheus.AlreadyRegisteredError
+		if !errors.As(err, &dup) {
+			return fmt.Errorf("register helixchannel metrics: %w", err)
+		}
+	}
+
+	if *printRoutes {
+		names := srv.RouteNames()
+		sort.Strings(names)
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"listen": cfg.Listen, "routes": names, "connect": cfg.Connect.Enabled,
+			"proxy_auth": string(srv.ProxyAuthMode()),
+		})
+	}
+
+	fmt.Fprintf(os.Stderr, "helixchannel gateway listening on %s routes=%v connect=%t proxy_auth=%s\n",
+		cfg.Listen, srv.RouteNames(), cfg.Connect.Enabled, srv.ProxyAuthMode())
+	warnUnauthenticatedProxyLeg(os.Stderr, srv.ProxyAuthMode(), cfg.Listen)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Optional AES-256-GCM leg: a second public listener carrying the same
+	// reverse-proxy routes with AES nested inside TLS. It is a SEPARATE Server
+	// so its serving scope is judged from its own public socket, never from the
+	// (loopback) reverse-proxy leg's — the two must not share s.scope. CONNECT
+	// is disabled on it: the AES leg exists for the reverse-proxy routes.
+	var aesSrv *channel.Server
+	var aesLn net.Listener
+	var aesKey [32]byte
+	if cfg.AES.Enabled {
+		key, err := channel.ResolveAESKey(cfg.AES)
+		if err != nil {
+			return err
+		}
+		aesKey = key
+
+		aesCfg := *cfg
+		aesCfg.Connect = channel.ConnectConfig{}
+		aesCfg.Listen = cfg.AES.Listen
+		aesCfg.AES = channel.AESConfig{}
+		aesSrv, err = channel.NewServer(&aesCfg, channel.NewHTTPForwarder(), channel.NewAuditor(auditWriter))
+		if err != nil {
+			return fmt.Errorf("aes leg server: %w", err)
+		}
+
+		cert, err := tls.LoadX509KeyPair(cfg.AES.TLS.CertFile, cfg.AES.TLS.KeyFile)
+		if err != nil {
+			return fmt.Errorf("aes leg tls: %w", err)
+		}
+		raw, err := net.Listen("tcp", cfg.AES.Listen)
+		if err != nil {
+			return fmt.Errorf("aes leg listen: %w", err)
+		}
+		aesLn = tls.NewListener(raw, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+		fmt.Fprintf(os.Stderr, "helixchannel AES leg listening on %s (aes-256-gcm inside tls) routes=%v proxy_auth=%s\n",
+			cfg.AES.Listen, aesSrv.RouteNames(), aesSrv.ProxyAuthMode())
+	}
+
+	// Run the reverse-proxy leg and, if configured, the AES leg concurrently,
+	// returning the first non-nil error and bringing the other leg down with it
+	// so a failure of either fails the process rather than degrading silently.
+	errCh := make(chan error, 2)
+	legs := 1
+	go func() { errCh <- srv.ListenAndServe(ctx) }()
+	if aesLn != nil {
+		legs++
+		go func() { errCh <- aesSrv.ServeWrapped(ctx, aesLn, aesKey) }()
+	}
+	var firstErr error
+	for i := 0; i < legs; i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+			stop()
+		}
+	}
+	return firstErr
+}
+
+// warnUnauthenticatedProxyLeg prints the loud startup warning for the two
+// postures in which the reverse-proxy leg authenticates nobody.
+//
+// It is deliberately not a debug line an operator has to go looking for. Both
+// states are legitimate — loopback_only is the historical default and open is
+// the fronted-by-a-terminator deployment — and both are indistinguishable, from
+// inside this process, from having forgotten to configure a token. The banner
+// above already carries proxy_auth for a log parser; this is the sentence a
+// human reads.
+func warnUnauthenticatedProxyLeg(w io.Writer, mode channel.ProxyAuthMode, listen string) {
+	switch mode {
+	case channel.ProxyAuthLoopbackOnly:
+		_, _ = fmt.Fprintf(w, "WARNING: no gateway_auth token is configured, so the reverse-proxy leg authenticates NOBODY. Reaching %s is sufficient to spend every key on every enabled route; the bind address is the only boundary. Set gateway_auth.token_env/token_file/token_ref before publishing this socket any wider.\n", listen)
+	case channel.ProxyAuthOpen:
+		_, _ = fmt.Fprintf(w, "WARNING: gateway_auth.allow_unauthenticated is set, so the reverse-proxy leg authenticates NOBODY on %s. Anyone who can open a TCP connection to it can spend every key on every enabled route. This is only safe behind an authenticating terminator that is the sole reachable path to this socket.\n", listen)
+	}
+}
+
+// warnAdvisoryTokenBudgets prints the loud startup warning for every route whose
+// per-key plan is denominated in TOKENS, naming the overshoot ratio derived from
+// that route's own cap and estimate.
+//
+// It is emitted at startup rather than left to the documentation because the
+// failure mode is a BILL. A token cap bounds the estimate an unsettled lease is
+// projected by, not the charge that lease eventually settles, so the plan is
+// overspendable by cap/estimate under concurrency — measured at 50x on cap 1000
+// / estimate 100 against a real 5000-token response. Request budgets have no
+// such gap and are the shape every shipped config now uses; see
+// channel.BudgetAdvisory for the arithmetic and for the reserved-token
+// accounting follow-up that would make token caps exact.
+//
+// Silence is the expected output. A warning that fires on the recommended
+// configuration is one operators learn to scroll past.
+func warnAdvisoryTokenBudgets(w io.Writer, cfg *channel.Config) {
+	for _, a := range cfg.TokenBudgetAdvisories() {
+		_, _ = fmt.Fprintln(w, a.Warning())
+	}
+}
+
+// warnUncappedPools prints the startup warning for every pooled route carrying
+// no cap at all.
+//
+// It sits beside warnAdvisoryTokenBudgets rather than inside it because the two
+// answer different questions and an operator can be wrong in only one of them
+// at a time: that one says "your cap does not mean what you think", this one
+// says "you have no cap". Before this existed, only the first was ever spoken,
+// so the config that spent a pool without limit was the quietest one in the
+// file.
+func warnUncappedPools(w io.Writer, cfg *channel.Config) {
+	for _, a := range cfg.UncappedPoolAdvisories() {
+		_, _ = fmt.Fprintln(w, a.Warning())
+	}
+}
+
+// runProxy serves the loopback client proxy that lets an agent route through
+// HelixChannel by setting HTTPS_PROXY — the path for agents (Claude Code being
+// the motivating one) whose own credential must reach the provider intact and
+// whose functionality degrades when pointed at a rewritten base URL.
+func runProxy(args []string) error {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	listen := fs.String("listen", envOrDefault("HELIXCHANNEL_PROXY_LISTEN", "127.0.0.1:47820"),
+		"loopback listen address for the agent to point HTTPS_PROXY at")
+	gateway := fs.String("gateway", envOrDefault("HELIXCHANNEL_GATEWAY", ""),
+		"channel edge as host:port (TLS), e.g. helixchannel.example.com:8443")
+	tokenEnv := fs.String("token-env", "HELIXCHANNEL_CONNECT_TOKEN",
+		"environment variable holding the CONNECT token")
+	tokenFile := fs.String("token-file", "", "file holding the CONNECT token")
+	insecure := fs.Bool("insecure", false,
+		"skip verification of the gateway certificate (pilot edges with self-signed certs only; the agent's own TLS to the provider is still verified end to end)")
+	printEnv := fs.Bool("print-env", false, "print the environment variables an agent needs, then exit")
+	if err := fs.Parse(filterTestFlags(args)); err != nil {
+		return err
+	}
+
+	if *printEnv {
+		env := channel.ProxyEnv(*listen)
+		keys := make([]string, 0, len(env))
+		for k := range env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Printf("%s=%s\n", k, env[k])
+		}
+		return nil
+	}
+
+	if *gateway == "" {
+		return fmt.Errorf("--gateway is required (or set HELIXCHANNEL_GATEWAY)")
+	}
+	token, err := resolveConnectToken(*tokenEnv, *tokenFile)
+	if err != nil {
+		return err
+	}
+
+	p := &channel.ClientProxy{
+		Listen:             *listen,
+		Gateway:            *gateway,
+		Token:              token,
+		InsecureSkipVerify: *insecure,
+		Audit:              channel.NewAuditor(os.Stdout),
+	}
+	fmt.Fprintf(os.Stderr, "helixchannel proxy listening on %s -> %s\n", *listen, *gateway)
+	fmt.Fprintf(os.Stderr, "point the agent at it with: helixchannel proxy --listen %s --print-env\n", *listen)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return p.ListenAndServe(ctx)
+}
+
+// runAESBridge serves the client-side AES leg forwarder: an OpenAI-compatible
+// client (Kilo Code) points its base URL at this loopback HTTP listener, and
+// every request is forwarded to the gateway's AES leg over TCP → TLS → AES, so
+// the payload is AES-encrypted inside the outer TLS. The gateway token still
+// travels as an X-HLXN-Token header set by the client; this bridge injects
+// nothing and holds no provider key.
+func runAESBridge(args []string) error {
+	fs := flag.NewFlagSet("aes-bridge", flag.ContinueOnError)
+	listen := fs.String("listen", envOrDefault("HELIXCHANNEL_AES_BRIDGE_LISTEN", "127.0.0.1:8788"),
+		"loopback HTTP listen address for the client's base URL, e.g. 127.0.0.1:8788")
+	gateway := fs.String("gateway", envOrDefault("HELIXCHANNEL_AES_GATEWAY", ""),
+		"AES leg edge as host:port (TLS), e.g. helixchannel.example.com:8444")
+	keyEnv := fs.String("key-env", "HELIXCHANNEL_AES_KEY",
+		"environment variable holding the 32-byte pre-shared AES key (hex, base64, or raw)")
+	keyFile := fs.String("key-file", "", "file holding the pre-shared AES key")
+	keyRef := fs.String("key-ref", "", "op:// (or other seam) reference to the pre-shared AES key")
+	insecure := fs.Bool("insecure", false,
+		"skip verification of the OUTER TLS certificate only; the inner AES still protects the payload (needed under a TLS-intercepting proxy)")
+	if err := fs.Parse(filterTestFlags(args)); err != nil {
+		return err
+	}
+
+	if *gateway == "" {
+		return fmt.Errorf("--gateway is required (or set HELIXCHANNEL_AES_GATEWAY)")
+	}
+	key, err := channel.ResolveAESKey(channel.AESConfig{KeyEnv: *keyEnv, KeyFile: *keyFile, KeyRef: *keyRef})
+	if err != nil {
+		return err
+	}
+
+	b := &channel.AESBridge{
+		Listen:             *listen,
+		Gateway:            *gateway,
+		Key:                key,
+		InsecureSkipVerify: *insecure,
+	}
+	fmt.Fprintf(os.Stderr, "helixchannel aes-bridge listening on %s -> %s (aes-256-gcm inside tls)\n", *listen, *gateway)
+	fmt.Fprintf(os.Stderr, "point the client's base URL at: http://%s/<route>/v1  (send X-HLXN-Token as a header)\n", *listen)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return b.ListenAndServe(ctx)
+}
+
+// resolveConnectToken reads the CONNECT token from an environment variable or
+// a file. The value is never echoed.
+func resolveConnectToken(envName, filePath string) (string, error) {
+	if envName != "" {
+		if v := os.Getenv(envName); v != "" {
+			return v, nil
+		}
+	}
+	if filePath != "" {
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			return "", fmt.Errorf("read token file: %w", err)
+		}
+		if v := trimSpace(string(b)); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("token file %s is empty", filePath)
+	}
+	return "", fmt.Errorf("no CONNECT token: set %s or pass --token-file", envName)
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\n' || s[start] == '\r' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\r' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
+// filterTestFlags drops flags injected by "go test" from an argv slice.
+//
+// Subcommands build their own flag.FlagSet, and a FlagSet errors on unknown
+// flags. When a test binary runs a subcommand in-process, the harness's own
+// -test.* flags are still on os.Args and would abort parsing. Every
+// flag-bearing subcommand must route argv through this helper first.
+func filterTestFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, "-test.") || strings.HasPrefix(a, "--test.") {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}

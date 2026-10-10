@@ -69,7 +69,7 @@ func TestSOCKS5ListenerFactory_Listen_BindsAndCancellable(t *testing.T) {
 	if serve == nil {
 		t.Fatal("Listen returned nil ServeLoop")
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Run the ServeLoop and confirm it exits within 2s after cancel.
 	done := make(chan error, 1)
@@ -102,7 +102,7 @@ func TestSOCKS5ListenerFactory_Listen_AcceptsTCPConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	var accepted atomic.Bool
 	// Custom ServeLoop stub: record first Accept and exit.

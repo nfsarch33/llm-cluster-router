@@ -119,7 +119,7 @@ func TestMinimaxRoute_200OnHello(t *testing.T) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode,
 		"live minimax round-trip MUST return HTTP 200 (got %d)", resp.StatusCode)
@@ -146,7 +146,7 @@ func TestMinimaxRoute_UpstreamMock(t *testing.T) {
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "Bearer test-key", seenAuth,

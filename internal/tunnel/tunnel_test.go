@@ -136,12 +136,12 @@ func TestClose_KillsSSHChild(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	c1, c2 := net.Pipe()
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	bridge := &sshConn{Conn: c1, cmd: cmd}
 	if err := bridge.Close(); err != nil {
 		t.Fatalf("bridge.Close: %v", err)
 	}
-	c1.Close()
+	_ = c1.Close()
 
 	// On Linux, FindProcess always succeeds; Signal(0) returns an
 	// error when the process is gone.

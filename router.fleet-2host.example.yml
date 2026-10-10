@@ -5,8 +5,14 @@
 # Health probes every 15s; threshold 3; cooldown 30s.
 
 listen: ":8080"
-metrics_addr: ":9091"
-debug_addr: ":6060"
+# metrics_addr / debug_addr bind LOOPBACK when the host is omitted:
+# ":9091" resolves to 127.0.0.1:9091. Neither listener sits behind the
+# bearer middleware that guards /v1/*, and pprof serves heap dumps and a
+# blocking CPU profile, so the default must not be every interface.
+# Spell an explicit host (0.0.0.0, ::, a specific address) to opt out.
+metrics_addr: "127.0.0.1:9091"
+# pprof is OFF unless debug_addr is set. Set it deliberately.
+debug_addr: "127.0.0.1:6060"
 log_level: info
 
 defaults:

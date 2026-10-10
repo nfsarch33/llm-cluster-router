@@ -4,6 +4,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,16 +12,41 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nfsarch33/llm-cluster-router/internal/health"
 	"gopkg.in/yaml.v3"
 )
 
 // Config is the top-level router configuration loaded from YAML.
 type Config struct {
-	Listen      string          `yaml:"listen"`
-	MetricsAddr string          `yaml:"metrics_addr"`
-	DebugAddr   string          `yaml:"debug_addr"`
-	LogLevel    string          `yaml:"log_level"`
-	AuthToken   string          `yaml:"auth_token"`
+	Listen string `yaml:"listen"`
+	// PIILocalRule governs the personal-payload routing constraint:
+	//   ""  or "auto"  — armed only when at least one node carries
+	//                     pii_local: true (the safe default: configs
+	//                     without a marked node route exactly as before).
+	//   "enforce"      — ALWAYS armed; if no node carries pii_local the
+	//                     router REFUSES personal payloads (fail closed)
+	//                     rather than letting them reach the cloud.
+	//   "off"          — detection stays observability-only.
+	PIILocalRule string `yaml:"pii_local_rule"`
+	// MetricsAddr is where the Prometheus exposition listener binds.
+	// Omitted selects DefaultMetricsAddr; a host-less value like ":9091"
+	// binds LOOPBACK, not every interface. See DiagnosticListenAddr for
+	// why, and for how to opt back out.
+	MetricsAddr string `yaml:"metrics_addr"`
+	// DebugAddr is where the net/http/pprof listener binds. Omitted
+	// leaves pprof OFF, which is the existing default and is kept: an
+	// endpoint that dumps the heap and blocks on demand should be
+	// switched on deliberately, not merely moved somewhere safer. When
+	// it IS set, a host-less value like ":6060" binds loopback. See
+	// DiagnosticListenAddr.
+	DebugAddr string `yaml:"debug_addr"`
+	LogLevel  string `yaml:"log_level"`
+	AuthToken string `yaml:"auth_token"`
+	// CustomerTokens maps router credentials to the "customer" workload
+	// class: a request bearing one of these tokens is class customer,
+	// every other valid token is internal. The class is derived from
+	// credentials only — never from a caller-set header.
+	CustomerTokens []string `yaml:"customer_tokens"`
 	// SlackWebhookURL, when non-empty, is the Slack Incoming Webhook URL the
 	// router posts quota-fallback alerts to. The webhook URL is loaded from
 	// the LLM_ROUTER_SLACK_WEBHOOK_URL env var at startup; the YAML field is
@@ -28,11 +54,21 @@ type Config struct {
 	SlackWebhookURL string `yaml:"slack_webhook_url"`
 	// SlackChannel, when non-empty, overrides the Slack Incoming Webhook's
 	// default channel. Empty means use the webhook's default.
-	SlackChannel string `yaml:"slack_channel"`
-	Defaults    Defaults        `yaml:"defaults"`
-	HealthCheck HealthConfig    `yaml:"health_check"`
-	FairShare   FairShareConfig `yaml:"fair_share"`
-	Nodes       []NodeConfig    `yaml:"nodes"`
+	SlackChannel string          `yaml:"slack_channel"`
+	Defaults     Defaults        `yaml:"defaults"`
+	HealthCheck  HealthConfig    `yaml:"health_check"`
+	FairShare    FairShareConfig `yaml:"fair_share"`
+	Nodes        []NodeConfig    `yaml:"nodes"`
+	// SmartRoute enables task-aware model/parameter routing and per-agent
+	// route gates. Both fields must be set for the feature to activate;
+	// absent or disabled means the router behaves exactly as before.
+	SmartRoute SmartRouteConfig `yaml:"smart_route"`
+}
+
+// SmartRouteConfig points the router at a smartroute policy file.
+type SmartRouteConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	PolicyFile string `yaml:"policy_file"`
 }
 
 // FairShareConfig controls per-user rate limiting. When Enabled is
@@ -51,7 +87,39 @@ type Defaults struct {
 	MaxQueueDepth  int           `yaml:"max_queue_depth"`
 	MaxConcurrency int           `yaml:"max_concurrency"`
 	RequestTimeout DurationValue `yaml:"request_timeout"`
-	MaxBodySize    int64         `yaml:"max_body_size"`
+	// KeyCooldown is how long an API key sits out of rotation after a
+	// quota signal (429 or a quota_detect_regex body match). Keeps failure
+	// isolation at the KEY level: with three paid token plans on one node,
+	// one exhausted plan must not keep eating every third request nor trip
+	// the whole node's circuit breaker. 0 disables cooling.
+	KeyCooldown DurationValue `yaml:"key_cooldown"`
+	MaxBodySize int64         `yaml:"max_body_size"`
+	// BodyReadTimeout bounds how long the proxy handler waits for the NEXT
+	// bytes of a request body before giving up on the read. It is an
+	// INACTIVITY bound, refreshed by every read that makes progress -- not a
+	// ceiling on how long a legitimate upload may take.
+	//
+	// It exists because admission happens BEFORE allocation: the queue slot
+	// is taken before io.ReadAll and held across it, so a caller that stops
+	// sending mid-body occupies a slot for as long as it cares to. With
+	// MaxQueueDepth such callers the router answers 429 to everyone else, so
+	// an unbounded read turns the memory exhaustion that ordering closed into
+	// an availability one. Bounding the read is what makes holding the slot
+	// safe, and the two belong together.
+	//
+	// The bound is on INACTIVITY rather than on total duration because a
+	// total cap cannot tell a caller on a slow link from a caller that has
+	// stopped, and killing the first would be a new availability bug in place
+	// of the old one. Total duration is still bounded -- by MaxBodySize, at
+	// whatever rate the caller is actually sustaining -- and the number of
+	// such readers is still bounded by MaxQueueDepth.
+	//
+	// 0 selects DefaultBodyReadTimeout. Negative is a config error: there is
+	// deliberately no spelling for "wait forever", because that is the state
+	// this key was added to make unreachable. Every config in the tree omits
+	// the key, so reading 0 as "unbounded" would leave exactly the
+	// deployments this exists for running exactly as they run today.
+	BodyReadTimeout DurationValue `yaml:"body_read_timeout"`
 	// Circuit tunes the per-upstream circuit breaker fleet-wide. It was
 	// previously hardcoded to 5 failures / 30s in main.go; exposing it here
 	// lets operators retune the breaker for a single-tier provider (e.g.
@@ -75,6 +143,17 @@ const (
 	DefaultCircuitCooldown  = 30 * time.Second
 )
 
+// DefaultBodyReadTimeout is how long the proxy handler waits for the next
+// bytes of a request body before releasing the queue slot that read is
+// holding and refusing the caller.
+//
+// 15s is far beyond any round trip a chat-completions body needs on a link
+// that is working -- the bound is refreshed on every read that makes
+// progress, so it is only ever measured against a gap of total silence -- and
+// far below the 120s RequestTimeout default, so a stalled upload is reaped
+// long before the requests it is blocking would have given up anyway.
+const DefaultBodyReadTimeout = 15 * time.Second
+
 // HealthConfig controls the upstream health-check loop.
 type HealthConfig struct {
 	Interval           DurationValue `yaml:"interval"`
@@ -82,12 +161,71 @@ type HealthConfig struct {
 	Path               string        `yaml:"path"`
 	UnhealthyThreshold int           `yaml:"unhealthy_threshold"`
 	HealthyThreshold   int           `yaml:"healthy_threshold"`
+	// LiveProbe bounds the /healthz?live=1 forced-probe path. See
+	// LiveProbeConfig.
+	LiveProbe LiveProbeConfig `yaml:"live_probe"`
+}
+
+// LiveProbeConfig bounds the rate at which anonymous callers can force a
+// live sweep of every configured upstream via /healthz?live=1.
+//
+// Plain /healthz is a liveness check and stays open -- caddy,
+// blackbox-exporter, Prometheus and a status page all depend on it, and
+// gating it would trade one outage for another. ?live=1 is not that: it
+// makes one inbound request fan out to one outbound request PER UPSTREAM,
+// which is an amplification lever rather than a liveness check, and it is
+// the one part of the endpoint that needs a bound.
+//
+// Zero values select the health package defaults
+// (health.DefaultLiveProbeInterval / DefaultLiveProbeBurst). Negative
+// values are a config error: there is no spelling for "unbounded",
+// because unbounded is the state this block exists to make unreachable.
+type LiveProbeConfig struct {
+	// Interval is the refill period of the forced-probe token bucket:
+	// one forced sweep is admitted per Interval once the burst is spent.
+	Interval DurationValue `yaml:"interval"`
+	// Burst is how many forced sweeps an idle router admits back to back
+	// before the Interval rate applies.
+	Burst int `yaml:"burst"`
 }
 
 // DurationValue wraps time.Duration for YAML unmarshalling from a
 // string like "30s" or "2m".
 type DurationValue struct {
 	time.Duration
+}
+
+// RequestDefaultsMap is the yaml-decodable form of per-node request-body
+// defaults: yaml.v3 cannot decode a scalar into a json.RawMessage byte
+// slice, so the map decodes as nodes and each value marshals to JSON once
+// here. MergeRequestDefaults keeps consuming map[string]json.RawMessage.
+type RequestDefaultsMap map[string]json.RawMessage
+
+// Raw returns the defaults as the merge helper's consumption type.
+func (m RequestDefaultsMap) Raw() map[string]json.RawMessage { return m }
+
+// UnmarshalYAML decodes the defaults map value-by-value, converting each
+// to its JSON encoding; a YAML scalar true becomes the JSON literal true.
+func (m *RequestDefaultsMap) UnmarshalYAML(node *yaml.Node) error {
+	*m = RequestDefaultsMap{}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("request_defaults must be a mapping, got %v at line %d", node.Kind, node.Line)
+	}
+	out := make(RequestDefaultsMap, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i].Value
+		var val any
+		if err := node.Content[i+1].Decode(&val); err != nil {
+			return fmt.Errorf("request_defaults.%s: %w", key, err)
+		}
+		enc, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Errorf("request_defaults.%s: %w", key, err)
+		}
+		out[key] = enc
+	}
+	*m = out
+	return nil
 }
 
 func (d *DurationValue) UnmarshalYAML(node *yaml.Node) error {
@@ -105,14 +243,25 @@ func (d *DurationValue) UnmarshalYAML(node *yaml.Node) error {
 
 // NodeConfig describes a single upstream LLM node.
 type NodeConfig struct {
-	Name     string   `yaml:"name"`
-	URL      string   `yaml:"url"`
-	Tier     string   `yaml:"tier"`
-	Enabled  string   `yaml:"enabled"`
-	Weight   int      `yaml:"weight"`
-	Models   []string `yaml:"models"`
-	APIKey   string   `yaml:"api_key"`
-	APIKeys  []string `yaml:"api_keys"`
+	Name    string   `yaml:"name"`
+	URL     string   `yaml:"url"`
+	Tier    string   `yaml:"tier"`
+	Enabled string   `yaml:"enabled"`
+	Weight  int      `yaml:"weight"`
+	Models  []string `yaml:"models"`
+	APIKey  string   `yaml:"api_key"`
+	APIKeys []string `yaml:"api_keys"`
+	// Workloads restricts which request classes may use this node:
+	// "internal", "customer", or both. Empty (or absent) means the node
+	// accepts both classes. The token-plan node is configured
+	// workloads: [internal] so customer traffic can never reach it.
+	Workloads []string `yaml:"workloads"`
+	// PIILocal marks a node as allowed to serve requests whose body
+	// carries personal information (the PII-local routing rule): the
+	// local hardware endpoints. A personal payload is NEVER routed to a
+	// node without this mark — the router refuses instead of spilling
+	// to a cloud endpoint.
+	PIILocal bool `yaml:"pii_local"`
 	// Vendor is the canonical upstream type. Empty (or "openai_compat") means the
 	// existing LocalOpenAICompatible path; values like "minimax" toggle the
 	// vendor-specific URL builder, auth header, and quota classifier.
@@ -131,15 +280,51 @@ type NodeConfig struct {
 	// register the vendor peer in the active routing pool; "false" (or
 	// omitted) leaves the peer unreachable but parseable.
 	EnabledVendor string `yaml:"enabled_vendor"`
+	// ModelRewrite maps a requested model name to the name this node's
+	// engine actually serves, applied to the request body on forward. Lets
+	// a strict engine (vLLM validates --served-model-name) join an alias
+	// pool without serving the alias itself: the node lists the alias in
+	// `models` so it is selected, and the body is rewritten before the hop.
+	// Empty (or absent) forwards the caller's model verbatim, exactly as
+	// before — the field is additive and ignored by older router builds.
+	ModelRewrite map[string]string `yaml:"model_rewrite"`
+
+	// RequestDefaults carries per-node request-body defaults applied after
+	// node selection, only for keys the caller did not set. A node whose
+	// engine embeds reasoning in content unless told to split it carries
+	// the split flag here once, for every caller. Values are kept
+	// byte-exact via a custom unmarshaler (see RequestDefaultsMap).
+	RequestDefaults RequestDefaultsMap `yaml:"request_defaults"`
 	// QuotaDetectRegex, when non-empty, is the regular expression applied to
 	// 4xx/5xx response bodies to flag the response as a quota event. A quota
 	// event triggers the route's fallback chain and increments
 	// `quota_fallback_total` so an operator can alert on a flat line.
 	QuotaDetectRegex string `yaml:"quota_detect_regex"`
-	Priority int      `yaml:"priority"`
+	Priority         int    `yaml:"priority"`
 	// Circuit optionally overrides the global Defaults.Circuit tuning for this
 	// single upstream. Unset (zero) fields inherit the global default.
 	Circuit CircuitConfig `yaml:"circuit"`
+	// AuthHeader, when non-empty, names the request header the node's
+	// api_key is sent in -- verbatim, with no "Bearer " prefix -- instead
+	// of the default "Authorization: Bearer <key>". The motivating
+	// upstream is a token-gated egress gateway that must NOT receive the
+	// credential in Authorization, because gateways with passthrough
+	// routes forward Authorization verbatim to the provider behind them.
+	//
+	// Three admission rules, enforced at load time so a misconfiguration
+	// is a boot error rather than silent unauthenticated traffic:
+	//   - "Authorization" is refused (that is the default path; spell it
+	//     by omitting auth_header);
+	//   - the name is restricted to ALPHA / DIGIT / "-";
+	//   - a usable key (api_key or api_keys, post env-expansion) must be
+	//     configured, otherwise the header would never be sent while the
+	//     config reads as though gateway auth were on.
+	//
+	// When AuthHeader is set the proxy also DELETES any inbound
+	// Authorization before dispatch: doUpstream copies caller headers to
+	// the upstream request, and the caller's router token must never
+	// reach the gateway.
+	AuthHeader string `yaml:"auth_header"`
 	// HealthCheckDisabled, when true, removes this upstream from the active
 	// health-probe loop. It defaults to false (probe enabled).
 	//
@@ -291,8 +476,13 @@ func LoadConfig(path string) (Config, error) {
 		cfg.Listen = ":8080"
 	}
 	if cfg.MetricsAddr == "" {
-		cfg.MetricsAddr = ":9091"
+		cfg.MetricsAddr = DefaultMetricsAddr
 	}
+	// Resolve BOTH diagnostic listeners through the same rule, so a
+	// host-less spelling binds loopback and an explicit host is honoured
+	// verbatim. DebugAddr keeps "" meaning "pprof off".
+	cfg.MetricsAddr = DiagnosticListenAddr(cfg.MetricsAddr)
+	cfg.DebugAddr = DiagnosticListenAddr(cfg.DebugAddr)
 	if cfg.Defaults.MaxQueueDepth <= 0 {
 		cfg.Defaults.MaxQueueDepth = 8
 	}
@@ -302,8 +492,27 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.Defaults.RequestTimeout.Duration <= 0 {
 		cfg.Defaults.RequestTimeout.Duration = 120 * time.Second
 	}
+	if cfg.Defaults.KeyCooldown.Duration < 0 {
+		cfg.Defaults.KeyCooldown.Duration = 0
+	} else if cfg.Defaults.KeyCooldown.Duration == 0 {
+		cfg.Defaults.KeyCooldown.Duration = 5 * time.Minute
+	}
 	if cfg.Defaults.MaxBodySize <= 0 {
 		cfg.Defaults.MaxBodySize = 1 << 20
+	}
+	// A STARTUP ERROR and not a clamp, matching connect.max_concurrent and
+	// connect.idle_timeout: an operator who wrote a negative here meant
+	// something, and every meaning available is one this key exists to refuse.
+	// Silently rounding it to the default would serve them a bound they did
+	// not ask for under a value that says otherwise.
+	if cfg.Defaults.BodyReadTimeout.Duration < 0 {
+		return cfg, fmt.Errorf(
+			"defaults: body_read_timeout must not be negative (got %v); omit the key or set 0 for the default of %v, and note there is no spelling for \"wait forever\"",
+			cfg.Defaults.BodyReadTimeout.Duration, DefaultBodyReadTimeout,
+		)
+	}
+	if cfg.Defaults.BodyReadTimeout.Duration == 0 {
+		cfg.Defaults.BodyReadTimeout.Duration = DefaultBodyReadTimeout
 	}
 	if cfg.Defaults.Circuit.Threshold <= 0 {
 		cfg.Defaults.Circuit.Threshold = DefaultCircuitThreshold
@@ -325,6 +534,23 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.HealthCheck.HealthyThreshold <= 0 {
 		cfg.HealthCheck.HealthyThreshold = 1
+	}
+	// A STARTUP ERROR and not a clamp, for the same reason as
+	// body_read_timeout: every meaning a negative could carry here is one
+	// this block exists to refuse, and silently rounding it to the default
+	// would leave the operator believing in a bound they did not get.
+	// Zero is fine and means "the health package default".
+	if cfg.HealthCheck.LiveProbe.Interval.Duration < 0 {
+		return cfg, fmt.Errorf(
+			"health_check.live_probe: interval must not be negative (got %v); omit the key or set 0 for the default of %v, and note there is no spelling for \"unbounded\"",
+			cfg.HealthCheck.LiveProbe.Interval.Duration, health.DefaultLiveProbeInterval,
+		)
+	}
+	if cfg.HealthCheck.LiveProbe.Burst < 0 {
+		return cfg, fmt.Errorf(
+			"health_check.live_probe: burst must not be negative (got %d); omit the key or set 0 for the default of %d, and note there is no spelling for \"unbounded\"",
+			cfg.HealthCheck.LiveProbe.Burst, health.DefaultLiveProbeBurst,
+		)
 	}
 	if cfg.FairShare.Enabled {
 		if cfg.FairShare.MaxRequestsPerUser <= 0 {
@@ -350,8 +576,72 @@ func LoadConfig(path string) (Config, error) {
 		if err := ValidateUpstreamURL(cfg.Nodes[i].Name, cfg.Nodes[i].URL); err != nil {
 			return cfg, err
 		}
+		if err := validateAuthHeader(cfg.Nodes[i]); err != nil {
+			return cfg, err
+		}
+		if err := validateWorkloads(cfg.Nodes[i]); err != nil {
+			return cfg, err
+		}
 	}
 	return cfg, nil
+}
+
+// validateWorkloads rejects unknown workload classes at LOAD time: a typo
+// like "internl" would otherwise remove the node from both classes
+// silently, and the failure would only surface as missing capacity at
+// dispatch.
+func validateWorkloads(n NodeConfig) error {
+	for _, w := range n.Workloads {
+		switch w {
+		case "internal", "customer":
+		default:
+			return fmt.Errorf("node %s: workloads entry %q is not one of internal|customer", n.Name, w)
+		}
+	}
+	return nil
+}
+
+// validateAuthHeader enforces the auth_header admission rules described
+// on NodeConfig.AuthHeader. It runs AFTER env expansion so an api_key of
+// "${UNSET_VAR}" -- which expands to "" -- is caught here rather than
+// producing a node that silently sends no credential.
+func validateAuthHeader(n NodeConfig) error {
+	if n.AuthHeader == "" {
+		return nil
+	}
+	if strings.EqualFold(n.AuthHeader, "Authorization") {
+		return fmt.Errorf(
+			"node %q: auth_header must not be \"Authorization\" -- that is the default "+
+				"Bearer path (omit auth_header for it), and a gateway credential in "+
+				"Authorization is forwarded verbatim to the provider by passthrough routes",
+			n.Name,
+		)
+	}
+	for i := 0; i < len(n.AuthHeader); i++ {
+		c := n.AuthHeader[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'
+		if !ok {
+			return fmt.Errorf(
+				"node %q: auth_header %q contains %q; header names here are restricted to letters, digits and '-'",
+				n.Name, n.AuthHeader, string(c),
+			)
+		}
+	}
+	hasKey := n.APIKey != ""
+	for _, k := range n.APIKeys {
+		if k != "" {
+			hasKey = true
+		}
+	}
+	if !hasKey {
+		return fmt.Errorf(
+			"node %q: auth_header %q is set but no usable api_key/api_keys is configured "+
+				"(after env expansion) -- the header would never be sent and every request "+
+				"would reach the upstream unauthenticated",
+			n.Name, n.AuthHeader,
+		)
+	}
+	return nil
 }
 
 // ValidateUpstreamURL parses rawURL and rejects it when the host

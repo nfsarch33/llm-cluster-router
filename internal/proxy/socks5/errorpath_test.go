@@ -22,7 +22,7 @@ func TestSOCKS5ListenerFactory_Listen_BindConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hold listener: %v", err)
 	}
-	defer hold.Close()
+	defer func() { _ = hold.Close() }()
 	addr := hold.Addr().String()
 
 	f := NewListenerFactory()
@@ -171,7 +171,7 @@ func TestSOCKS5ListenerFactory_NonSOCKS5ClientConnectionCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, ln) }()
@@ -184,7 +184,7 @@ func TestSOCKS5ListenerFactory_NonSOCKS5ClientConnectionCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte{0x42}); err != nil {
 		t.Fatalf("write: %v", err)

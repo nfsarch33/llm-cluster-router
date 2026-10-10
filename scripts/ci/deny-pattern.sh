@@ -1,0 +1,1042 @@
+#!/usr/bin/env bash
+# runx-public-repo-gate: allow-file private_key
+# v18750-O-Track-D: deny-pattern anti-leak scanner
+#
+# Scans git diff (against base ref) for forbidden patterns: 1Password vault
+# names, internal IPs, PII keys, API tokens, security keys, etc.
+#
+# v18794 — the allow-file header on line 2 is for a DIFFERENT gate, and it has
+# to stay on line 2. helixon-platform's .github/scripts/public-repo-gate.sh
+# greps its tree for the literal `ssh-rsa ` under the category `private_key`,
+# and the PATTERNS array below carries that literal as a REGEX DESCRIBING the
+# format -- there is no key material in this file. So the first commit that
+# installed this scanner into helixon-platform failed that repo's gate on the
+# artefact it was adding, which is the same shape as the self-match v18792
+# fixed, one scanner's pattern list tripping another scanner.
+#
+# The annotation is the mechanism that gate documents and that twelve files in
+# helixon-platform already use; the alternative was splitting the literal to
+# dodge a grep, which is obfuscation and would leave the pattern less readable
+# than the thing it detects. It must appear within the first
+# PUBLIC_REPO_GATE_HEADER_LINES (default 5) lines or it is not consulted --
+# tools/deny-pattern-tests.sh pins both the header and that line budget.
+#
+# Usage:
+#   bash deny-pattern.sh [BASE_REF]
+#     BASE_REF defaults to origin/main (or HEAD~1 if no origin)
+#
+# Exit codes:
+#   0 — nothing to scan, no matches, or this IS the internal repo
+#   1 — at least one match found (fail the workflow / pre-push)
+#   2 — configuration error (missing base, git failure)
+#
+# This script is the canonical scanner; it's invoked by:
+#   - .github/workflows/deny-pattern.yml (PR check, no GH Actions minutes)
+#   - .git/hooks/pre-push (local pre-push, instant feedback)
+#   - L0 rule 01-public-repo-sanity.mdc (AI agent auto-check before commit)
+#
+# v18790 — two defects fixed. Both made this gate report something other than
+# what it had actually done, and both reproduced on pristine main @659deaa9d.
+#
+#   1. INTERNAL_REPO was decided by a GLOB OVER THE WORKING-DIRECTORY PATH:
+#        case "$(git rev-parse --show-toplevel)" in *cursor-global-kb*)
+#      so ANY repo checked out beneath a directory whose name contains
+#      "cursor-global-kb" bypassed every deny pattern — vault names, Tailscale
+#      IPs, PATs, Slack tokens, operator emails — and a legitimate KB worktree
+#      at a path that did not carry the name failed to bypass. Repo identity
+#      now comes from the repo: the origin remote's owner/repo slug, with a
+#      tracked marker file as the fallback. The checkout path decides nothing.
+#
+#   2. `DIFF=$(... | grep -E '^\+' | grep -v '^+++')` died under
+#      `set -o pipefail` whenever the diff added no lines — grep exits 1 — so
+#      the script exited 1 having printed one line and scanned nothing, and
+#      the "No diff to scan" branch below it was unreachable. Every caller
+#      read that as "anti-leak scan FAILED". The empty case now says so and
+#      exits 0; a base ref that does not resolve is a genuine configuration
+#      error and exits 2, so the fail-closed direction is kept where it belongs.
+#
+# v18791 — the third of the same family, left out of scope by #875 and fixed
+# here. `FOUND` was a 0/1 flag that the summary printed as if it were a count:
+#
+#     FOUND=1                                    # in the per-pattern loop
+#     echo "FAIL: $FOUND pattern match(es) ..."  # in the summary
+#
+# so a run that had just printed four MATCH blocks — a vault name, an op://
+# reference, a Tailscale IP and an operator email — still signed off with
+# "FAIL: 1 pattern match(es)". Reproduced on pristine main @4f0aa9a7b. The
+# blocks were right and only the summary was wrong, but the summary is the
+# line that gets quoted into a PR comment, a hook failure and a runbook, so
+# the gate consistently understated what it had found. It is a real counter
+# now, and each block reports its own line count and says when the three-line
+# cap hid some.
+#
+# v18792 — the fourth, and the reason the installer had never been run. Seven
+# PATTERNS entries were plain literal strings, because that is what a pattern
+# list is, so the commit that ADDS this file to a public repo matched seven of
+# its own patterns — reproduced on pristine main @4f0aa9a7b: 7 MATCH blocks,
+# exit 1. (The seven are no longer named here: see v18793 below — this file is
+# installed into public repositories, and an enumeration of them is exactly
+# the thing that must not travel.) The pull
+# request that installs the gate went red on the artefact it was adding, and
+# the installed pre-push hook blocked the very push that installs it. The only
+# way past was --no-verify, which L0 rule 01-public-repo-sanity.mdc forbids and
+# should, so scripts/ci/install-deny-pattern.sh could never be run against
+# helixon-platform or llm-cluster-router — the two public repos, and the entire
+# point of the installer. This scanner's own source is now excluded from the
+# diff it reads; see SELF_PATH below for the shape of that exclusion and
+# docs/security/anti-leak.md for what still covers the excluded file.
+#
+# v18793 — the fifth, and the one that had to land before the installer was
+# ever pointed at a public repository. This file's PATTERNS array IS a list of
+# the identifiers that name this estate: a 1Password vault name, an SA token
+# name, two operator email addresses, an internal host-naming scheme, an agent
+# name. Installing the gate into a public repo published that list — a curated,
+# machine-readable index of exactly what an attacker should grep the estate's
+# public artefacts for. Measured 2026-08-31 against origin/main: for
+# llm-cluster-router seven of them, including BOTH operator email addresses,
+# would have been NEW disclosure.
+#
+# So the patterns are now in two sets:
+#
+#   PUBLIC   — vendor credential FORMATS (AWS, GitHub, Slack, Stripe, SSH keys)
+#              and the generic private-address ranges. None of these names this
+#              estate; they are safe in a public tree, and they are the ones a
+#              real credential leak trips.
+#   INTERNAL — everything that identifies this estate. Kept OUT of this file
+#              and loaded at runtime from HLXN_DENY_PATTERNS_FILE, which points
+#              at a file that only ever exists where it is already private: the
+#              knowledge base checkout (for the local pre-push hook) or an
+#              Actions secret materialised on the runner (for CI).
+#
+# The run always says which sets it loaded. An unset HLXN_DENY_PATTERNS_FILE is
+# a legitimate, announced reduction in coverage; a SET-but-unreadable one is a
+# configuration error and exits 2, because "the internal set was configured and
+# silently did not load" must never look like "the internal set is not
+# configured".
+#
+# INTERNAL_SLUG below stays a literal on purpose. The owner handle appears in
+# every clone URL of these repos and `cursor-global-kb` is already in 70 files
+# of helixon-platform and 10 of llm-cluster-router (measured 2026-08-31), so it
+# discloses nothing new — and hashing it would rewrite the exemption logic
+# v18790 fixed and that tools/deny-pattern-tests.sh pins in both directions.
+#
+# v18797 — the sixth. The operator GitHub handle is an internal deny pattern,
+# and the handle is ALSO the owner segment of every one of these repos' OWN
+# module paths (github.com/nfsarch33/<this-repo>), which sit on go.mod and on
+# every internal import. So a diff that added a new internal import tripped the
+# handle pattern on a string the repo is public by construction for carrying —
+# llm-cluster-router PR #73, and every future PR to either public repo that
+# adds an internal import. The scanner now removes exactly that one public slug
+# (this repo's own github.com/<owner>/<repo>, at a path boundary) from the added
+# lines before matching; a reference to any OTHER repo under the same handle,
+# including a private one, is untouched and still caught. See the SCAN_DIFF
+# block below and docs/security/anti-leak.md.
+#
+# v18811 — the seventh, and the only one this file caused itself. v18797 above
+# matched EVERY pattern against the shortened lines, so any pattern whose match
+# had to run past the slug went silent: an SSH public key whose comment ended
+# at the repo's own module path passed the gate, in both public repos, with the
+# public set alone. The removal is now applied per pattern — only to a pattern
+# the module path would itself match — and leaves a separator behind. See the
+# v18811 note in the SCAN_DIFF block below.
+#
+# v18813 - the eighth, and the first that was never about the patterns at all.
+# The filter that separates added lines from diff headers was TEXTUAL:
+#
+#     DIFF="$(... | grep -E '^\+' | grep -v '^+++' || true)"
+#
+# git prefixes an added line with ONE `+`, so file content beginning with TWO
+# `+` produces a diff line beginning `+++` -- indistinguishable, to that filter,
+# from the `+++ b/<path>` header it exists to drop. The line was discarded
+# UNSCANNED, anywhere in any file, because nothing anchored the filter to the
+# region where a header can occur. Measured 2026-09-05 against origin/main
+# @f036ca83 with the PUBLIC set alone, same payload line, varying only the
+# leading characters of the file content:
+#
+#     leader ''    -> exit 1  caught
+#     leader '+'   -> exit 1  caught
+#     leader '++'  -> exit 0  BYPASSED
+#     leader '+++' -> exit 0  BYPASSED
+#
+# The carrier is ordinary rather than contrived. A patch that edits a patch has
+# its own added lines prefixed twice; the combined diff `git show` prints for a
+# merge commit marks an added line with two columns. Commit either artefact --
+# an evidence directory is full of them -- and every one of its `++` lines
+# reaches the outer diff as `+++` and is dropped. A patch adding an SSH key, an
+# AWS key ID or an internal address passed the gate.
+#
+# The header is now dropped STRUCTURALLY, by hunk boundary; see the v18813 note
+# at the DIFF extraction below for why the one-line textual narrowing was
+# measured and rejected.
+#
+# v18814 — the ninth, and the widest of the family: the gate never looked at
+# an added file that git classed as BINARY, and said so as a clean pass.
+#
+# `git diff` renders such a file as one line — `Binary files /dev/null and
+# b/<path> differ` — and NO content lines at all, so the extractor above found
+# nothing, the empty-diff branch fired, and the run printed
+#
+#     OK: no added lines in diff against <ref> - nothing to scan (empty range,
+#     or only scripts/ci/deny-pattern.sh changed)
+#
+# and exited 0. Not one pattern in either set ran, against a file whose bytes
+# were going into a public repository verbatim. Reproduced 2026-09-05 against
+# pristine origin/main, with the PUBLIC set alone, so it needed no secret and
+# no estate identifier:
+#
+#   a file whose first byte is NUL, carrying `<rsa-key-format> <blob> user@host`
+#     -> exit 0, "no added lines"
+#   the identical payload in a .txt -> exit 1, MATCH [SSH RSA public key]
+#
+# Nothing about that is exotic. Git calls a blob binary on ANY of:
+#
+#   * a NUL byte anywhere in the first 8k — every archive, image, database,
+#     compiled object, and any text file that picked one up;
+#   * a `-diff` or `binary` attribute in a COMMITTED .gitattributes — which is
+#     content a pull request can add, so the bypass was reachable BY THE DIFF
+#     BEING SCANNED;
+#   * a blob over core.bigFileThreshold.
+#
+# A fourth rendering hid content just as completely: a `diff=<driver>` textconv
+# rewriting the added lines before the gate saw them. (A fifth, an external
+# diff driver, was closed by v18813's --no-ext-diff just above; it is the one
+# that leaves no "Binary files" line behind at all, so it had no tell.)
+#
+# So the diff options are now a single list used by BOTH invocations:
+#
+#   --text          render every blob as text, whatever the heuristic, the
+#                   attribute or the size say.
+#   --no-textconv   ignore a configured textconv driver; the gate reads what is
+#                   committed, never a rendering of it.
+#   --no-ext-diff   from v18813, kept here so one list is the whole answer.
+#
+# THAT WAS NOT ENOUGH ON ITS OWN, and the half that was missing looked exactly
+# like the half that was fixed. Once binary content reaches the added lines it
+# carries invalid UTF-8, and GNU grep treats input with encoding errors as
+# binary and stops printing matching lines — writing its notice to stderr since
+# 3.5, so the caller sees an empty result and NO diagnostic. Measured on grep
+# 3.11 under LANG=C.UTF-8, eight invalid bytes ahead of a verbatim public key
+# were enough to take `grep -niE` from one match to zero. Hence LC_ALL=C below,
+# and `-a` at the point of use. (v18813's awk extractor is unaffected: gawk
+# 5.2.1 was measured on the same input and reads it correctly either way.)
+#
+# The trade-off is deliberate and in the documented direction (see "Responding
+# to a finding" in docs/security/anti-leak.md): genuine binary assets are now
+# scanned as text, so a byte sequence inside a PNG or a tarball can trip a
+# pattern. That is a false positive, and false positives are cheap here; the
+# thing it replaces is a permanent, silent false negative on every opaque file
+# ever added. Measured over every tracked binary blob in both public repos
+# before landing — 0 of 0 and 0 of 1 tripping — see docs/security/anti-leak.md.
+#
+# v18814 (the path half) — the added file's PATH is never scanned, and every
+# version above shares it, the binary fix included. The extraction is
+# hunk-scoped, so `+++ b/<path>` is skipped — and it is the ONLY line in a
+# unified diff that carries a new file's name. The other path-bearing lines
+# (`diff --git`, `new file mode`, `rename to`) sit outside the hunks too. So a
+# deny pattern present only in a file or directory NAME was invisible to every
+# pattern in both sets.
+#
+# This estate names evidence directories after the host they were captured on,
+# so the internal host-naming patterns are precisely the ones a path carries;
+# helixon-platform, a PUBLIC repo, already tracks 28 such paths. A pure rename
+# was sharper still: it adds no lines at all, so the run took the "nothing to
+# scan" branch and exited 0 having loaded no patterns.
+#
+# The header is still not scanned as a diff line — the extraction is untouched.
+# The range's added and renamed PATHS are enumerated SEPARATELY, so a path is
+# scanned because it was asked for rather than as a side effect. See the
+# v18814 path block below the extraction for the --diff-filter=ACR reasoning.
+#
+# Regression pins: tools/deny-pattern-tests.sh (registered in
+# tools/workspace-doctor.sh). The installer that ships this scanner into other
+# repos is pinned by tools/install-deny-pattern-tests.sh.
+
+set -euo pipefail
+
+# v18814 — every regex in this file matches BYTES, not characters.
+#
+# Once --text renders opaque blobs (see the v18814 note above), the added lines
+# carry arbitrary bytes, and in a UTF-8 locale those are ENCODING ERRORS. GNU
+# grep treats such input as binary and stops printing matching lines, writing
+# its notice to stderr, so a caller sees an empty result and no diagnostic --
+# which is the same false negative this file keeps rediscovering, wearing the
+# same clothes. C is also simply the right locale for a leak gate: byte-oriented
+# matching cannot be steered by how a file happens to be encoded, and the
+# patterns in both sets are ASCII.
+export LC_ALL=C
+
+# The single repository whose contents are exempt. It is internal and holds
+# operator handles, internal IPs and host names by design.
+INTERNAL_SLUG="nfsarch33/cursor-global-kb"
+INTERNAL_MARKER=".internal-repo"
+
+# The one path this scanner does not scan: its own source. See the v18792 note
+# above for why. This narrows a security predicate, so it is deliberately the
+# smallest and dumbest narrowing that fixes the defect:
+#
+#   * ONE path, spelled out as a fixed literal here in the scanner. Never a
+#     glob, never a directory, never read from the environment, an argument, or
+#     the diff being scanned. A gate whose exempt paths can be named by the
+#     diff it is scanning is not a gate.
+#   * `top,` anchors the pathspec to the repository ROOT. Without it a pathspec
+#     resolves against the CURRENT DIRECTORY, and the pre-push hook runs
+#     wherever the operator happened to type `git push`. Measured 2026-08-31
+#     from scripts/ci/: a bare ':(exclude)scripts/ci/deny-pattern.sh' excludes
+#     nothing, and the ':(exclude)' form written alongside a '.' pathspec scans
+#     only the current directory and silently drops the rest of the repo — a
+#     gate that passes because it never looked. Both are pinned in
+#     tools/install-deny-pattern-tests.sh.
+#   * Everything else is still scanned, including every other file in
+#     scripts/ci/ and any other file with this basename elsewhere in the tree.
+#     An exclusion that swallows a directory is worse than the self-match it
+#     fixes, and would look identical in a test that only asserts "exit 0".
+#
+# If this file is ever renamed, the exclusion stops applying and the scanner
+# starts matching its own source again: loud, and in the safe direction.
+SELF_PATH="scripts/ci/deny-pattern.sh"
+SELF_EXCLUDE=":(top,exclude)$SELF_PATH"
+
+BASE_REF="${1:-}"
+
+# Determine base ref
+if [[ -z "$BASE_REF" ]]; then
+  if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    BASE_REF="origin/main"
+  elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+    BASE_REF="origin/master"
+  elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+    BASE_REF="HEAD~1"
+  else
+    echo "ERROR: cannot determine BASE_REF; pass it as arg 1" >&2
+    exit 2
+  fi
+fi
+
+# v18750-Q9 / v18790: INTERNAL_REPO detection for cursor-global-kb.
+#
+# Per L0 rule 01-public-repo-sanity.mdc, cursor-global-kb is an internal repo
+# that may contain operator hostnames, internal IPs and operator GitHub
+# handles. When the scanner runs inside THAT repo, the deny patterns are
+# bypassed. Identity is established from the repository itself, never from
+# where it happens to be checked out.
+
+# Print the owner/repo slug of the origin remote, or fail if origin is absent
+# or is not a github.com URL. The host is matched after stripping scheme and
+# userinfo, so `https://github.com.evil.example/nfsarch33/cursor-global-kb`
+# and `https://evil.example/github.com/nfsarch33/cursor-global-kb` both fail
+# rather than resolving to the internal slug.
+repo_slug_from_origin() {
+  local url rest slug
+  url="$(git config --get remote.origin.url 2>/dev/null)" || return 1
+  [[ -n "$url" ]] || return 1
+  url="${url%/}"
+  url="${url%.git}"
+  rest="${url#*://}"   # drop scheme, if any (scp-like URLs have none)
+  rest="${rest#*@}"    # drop userinfo, if any
+  case "$rest" in
+    github.com:*) slug="${rest#github.com:}" ;;
+    github.com/*) slug="${rest#github.com/}" ;;
+    *) return 1 ;;
+  esac
+  slug="${slug#/}"
+  # Exactly one slash: owner/repo, nothing deeper.
+  [[ "$slug" == */* && "$slug" != */*/* ]] || return 1
+  printf '%s\n' "$slug"
+}
+
+# The fallback for clones whose origin is a mirror, a bare path, or absent —
+# an offline mirror, an archive re-init, a checkout with the remote removed.
+# The marker must be TRACKED (so it went through review, not dropped in) and
+# must carry the slug on a line of its own.
+marker_declares_internal() {
+  local top="$1"
+  [[ -f "$top/$INTERNAL_MARKER" ]] || return 1
+  git -C "$top" ls-files --error-unmatch -- "$INTERNAL_MARKER" \
+    >/dev/null 2>&1 || return 1
+  # tr -d '\r': .gitattributes pins this file to LF, but a checkout made
+  # before that pin (or with core.autocrlf on) would carry CRLF, and the
+  # whole-line match would silently stop resolving.
+  tr -d '\r' <"$top/$INTERNAL_MARKER" 2>/dev/null \
+    | grep -qxF "$INTERNAL_SLUG" || return 1
+  return 0
+}
+
+INTERNAL_REPO=0
+IDENTITY_SOURCE=""
+REPO_SLUG=""
+if REPO_TOP="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_SLUG="$(repo_slug_from_origin || true)"
+  if [[ "$REPO_SLUG" == "$INTERNAL_SLUG" ]]; then
+    INTERNAL_REPO=1
+    IDENTITY_SOURCE="origin remote"
+  elif marker_declares_internal "$REPO_TOP"; then
+    INTERNAL_REPO=1
+    IDENTITY_SOURCE="tracked $INTERNAL_MARKER marker"
+  fi
+fi
+
+if [[ "$INTERNAL_REPO" -eq 1 ]]; then
+  echo "OK: INTERNAL_REPO $INTERNAL_SLUG via $IDENTITY_SOURCE - deny-pattern skipped (L0 rule 01-public-repo-sanity.mdc)"
+  exit 0
+fi
+
+# Say which repo is being scanned and why it was not exempted. The old script
+# printed nothing here, so a wrongly-exempted or wrongly-scanned run looked
+# identical to a correct one. The slug is deliberate: the checkout path is
+# never printed, because this scanner's own output ends up in public CI logs.
+echo "Repo identity: ${REPO_SLUG:-<no github.com origin remote>} (not $INTERNAL_SLUG) - scanning"
+echo "Scanning diff against $BASE_REF ..."
+# Say it out loud. A gate that quietly scans less than it claims is the failure
+# mode this whole file keeps rediscovering, so the one exempt path is named on
+# every run rather than left in the source for someone to find later.
+echo "Excluding $SELF_PATH (this scanner's own source; see docs/security/anti-leak.md)"
+
+# A base ref that does not resolve means NOTHING was scanned. That is a
+# configuration error (exit 2), and it must stay distinguishable from a clean
+# scan — otherwise the empty-diff fix below would turn a broken invocation
+# into a silent pass.
+if ! git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null 2>&1; then
+  echo "ERROR: BASE_REF '$BASE_REF' does not resolve to a commit in this repo;" >&2
+  echo "       nothing was scanned. Fetch it (git fetch origin <branch>) or" >&2
+  echo "       pass a ref that exists." >&2
+  exit 2
+fi
+
+# Diff against base ref
+# Only scan ADDED lines (start with +). Removed lines (-) are intentionally
+# not scanned because they represent content that is LEAVING the codebase,
+# which is harmless from a leak-prevention standpoint.
+#
+# v18813 - `--no-ext-diff`. The extraction below reads the unified diff format
+# STRUCTURALLY, which means the output has to actually be unified diff.
+# `diff.external` and `GIT_EXTERNAL_DIFF` replace what `git diff` prints with
+# whatever a third-party tool emits: no `diff --git`, no `@@`, so the parser
+# would find no hunk, produce no added lines, and the run would report a clean
+# tree having read nothing. Neither is reachable from a pull request -- a driver
+# named in .gitattributes must still be DEFINED in git config -- so this is not
+# an attack path so much as a local setting that must not be able to switch the
+# gate off by accident. The old prefix filter degraded differently rather than
+# better; it would have matched whatever the external tool happened to print
+# with a leading `+`. Pinned in tools/deny-pattern-tests.sh.
+# v18814 — the diff options live in ONE list used by BOTH invocations below,
+# so the three-dot form and the two-dot fallback cannot drift apart. The
+# fallback runs only on repos with no merge base, which is exactly where a
+# divergence would be least likely to be noticed and most likely to matter.
+# See the v18814 note in this file's header for what each option closes.
+DIFF_FLAGS=(--text --no-textconv --no-ext-diff)
+
+# `tr -d '\000'`: --text renders binary blobs verbatim, so RAW_DIFF can now
+# carry NUL bytes. Bash drops them from a command substitution ANYWAY and warns
+# on stderr while doing it ("command substitution: ignored null byte in
+# input"), so the removal is not a choice -- only whether it happens visibly
+# here or invisibly in the assignment, and a P0 gate should not have a silent
+# content transformation in it, nor emit a warning that reads like a fault.
+#
+# It is a removal, and a removal before matching is how v18797 became v18811,
+# so: it DELETES rather than substituting a separator, which is the safe
+# direction here. Deleting can only splice neighbouring bytes together, and
+# splicing can create a match but not destroy one -- a key or token interrupted
+# by a NUL becomes contiguous and is now caught. Substituting would do the
+# opposite. It also cannot shift a line number (NUL is not a newline), so the
+# DIFF/SCAN_DIFF alignment check further down still holds.
+# v18814 (path half) - RANGE_MODE records WHICH of the two forms produced the
+# diff, so the path enumeration below is taken from the same range. Re-deriving
+# it would let the two halves of one scan disagree about what was scanned.
+RANGE_MODE=""
+if RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
+  RANGE_MODE="three-dot"
+elif RAW_DIFF="$(git diff "${DIFF_FLAGS[@]}" "$BASE_REF" HEAD -- "$SELF_EXCLUDE" 2>/dev/null | tr -d '\000')"; then
+  RANGE_MODE="two-dot"
+  echo "NOTE: no merge base with $BASE_REF; scanning the two-dot diff instead."
+else
+  echo "ERROR: git diff against '$BASE_REF' failed; nothing was scanned." >&2
+  exit 2
+fi
+
+# v18814 — the tripwire on the guarantee those options provide.
+#
+# With --text, git does not take the binary branch in builtin_diff() and so
+# cannot emit this line; every rendering measured for v18814 confirms that.
+# This is therefore an ASSERTION, not a live code path, and it is here because
+# of how this file travels: scripts/ci/install-deny-pattern.sh COPIES it into
+# public repositories, where the copy can be hand-edited, reverted, or left
+# behind by a newer upstream. If any of that drops an option, the failure mode
+# is the ORIGINAL defect -- a whole file unscanned, reported as a clean pass --
+# which is precisely the shape that survives review. So the invariant is
+# checked rather than assumed, and a violation is exit 2: nothing was scanned
+# for that path, and "we could not look" must never leave by the same door as
+# "we looked and it was clean".
+#
+# `^`-anchored: an added line carrying this text is prefixed with `+` by git and
+# a context line with a space, so only git's own unprefixed rendering matches.
+#
+# The `and b/<path>` half of the anchor is load-bearing too, and it is why this
+# does not simply grep for "Binary files". Measured 2026-09-05, the three
+# renderings git produces are:
+#
+#   added     Binary files /dev/null and b/<path> differ    -> captured
+#   modified  Binary files a/<path>  and b/<path> differ    -> captured
+#   DELETED   Binary files a/<path>  and /dev/null differ   -> NOT captured
+#
+# A deletion adds no content, so there is nothing for a deny pattern to have
+# missed; firing on one would be a false alarm on the routine removal of an
+# image. This gate scans added lines and only added lines, and the tripwire
+# holds the same line. tools/deny-pattern-tests.sh drives it with a git stub, so
+# it is pinned as wired-up rather than assumed to be.
+OPAQUE_FILES="$(printf '%s\n' "$RAW_DIFF" \
+  | sed -n 's/^Binary files .* and b\/\(.*\) differ$/\1/p' || true)"
+if [[ -n "$OPAQUE_FILES" ]]; then
+  echo "ERROR: git rendered these path(s) as opaque despite --text, so their" >&2
+  echo "       added content was NOT scanned by any deny pattern:" >&2
+  printf '%s\n' "$OPAQUE_FILES" | sed 's/^/         /' >&2
+  echo "       This should be unreachable while ${DIFF_FLAGS[*]} are passed;" >&2
+  echo "       if it fired, this scanner has drifted from the upstream copy in" >&2
+  echo "       $INTERNAL_SLUG. Re-install it with that repo's" >&2
+  echo "       scripts/ci/install-deny-pattern.sh rather than editing it here." >&2
+  exit 2
+fi
+
+# v18813 - drop the diff headers STRUCTURALLY, not by prefix.
+#
+# The old filter was `grep -E '^\+' | grep -v '^+++'`, and its second stage
+# could not tell a header from content: git prefixes an added line with one
+# `+`, so content beginning `++` arrives as `+++` and was removed with the real
+# `+++ b/<path>` header. See the v18813 note in this file's header for the
+# measurement and the carrier.
+#
+# The narrow textual fix -- `grep -vE '^\+\+\+ (a|b)/'` -- was written,
+# measured and REJECTED. It moves the collision instead of removing it:
+# content beginning `++ b/` still arrives as `+++ b/` and is still eaten
+# (measured 2026-09-05: baseline exit 0, narrowed filter exit 0, the parse
+# below exit 1), and the `a/`,`b/` anchor is not a property of the format --
+# `diff.noprefix`, `--no-prefix` and `--src-prefix`/`--dst-prefix` all retire
+# it, at which point the narrowed filter stops dropping the header and starts
+# scanning every file PATH in the tree instead. A gate whose correctness
+# depends on file content never resembling a header is the defect, not the fix.
+#
+# So the boundary is taken from the format's own structure. An added line
+# exists only inside a hunk, and every header line of a file section precedes
+# that section's first `@@`:
+#
+#   * `diff --git ` at column 0 opens a file section and closes any open hunk.
+#     Inside a hunk that text is `+diff --git `, `-diff --git ` or
+#     ` diff --git `, so the unprefixed form cannot occur there.
+#   * `@@` at column 0 opens a hunk. Inside a hunk every line carries an
+#     indicator (` `, `+`, `-`, `\`), so an added line whose content starts
+#     `@@` is `+@@` and cannot be mistaken for a hunk header either.
+#   * Everything else is scanned iff it is inside a hunk and starts with `+`.
+#     `+++ b/<path>` never is: it sits between `diff --git` and the first `@@`.
+#
+# This is a strict SUPERSET of what the old filter kept -- no header line
+# begins with `+` except `+++`, which the hunk boundary excludes on its own --
+# so the change can only ever add lines to the scan. It is also prefix-blind,
+# which the alternative above is not. The other direction is pinned too: a file
+# PATH is still never scanned HERE, because turning this false negative into a
+# false positive on every path in the tree would be its own defect. Since
+# v18814 the paths a range INTRODUCES are scanned - but from their own
+# enumeration below, never by relaxing this boundary, and never for a path that
+# was merely modified.
+#
+# The `|| true` is gone with the greps that needed it. awk exits 0 on empty
+# input, so the v18790 empty-range behaviour below is now structural rather
+# than a suppressed exit code -- and an awk that cannot run is a configuration
+# error (exit 2) rather than an empty DIFF that reads as a clean scan.
+if ! CONTENT_DIFF="$(printf '%s\n' "$RAW_DIFF" | awk '
+  /^diff --git / { in_hunk = 0; next }
+  /^@@/          { in_hunk = 1; next }
+  in_hunk && /^[+]/ { print }
+')"; then
+  echo "ERROR: could not extract the added lines from the diff against" >&2
+  echo "       '$BASE_REF'; nothing was scanned." >&2
+  exit 2
+fi
+
+# v18814 (path half) - the added file's PATH is content too, and it was never
+# scanned.
+#
+# The extraction above is hunk-scoped, so every diff header is skipped -
+# including `+++ b/<path>`, the ONLY line in a unified diff carrying a new
+# file's name. The other lines that name a path (`diff --git a/... b/...`,
+# `new file mode`, `rename to <path>`) sit outside the hunks as well. That is
+# correct for reading CONTENT and is left exactly as written; it is also why a
+# deny pattern appearing only in a file or directory NAME was invisible to
+# every pattern in both sets.
+#
+# Not a corner case here: this estate names evidence directories after the host
+# they were captured on, so the internal host-naming patterns are exactly the
+# ones a path carries. Reproduced 2026-09-05 against origin/main with the
+# internal set loaded - a file added at an evidence path carrying a host name,
+# whose CONTENT is innocuous, exited 0 "OK: no deny-pattern matches", while the
+# same host name in the file BODY exited 1. A pure rename was sharper still: it
+# adds no lines, so the run took the empty branch below and exited 0 having
+# loaded no patterns and scanned nothing at all.
+#
+# So the paths are enumerated SEPARATELY and folded in as synthetic lines. The
+# header stays unscanned and the hunk boundary is untouched: a path is scanned
+# because it was asked for, not as a side effect of the extraction. The prefix
+# keeps a path visibly distinct from a content line in a MATCH block and cannot
+# break a pattern - no pattern in either set is anchored (none contains ^ or
+# $), and an added content line already carries a leading `+`, so a
+# start-of-line anchor could never have worked here anyway.
+#
+# --diff-filter=ACR - Added, Copied, Renamed-to. Deliberately NOT M:
+#
+#   * A path that already exists on the base ref is not new disclosure. That is
+#     the same reasoning the removed-lines rule above rests on: this gate scans
+#     what a range INTRODUCES. It is also what keeps the fix deployable -
+#     helixon-platform tracks 28 paths carrying an internal host name (measured
+#     2026-09-05 on origin/main, 780 files). With M included, every PR that
+#     merely edited one of them would fail on a name it did not choose and
+#     could not fix. Over that repo's last 120 commits: 7 would go red under
+#     ACR - each one the commit that ADDED such a path, which is the case this
+#     exists to catch - against 14 under ACMR. It is also the policy the
+#     v18813b path control in tools/deny-pattern-tests.sh defers to: that
+#     control pins the EXTRACTION on a modified path, which is outside this
+#     filter either way, so the two hold simultaneously.
+#   * R reports only the DESTINATION path, so renaming AWAY from a bad name is
+#     never flagged: the cleanup commit is not blocked by the gate that asked
+#     for it.
+#   * If rename detection is off, a rename is reported as A plus D instead, and
+#     the A still carries the destination. Either way the new name is scanned.
+#
+# The range form is RANGE_MODE, the one the content diff actually used, and the
+# options are the same DIFF_FLAGS list, so no invocation can drift from the
+# others. core.quotePath=false keeps a non-ASCII path as written rather than
+# octal-escaped.
+PATH_LINE_PREFIX="+path: "
+PATHS_RC=0
+if [[ "$RANGE_MODE" == "three-dot" ]]; then
+  ADDED_PATHS="$(git -c core.quotePath=false diff "${DIFF_FLAGS[@]}" --name-only \
+                   --diff-filter=ACR "$BASE_REF"...HEAD -- "$SELF_EXCLUDE" \
+                   2>/dev/null)" || PATHS_RC=$?
+else
+  ADDED_PATHS="$(git -c core.quotePath=false diff "${DIFF_FLAGS[@]}" --name-only \
+                   --diff-filter=ACR "$BASE_REF" HEAD -- "$SELF_EXCLUDE" \
+                   2>/dev/null)" || PATHS_RC=$?
+fi
+# Fail closed. The content diff has already succeeded against this same range,
+# so a failure here is not "no paths" - it is the file names going unscanned
+# while the added lines are scanned, reported as one clean verdict. That is a
+# partial scan presented as a full one, which is the failure mode this whole
+# file keeps rediscovering, so it takes the exit 2 the contract reserves for
+# "the scan did not happen".
+if [[ "$PATHS_RC" -ne 0 ]]; then
+  echo "ERROR: could not enumerate the paths introduced in the range against" >&2
+  echo "       '$BASE_REF' (git exited $PATHS_RC), while the content diff" >&2
+  echo "       succeeded. Scanning the added lines but not the file names" >&2
+  echo "       would report a partial scan as a clean one." >&2
+  exit 2
+fi
+PATH_LINES=""
+PATH_COUNT=0
+if [[ -n "$ADDED_PATHS" ]]; then
+  PATH_COUNT="$(printf '%s\n' "$ADDED_PATHS" | wc -l | tr -d '[:space:]')"
+  PATH_LINES="$(printf '%s\n' "$ADDED_PATHS" | sed "s|^|$PATH_LINE_PREFIX|")"
+fi
+
+if [[ -z "$CONTENT_DIFF" && -z "$PATH_LINES" ]]; then
+  # Since v18792 there are two ways to land here, and the message must not
+  # claim the wrong one: a genuinely empty range, or a range whose only added
+  # lines were in the one excluded path. Since v18814 it also means the range
+  # introduced no path - a rename-only range now has something to scan.
+  echo "OK: no added lines and no added or renamed paths in diff against $BASE_REF - nothing to scan (empty range, or only $SELF_PATH changed)"
+  exit 0
+fi
+
+# Say what the path list contributed, on every run and before any verdict. A
+# gate that quietly scans something other than what it claims is the failure
+# mode this file keeps rediscovering.
+echo "Also scanning $PATH_COUNT added/renamed path(s) as text - a deny pattern in a FILE NAME is a leak too"
+
+if [[ -n "$CONTENT_DIFF" && -n "$PATH_LINES" ]]; then
+  DIFF="$CONTENT_DIFF
+$PATH_LINES"
+elif [[ -n "$CONTENT_DIFF" ]]; then
+  DIFF="$CONTENT_DIFF"
+else
+  DIFF="$PATH_LINES"
+fi
+
+# v18797 — neutralize the repo's OWN public module path before matching.
+#
+# The operator GitHub handle is an internal deny pattern, but that handle is
+# ALSO the owner segment of every one of these repos' own module paths:
+# `github.com/nfsarch33/<this-repo>`. That path sits on go.mod's `module` line,
+# on every `require`, and on every internal import, so it is public BY
+# CONSTRUCTION in the repo it names — yet a diff that adds a NEW internal import
+# (e.g. `"github.com/nfsarch33/llm-cluster-router/internal/crypto"`) tripped the
+# handle pattern on a string the repo could not not contain. Measured
+# 2026-08-31: llm-cluster-router PR #73 failed exactly this way, and so would
+# every future PR to either public repo that adds an internal import.
+#
+# So the one string that is public by construction — this repo's own
+# `github.com/<owner>/<repo>` slug, and ONLY that exact slug at a path boundary
+# — is removed from the added lines before any pattern is matched. The slug
+# comes from REPO_SLUG, the same origin-derived identity the internal-repo
+# exemption above already trusts to skip EVERY pattern, so this grants strictly
+# less than that decision does. It is deliberately the smallest narrowing that
+# fixes the defect (docs/security/anti-leak.md, "Responding to a finding"):
+#
+#   * ONE token: the literal `github.com/<REPO_SLUG>`, anchored on the right to
+#     a path boundary (`/ " ' backtick whitespace` or end-of-line) so a
+#     DIFFERENT repo whose name merely shares this one's prefix is untouched.
+#   * A reference to any OTHER repo under the same handle — a PRIVATE repo such
+#     as `github.com/nfsarch33/cursor-global-kb`, or the bare handle in a
+#     comment or config — carries a different slug (or none), is NOT removed,
+#     and still trips the handle pattern. That is the genuine-leak case, pinned
+#     in tools/deny-pattern-tests.sh next to this one.
+#   * Nothing but this exact public slug is removed. On its own that is NOT
+#     enough to make the removal safe — see the v18811 note directly below,
+#     which is what makes it safe.
+#
+# With no github.com origin REPO_SLUG is empty, there is nothing public by
+# construction to neutralize, and the diff is scanned unchanged.
+#
+# v18811 — the seventh, and the only one this file inflicted on itself: v18797
+# above introduced a FALSE NEGATIVE, the class this gate exists to prevent.
+#
+# v18797 removed the own slug from every added line and then matched EVERY
+# pattern against the shortened text. Removing text cannot create a match, but
+# it can DESTROY one: any pattern whose match had to extend past the slug went
+# silent while the payload stayed in the tree verbatim. Reproduced 2026-09-03
+# against the merged scanner, in BOTH public repos, using the PUBLIC set only,
+# so it needed no secret and no estate identifier:
+#
+#   +authorized_key: ssh-rsa AAAA<key> runner@github.com/<owner>/<this-repo>
+#
+# Both SSH-key patterns end `[^@]+@[^@]+`. That trailing `[^@]+` was satisfied
+# by the module path and by nothing else on the line, so deleting the path took
+# the match with it: exit 0, "OK: no deny-pattern matches". The identical line
+# ending `runner@buildhost` exits 1. The Slack-token pattern fails the same way
+# (`xoxb-` immediately followed by the module path at end of line).
+#
+# Two changes. The first is the one that matters:
+#
+#   1. NEUTRALIZE PER PATTERN, NOT GLOBALLY. A pattern reads the neutralized
+#      copy only if the module path is a string that pattern would itself
+#      match; every other pattern reads the added lines EXACTLY as written. The
+#      false positive v18797 existed to fix is by definition such a pattern —
+#      the operator handle IS the owner segment — so none of that fix is lost,
+#      while a credential format, an address range or a vendor token, none of
+#      which match a module path, can no longer be silenced by the removal.
+#      What remains suppressible is only what the public-by-construction string
+#      trips on its own, which is exactly the case this was written for.
+#
+#   2. THE REMOVAL LEAVES A SEPARATOR. Both rules now replace the slug with a
+#      single space rather than one of them deleting it outright, so a removal
+#      can neither splice its neighbours together nor truncate a line to end
+#      one character short of a pattern. This is defence in depth behind (1),
+#      never a substitute for it: a space satisfies `[^@]+` but not
+#      `[0-9a-zA-Z-]+`, so a separator alone would have fixed the SSH case and
+#      left the Slack one open.
+#
+#   3. AN ENTRY CARRYING AN ALTERNATION IS NEVER NEUTRALIZED. An ERE is not one
+#      matcher: a top-level `|` makes it several independent ones, and gating
+#      the whole ENTRY on the fact that ONE branch matches the module path puts
+#      every OTHER branch on the shortened text — the same defect, reappearing
+#      inside a single entry. Measured 2026-09-04 on this scanner with the two
+#      regexes `<handle>` and `<token-format>`: as two entries the payload
+#      exits 1, combined into one entry it exits 0. Deciding which `|` is
+#      top-level needs a regex parser, so the test is the dumber and strictly
+#      safer one — ANY `|` in the pattern disqualifies the entry, which can
+#      only ever neutralize LESS, never more. The cost is a false positive if
+#      someone writes the handle as one branch of an alternation; that is the
+#      cheap direction, and pattern_reads_neutralized() below says so.
+#
+#   4. THE REMOVAL IS CASE-INSENSITIVE, like the matcher. Patterns are matched
+#      with `grep -iE`, so an entry can be gated ON by a case-insensitive match
+#      and then have the removal miss, because a host name is written
+#      `GitHub.com` in prose and a clone URL need not carry the canonical case.
+#      Both `s###` commands take the `I` flag (GNU sed; the runners are
+#      `[self-hosted, linux]`). This is not a widening in the false-negative
+#      direction: only a pattern that itself matches the module path ever reads
+#      the neutralized copy, and that pattern is matched case-insensitively
+#      anyway, so the removal now agrees with the matcher instead of quietly
+#      disagreeing with it.
+#
+# Pinned in tools/deny-pattern-tests.sh, "DEFECT 6 (v18811)", for both public
+# slugs and in both directions.
+# v18836 - the repo's own module path is not the only one it is REQUIRED to
+# publish. A Go module that depends on a sibling repository under the same
+# owner must name that path in go.mod, go.sum and every importing file, so the
+# handle appears in the tree by construction and every future diff touching
+# those imports would match the operator-handle pattern forever. Measured on
+# sprintboard-mcp: a single added import line failed the gate while the same
+# path already sat on main in five files.
+#
+# Sibling paths are therefore neutralised TOO -- but only the ones the repo
+# ALREADY declares in go.mod AT THE BASE REF. A dependency the diff itself
+# introduces is not in the base go.mod and still matches, so "this PR starts
+# naming another repository under the handle" remains a finding. That is the
+# whole difference between recognising what the repo already publishes and
+# blanket-suppressing the handle.
+#
+# Only the ROOT go.mod is read. A module in a subdirectory is not consulted,
+# which can only ever neutralize LESS.
+SCAN_DIFF="$DIFF"
+OWN_MODULE_PATH=""
+NEUTRALIZED_SLUGS=()
+SIBLING_SLUG_COUNT=0
+if [[ -n "$REPO_SLUG" ]]; then
+  OWN_MODULE_PATH="github.com/$REPO_SLUG"
+  NEUTRALIZED_SLUGS=("$REPO_SLUG")
+  OWNER_RE="${REPO_SLUG%%/*}"
+  OWNER_RE="${OWNER_RE//./\\.}"
+  while IFS= read -r sibling_slug; do
+    [[ -n "$sibling_slug" ]] || continue
+    [[ "$sibling_slug" == "$REPO_SLUG" ]] && continue
+    NEUTRALIZED_SLUGS+=("$sibling_slug")
+    SIBLING_SLUG_COUNT=$((SIBLING_SLUG_COUNT + 1))
+  done < <(git show "${BASE_REF}:go.mod" 2>/dev/null \
+             | grep -aoE "github[.]com/${OWNER_RE}/[A-Za-z0-9._-]+" \
+             | sed -E 's#^github[.]com/##' | sort -u)
+  # Escape the one ERE metacharacter a GitHub owner/repo slug can carry (`.`)
+  # so a literal dot in a repo name cannot widen the removal.
+  for neutralized_slug in "${NEUTRALIZED_SLUGS[@]}"; do
+    SLUG_RE="${neutralized_slug//./\\.}"
+    SCAN_DIFF="$(printf '%s\n' "$SCAN_DIFF" \
+      | sed -E "s#github\\.com/${SLUG_RE}([/\"'\`[:space:]])# \\1#gI; s#github\\.com/${SLUG_RE}\$# #gI")"
+  done
+  # The two copies must stay line-for-line aligned: a MATCH block below is
+  # located in SCAN_DIFF and then REPORTED from DIFF by line number, and a
+  # misattributed line is precisely this file's recurring failure — a gate
+  # saying something other than what it read. sed cannot change the line count
+  # here, but a future edit could, so this is checked rather than assumed.
+  if [[ "$(printf '%s\n' "$DIFF" | wc -l)" != "$(printf '%s\n' "$SCAN_DIFF" | wc -l)" ]]; then
+    echo "ERROR: the neutralized copy is not line-for-line aligned with the" >&2
+    echo "       diff, so a reported line number would name the wrong line." >&2
+    echo "       Refusing to scan rather than report the wrong evidence." >&2
+    exit 2
+  fi
+fi
+
+# v18811 - the one place that decides whether a pattern reads the neutralized
+# copy instead of the added lines as written. Three conditions, all necessary:
+#
+#   * there is a module path to neutralize at all;
+#   * the pattern carries no `|` (see note 3 above — an alternation is several
+#     matchers and must never be gated as one); and
+#   * the module path, on its own, is a string this pattern matches. If it is
+#     not, removing that path cannot change this pattern's verdict, so the
+#     pattern reads the diff exactly as written.
+#
+# Deliberately NOT tested: the module path embedded in surrounding context. A
+# pattern that only matches once the path has a trailing `/` or an adjacent
+# character is classified here as not-gated, so v18797's false positive returns
+# for that pattern alone. That is the cheap direction and it is recorded in
+# docs/security/anti-leak.md; widening this test would suppress MORE, which is
+# the direction that costs false negatives.
+pattern_reads_neutralized() { # $1 = pattern
+  [[ ${#NEUTRALIZED_SLUGS[@]} -gt 0 ]] || return 1
+  case "$1" in *"|"*) return 1 ;; esac
+  # ANY neutralised path being a string this pattern matches is enough: the
+  # neutralised copy has every one of them removed, so the pattern must read
+  # that copy or it would report a line the scanned text no longer contains.
+  local candidate
+  for candidate in "${NEUTRALIZED_SLUGS[@]}"; do
+    if printf '%s\n' "github.com/$candidate" | grep -qiE -- "$1"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# PUBLIC deny patterns (case-insensitive extended regex).
+# Format: PATTERN|LABEL (for human-readable output)
+#
+# Vendor credential FORMATS and the generic private-address ranges only. None
+# of these names this estate, so this array is safe in a public tree — which
+# matters, because this file is installed into public repositories. Anything
+# that identifies the estate belongs in the internal set loaded below, NOT
+# here. See the v18793 note at the top before adding a pattern.
+PATTERNS=(
+  'api[.]minimax[.]io|minimax.io domain (must use api.minimaxi.com)'
+  'sk_live_|Stripe live key prefix'
+  'AKIA[0-9A-Z]{16}|AWS access key ID'
+  'ghp_[A-Za-z0-9]{36}|GitHub personal access token'
+  'github_pat_[A-Za-z0-9_]{82}|GitHub fine-grained PAT'
+  'xox[baprs]-[0-9a-zA-Z-]+|Slack token'
+  'ssh-rsa AAAA[0-9A-Za-z+/]+[=]{0,3} ?[^@]+@[^@]+|SSH RSA public key (use ed25519)'
+  'ssh-ed25519 AAAA[0-9A-Za-z+/]+[=]{0,3} ?[^@]+@[^@]+|SSH ed25519 public key'
+  '100\.[0-9]+\.[0-9]+\.[0-9]+|Tailscale IP (internal)'
+  '10\.[0-9]+\.[0-9]+\.[0-9]+|RFC1918 internal IP'
+  '192[.]168[.][0-9]+\.[0-9]+|RFC1918 internal IP'
+  '172[.](1[6-9]|2[0-9]|3[01])[.][0-9]+\.[0-9]+|RFC1918 internal IP'
+  # The retired memory service term (ADR-063): written as a character class
+  # so THIS pattern line does not itself contain the literal the repo-wide
+  # git-grep gate forbids (that gate has no allowlist; the class also cannot
+  # match its own bracketed text, so the scanner never self-matches). The
+  # trailing character is the DIGIT zero: 'memory'/'memo' must not match.
+  '[mM]em0|retired memory service term (use Engram; ADR-063)'
+)
+PUBLIC_COUNT="${#PATTERNS[@]}"
+
+# INTERNAL deny patterns, appended at runtime from a file this repository does
+# not ship. Same PATTERN|LABEL format, one per line; blank lines and lines
+# starting with # are ignored.
+#
+# The three states are deliberately distinguishable, because the failure this
+# scanner keeps having is a run that reports something other than what it did:
+#
+#   unset                  -> public set only, said out loud on every run.
+#                             A real reduction in coverage, announced.
+#   set and readable       -> both sets, with the counts printed (never the
+#                             patterns themselves — this output reaches public
+#                             CI logs).
+#   set but not readable,  -> exit 2. It was configured and did not load, and
+#   or carrying no usable     that must never be mistaken for "not configured".
+#   patterns
+INTERNAL_PATTERNS_FILE="${HLXN_DENY_PATTERNS_FILE:-}"
+INTERNAL_COUNT=0
+if [[ -n "$INTERNAL_PATTERNS_FILE" ]]; then
+  if [[ ! -r "$INTERNAL_PATTERNS_FILE" ]]; then
+    echo "ERROR: HLXN_DENY_PATTERNS_FILE is set to '$INTERNAL_PATTERNS_FILE'," >&2
+    echo "       but that file is not readable. The internal pattern set was" >&2
+    echo "       NOT loaded, so nothing that identifies this estate was" >&2
+    echo "       checked. Fix the path, or unset the variable to scan with" >&2
+    echo "       the public set only." >&2
+    exit 2
+  fi
+  # `|| [[ -n "$line" ]]`: a final line with no trailing newline still counts.
+  # tr -d '\r' equivalent inline, for a file that came through a CRLF path.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == \#* ]] && continue
+    # A line with no | has no label and would silently become a pattern whose
+    # label is itself. Skip it rather than guess.
+    [[ "$line" == *"|"* ]] || continue
+    PATTERNS+=("$line")
+    INTERNAL_COUNT=$((INTERNAL_COUNT + 1))
+  done <"$INTERNAL_PATTERNS_FILE"
+  if [[ "$INTERNAL_COUNT" -eq 0 ]]; then
+    echo "ERROR: HLXN_DENY_PATTERNS_FILE '$INTERNAL_PATTERNS_FILE' contained no" >&2
+    echo "       usable PATTERN|LABEL lines. Refusing to report a pass on a" >&2
+    echo "       set that was configured and did not load." >&2
+    exit 2
+  fi
+fi
+
+# Counts, never the patterns. This line is the coverage statement for the run.
+if [[ "$INTERNAL_COUNT" -gt 0 ]]; then
+  echo "Patterns: $PUBLIC_COUNT public + $INTERNAL_COUNT internal (from HLXN_DENY_PATTERNS_FILE)"
+else
+  echo "Patterns: $PUBLIC_COUNT public only - the internal set is NOT loaded (HLXN_DENY_PATTERNS_FILE unset)."
+  echo "          Estate identifiers (vault and token names, operator addresses,"
+  echo "          host naming) are NOT checked in this run. See docs/security/anti-leak.md."
+fi
+
+# MATCHED counts the PATTERNS that matched, which is exactly the number of
+# "MATCH [...]" blocks printed below. It was a 0/1 flag that the summary then
+# printed as if it were a count, so every failing run ended with "FAIL: 1
+# pattern match(es)" however many blocks it had just printed above that line.
+# v18809 - every pattern must compile before any of them runs.
+#
+# An entry is pattern|label, and the PATTERN is everything before the LAST
+# delimiter, not everything before the first. It used to be `${entry%%|*}`,
+# which truncates at the first `|` INSIDE the pattern: the RFC1918 172.16/12
+# entry carries an alternation, so this loop compiled `172[.](1[6-9]`, grep
+# exited 2 on the unmatched parenthesis, the `2>/dev/null || true` below
+# swallowed the error, and that entry matched nothing for as long as it
+# existed. A dead pattern and a clean diff print the same line, which is why
+# the compile check is not optional: an entry grep cannot parse is an
+# infrastructure failure, never a clean scan.
+for entry in "${PATTERNS[@]}"; do
+  PROBE="${entry%|*}"
+  # `|| PROBE_RC=$?` matters: this script runs under `set -e`, and grep exits 1
+  # on the empty input whenever the pattern is merely valid. Only 2 and above
+  # mean grep could not parse it.
+  PROBE_RC=0
+  grep -qE -- "$PROBE" /dev/null || PROBE_RC=$?
+  if [[ "$PROBE_RC" -ge 2 ]]; then
+    echo "ERROR: deny pattern does not compile: ${entry##*|}" >&2
+    echo "       A pattern grep cannot parse reports nothing, which reads as clean." >&2
+    exit 2
+  fi
+done
+
+# v18811 - which patterns the own-module-path neutralization actually applies
+# to, said out loud before the scan rather than left to be inferred. Only a
+# pattern the module path itself matches can be suppressed by removing that
+# path; for every other pattern the neutralized copy is not consulted at all.
+# The count is printed, never the labels: this output reaches public CI logs.
+NEUTRALIZED_FOR=0
+if [[ -n "$OWN_MODULE_PATH" ]]; then
+  for entry in "${PATTERNS[@]}"; do
+    if pattern_reads_neutralized "${entry%|*}"; then
+      NEUTRALIZED_FOR=$((NEUTRALIZED_FOR + 1))
+    fi
+  done
+  echo "Neutralizing this repo's own public module path github.com/$REPO_SLUG for $NEUTRALIZED_FOR of ${#PATTERNS[@]} pattern(s) - the ones that string trips by itself (public by construction; see docs/security/anti-leak.md)"
+  if [[ "$SIBLING_SLUG_COUNT" -gt 0 ]]; then
+    # The count, not the paths: this output reaches public CI logs, and the
+    # count is what tells a reader whether the base go.mod was read at all.
+    echo "Also neutralizing $SIBLING_SLUG_COUNT sibling module path(s) this repo's go.mod already declares at $BASE_REF - a dependency ADDED by the diff is NOT neutralized and still matches"
+  fi
+fi
+
+MATCHED=0
+for entry in "${PATTERNS[@]}"; do
+  PATTERN="${entry%|*}"
+  LABEL="${entry##*|}"
+  # v18811 - the subject is the added lines EXACTLY as written, UNLESS this is
+  # a pattern the repo's own module path would itself match, in which case it
+  # is the neutralized copy. Matching every pattern against the shortened text
+  # is how v18797's removal became a false negative; see the note above.
+  SUBJECT="$DIFF"
+  if pattern_reads_neutralized "$PATTERN"; then
+    SUBJECT="$SCAN_DIFF"
+  fi
+  # Use grep -iE with -- to delimit. Located in SUBJECT, but REPORTED from DIFF
+  # below: for a neutralized pattern the subject line has had the module path
+  # replaced by whitespace, and printing that as the finding quoted an
+  # offending line that existed in no file — so `grep -F` on the evidence found
+  # nothing and the column offsets were wrong. The two copies are line-for-line
+  # aligned (asserted where SCAN_DIFF is built), so the line number transfers.
+  # v18814 - `-a`. On added lines holding arbitrary bytes this grep returns
+  # NOTHING without it, which reads as "this pattern did not match". See the
+  # LC_ALL note at the top of this file for the measurement.
+  MATCH_LINES=$(printf '%s\n' "$SUBJECT" | grep -aniE -- "$PATTERN" 2>/dev/null \
+                | cut -d: -f1 || true)
+  if [[ -n "$MATCH_LINES" ]]; then
+    # tr -d: `wc -l` pads its count on some platforms, and the arithmetic
+    # below needs a bare integer.
+    LINES="$(printf '%s\n' "$MATCH_LINES" | wc -l | tr -d '[:space:]')"
+    echo ""
+    echo "MATCH [$LABEL] ($LINES matching line(s)):"
+    # v18814 - DISPLAY ONLY: replace every non-printable byte with '.'. Since
+    # --text, a matching line can be a slice of a binary blob, and this output
+    # goes verbatim into a public CI log, a PR comment and the operator's
+    # terminal. Raw control bytes there are at best unreadable and at worst
+    # forgeable -- an ANSI escape can repaint or erase the surrounding lines of
+    # the very report that is quoting it.
+    #
+    # It changes nothing about what was matched: MATCH_LINES was decided above
+    # against the untouched bytes, and this only reformats what is echoed back.
+    # Tabs survive because indentation carries meaning in the file the line came
+    # from. Under LC_ALL=C `[:print:]` is ASCII, so a non-ASCII character in a
+    # legitimate text finding is dotted as well; the label, the line count and
+    # the line number are all still exact, and the file itself is the evidence.
+    printf '%s\n' "$MATCH_LINES" | head -3 | while read -r n; do
+      printf '%s\n' "$DIFF" | sed -n "${n}p" | tr -c '[:print:]\t\n' '.'
+    done | sed 's/^/  /'
+    # The block is capped at three lines. Say what was hidden, for the same
+    # reason the summary must not undercount: a gate that shows less than it
+    # found reads as a smaller problem than it is.
+    if [[ "$LINES" -gt 3 ]]; then
+      echo "  ... and $((LINES - 3)) more matching line(s) not shown"
+    fi
+    MATCHED=$((MATCHED + 1))
+  fi
+done
+
+if [[ "$MATCHED" -gt 0 ]]; then
+  echo ""
+  echo "FAIL: $MATCHED deny pattern(s) matched in diff against $BASE_REF"
+  echo "      See docs/security/anti-leak.md and L0 rule 01-public-repo-sanity.mdc"
+  echo "      Remove the offending content and amend the commit before pushing."
+  exit 1
+fi
+
+echo "OK: no deny-pattern matches in diff against $BASE_REF"
+exit 0

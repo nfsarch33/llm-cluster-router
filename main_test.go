@@ -533,7 +533,13 @@ func TestRunCancelProbeSetsMaxTokens(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	result := runCancelProbe(server.URL, "qwen3.5-27b", "local", "hello", 10*time.Millisecond, 64)
+	// The subject of this test is the max_tokens value, asserted in the stub
+	// above. The cancellation deadline must therefore be long enough that it
+	// cannot fire before an immediate local response completes: with a 10ms
+	// deadline a loaded machine cancels the in-flight request and the probe
+	// correctly reports "context canceled", failing a test that is not about
+	// cancellation at all.
+	result := runCancelProbe(server.URL, "qwen3.5-27b", "local", "hello", 30*time.Second, 64)
 	if result.Error != "" {
 		t.Fatalf("runCancelProbe returned error: %#v", result)
 	}
@@ -1121,5 +1127,141 @@ func TestBuildReloadable_WiresTunnel(t *testing.T) {
 	}
 	if _, _, _, err := buildReloadable(badCfg); err == nil {
 		t.Fatal("expected buildReloadable to fail for invalid tunnel config")
+	}
+}
+
+func TestHandleProxyAppliesNodeModelRewrite(t *testing.T) {
+	t.Parallel()
+
+	var gotModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	parsed, _ := url.Parse(upstream.URL)
+	node := &upstreamNode{
+		// A strict vLLM engine (serves ONE pinned name) joining an alias
+		// pool — it lists the alias so it is selected, and the rewrite
+		// swaps the body to the served name.
+		cfg: nodeConfig{
+			Name:         "strict-engine",
+			Tier:         "0",
+			Models:       []string{"qwen3.8-27b", "qwen3.8-27b-local"},
+			Weight:       1,
+			ModelRewrite: map[string]string{"qwen3.8-27b-local": "qwen3.8-27b"},
+		},
+		baseURL: parsed,
+	}
+	node.healthy.Store(true)
+
+	r := &router{
+		cfg: config{
+			Defaults: defaults{
+				MaxQueueDepth:  8,
+				MaxConcurrency: 2,
+				RequestTimeout: durationValue{Duration: 5 * time.Second},
+				MaxBodySize:    1 << 20,
+			},
+		},
+		client:    &http.Client{Timeout: 5 * time.Second},
+		semaphore: make(chan struct{}, 2),
+		nodes:     []*upstreamNode{node},
+	}
+
+	body := `{"model":"qwen3.8-27b-local","messages":[{"role":"user","content":"hi"}],"max_tokens":16}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.handleProxy(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotModel != "qwen3.8-27b" {
+		t.Fatalf("the strict engine must receive its served name, got %q", gotModel)
+	}
+}
+
+func TestHandleProxyAppliesNodeRequestDefaults(t *testing.T) {
+	t.Parallel()
+
+	var gotSplit *bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if v, ok := payload["reasoning_split"]; ok {
+			b := string(v) == "true"
+			gotSplit = &b
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	parsed, _ := url.Parse(upstream.URL)
+	node := &upstreamNode{
+		cfg: nodeConfig{
+			Name:   "split-engine",
+			Tier:   "1",
+			Models: []string{"reasoning-model"},
+			Weight: 1,
+			RequestDefaults: cfg.RequestDefaultsMap{
+				"reasoning_split": json.RawMessage(`true`),
+			},
+		},
+		baseURL: parsed,
+	}
+	node.healthy.Store(true)
+
+	r := &router{
+		cfg: config{
+			Defaults: defaults{
+				MaxQueueDepth:  8,
+				MaxConcurrency: 2,
+				RequestTimeout: durationValue{Duration: 5 * time.Second},
+				MaxBodySize:    1 << 20,
+			},
+		},
+		client:    &http.Client{Timeout: 5 * time.Second},
+		semaphore: make(chan struct{}, 2),
+		nodes:     []*upstreamNode{node},
+	}
+
+	// Case 1: the caller cannot send the field (an agent that builds no
+	// request fields) — the node's default must land in the forwarded body.
+	body := `{"model":"reasoning-model","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.handleProxy(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotSplit == nil || !*gotSplit {
+		t.Fatalf("absent reasoning_split must default to true at the node, got %v", gotSplit)
+	}
+
+	// Case 2: a caller who DID set it keeps their value verbatim.
+	gotSplit = nil
+	body = `{"model":"reasoning-model","reasoning_split":false,"messages":[{"role":"user","content":"hi"}]}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	r.handleProxy(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if gotSplit == nil || *gotSplit {
+		t.Fatalf("caller-set false must survive, got %v", gotSplit)
 	}
 }

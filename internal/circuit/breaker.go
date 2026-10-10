@@ -168,3 +168,38 @@ var StateGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "llm_router_circuit_state",
 	Help: "Per-upstream circuit-breaker state. 1 in exactly one of state in {closed, open, half_open}.",
 }, []string{"node", "state"})
+
+// BreakerStats is an immutable snapshot of a Breaker's current health.
+// Returned by Stats() so dashboards and audit tooling can render the
+// breaker without contending on its mutex.
+//
+// Added by q10b-1 to GREEN the Ginkgo spec in circuit_ginkgo_test.go.
+type BreakerStats struct {
+	State               State
+	ConsecutiveFailures int
+	Threshold           int
+	CooldownRemaining   time.Duration
+	NodeName            string
+}
+
+// Stats returns an immutable snapshot of the breaker's current state.
+// Safe for concurrent use; takes the mutex briefly to copy state.
+func (cb *Breaker) Stats() BreakerStats {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	var remaining time.Duration
+	if cb.state == Open {
+		elapsed := cb.nowFn().Sub(cb.openedAt)
+		remaining = cb.cooldown - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	return BreakerStats{
+		State:               cb.state,
+		ConsecutiveFailures: cb.failures,
+		Threshold:           cb.threshold,
+		CooldownRemaining:   remaining,
+		NodeName:            cb.nodeName,
+	}
+}

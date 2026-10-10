@@ -149,7 +149,7 @@ func TestFairScheduler_FallbackToTokenHash(t *testing.T) {
 	})
 	defer s.Stop()
 
-	token := "sk-abc123secret"
+	token := "dummy-not-a-real-key-v18752"
 	userID := UserFromToken(token)
 
 	if userID == "" {

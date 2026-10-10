@@ -24,6 +24,23 @@ var (
 		Name: "llm_router_quota_fallback_total",
 		Help: "Vendor quota-exhaustion events that triggered failover off a vendor peer.",
 	}, []string{"model", "node", "vendor"})
+	// PIILocalRequests counts the PII-local rule's decisions: personal
+	// payloads detected, and refusals for want of a pii-local node. The
+	// "zero personal payloads to cloud models" guarantee is structural
+	// (selection filters them out); this counter makes it observable.
+	// PIIArmedGauge is 1 while the PII-local rule enforces on this
+	// process (mode enforce, or auto with a marked node) and 0 while
+	// detection stays observability-only.
+	PIIArmedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "llm_router_pii_rule_armed",
+		Help: "1 when the PII-local routing rule enforces; 0 when personal detection is observability-only. Page on a sustained detected_rule_off rate.",
+	})
+
+	PIILocalRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "llm_router_pii_local_requests_total",
+		Help: "Personal payloads detected by the PII-local rule (detected) and refused for want of a pii-local node (no_local_node_refused); cloud endpoints never receive one by construction.",
+	}, []string{"outcome"})
+
 	RequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "llm_router_requests_total",
 		Help: "Total routed requests.",
@@ -93,4 +110,30 @@ var (
 		Name: "llm_router_auth_rejected_total",
 		Help: "Requests rejected by the bearer-token auth middleware (401).",
 	}, []string{"path"})
+
+	// v18846-5 metadata-only attribution: counts and latencies by the
+	// X-Helixon-Agent identity header ONLY. No bodies, no other headers, no
+	// keys; requests without the header are absent from these families by
+	// design (that absence is the signal for the unattributed majority).
+	RequestsByAgentTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hlxn_router_requests_by_agent_total",
+		Help: "Requests attributed to a Helixon agent via the X-Helixon-Agent identity header. Metadata only: no bodies, no other headers, no keys.",
+	}, []string{"agent"})
+
+	AgentRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "hlxn_router_agent_request_duration_seconds",
+		Help:    "End-to-end request duration by Helixon agent (identity header label; LLM-tuned buckets).",
+		Buckets: LLMRouterBuckets,
+	}, []string{"agent"})
+
+	// LiveProbeThrottledTotal counts /healthz?live=1 requests that were
+	// served the cached health view because the forced-probe rate bound
+	// was exhausted. Those requests still answer 200, so this counter is
+	// the ONLY signal that the bound is biting -- alert on a sustained
+	// rate, which means either a misconfigured poller or somebody using
+	// the endpoint as an amplifier.
+	LiveProbeThrottledTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "llm_router_health_live_probe_throttled_total",
+		Help: "Forced /healthz?live=1 probes refused by the rate bound and served from cache.",
+	})
 )

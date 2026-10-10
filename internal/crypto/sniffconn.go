@@ -8,6 +8,13 @@ import (
 
 const hsTimeout = 5 * time.Second
 
+// sniffWindow bounds ONLY the magic peek, separately from the handshake
+// timeout. Both channel kinds send their first bytes immediately, so the
+// window only ever elapses for a client that says nothing — the legacy
+// shape the static wrap has always served without reading first. The
+// window must stay far below any caller's own accept-to-EOF budget.
+const sniffWindow = 250 * time.Millisecond
+
 // prefixConn replays already-read bytes before passing reads through to
 // the underlying conn — needed because the server must peek the first
 // bytes to decide between the ephemeral handshake and the legacy static
@@ -41,7 +48,7 @@ func Negotiate(conn net.Conn, keys NoiseKeys, staticKey [32]byte, requireEphemer
 	if timeout <= 0 {
 		timeout = hsTimeout
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(sniffWindow)); err != nil {
 		_ = conn.Close()
 		return nil, "error"
 	}

@@ -49,32 +49,32 @@ func dialSOCKS5(ctx context.Context, proxyAddr, target string, handshakeTimeout 
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}
 	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: set deadline: %w", err)
 	}
 
 	host, port, err := splitHostPort(target)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: target addr: %w", err)
 	}
 
 	// Greeting: VER=5, NMETHODS=1, METHODS=[0x00 (no-auth)].
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: write greeting: %w", err)
 	}
 	greet := make([]byte, 2)
 	if _, err := io.ReadFull(conn, greet); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: read greeting reply: %w", err)
 	}
 	if greet[0] != 0x05 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: bad greeting reply version 0x%02x", greet[0])
 	}
 	if greet[1] == 0xff || greet[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, ErrAuthRequired
 	}
 
@@ -83,21 +83,21 @@ func dialSOCKS5(ctx context.Context, proxyAddr, target string, handshakeTimeout 
 	req = append(req, []byte(host)...)
 	req = append(req, byte(port>>8), byte(port))
 	if _, err := conn.Write(req); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: write connect: %w", err)
 	}
 
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: read reply header: %w", err)
 	}
 	if hdr[0] != 0x05 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: bad reply version 0x%02x", hdr[0])
 	}
 	if hdr[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, &ErrServerReply{Code: hdr[1]}
 	}
 	var addrLen int
@@ -107,19 +107,19 @@ func dialSOCKS5(ctx context.Context, proxyAddr, target string, handshakeTimeout 
 	case 0x03:
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(conn, l); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("socks5: read fqdn len: %w", err)
 		}
 		addrLen = int(l[0])
 	case 0x04:
 		addrLen = 16
 	default:
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: unknown ATYP 0x%02x", hdr[3])
 	}
 	tail := make([]byte, addrLen+2)
 	if _, err := io.ReadFull(conn, tail); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("socks5: read reply tail: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -159,7 +159,7 @@ func StreamSSE(ctx context.Context, proxyAddr, target, httpMethod, httpPath, aut
 			errs <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		req := buildHTTPRequest(target, httpMethod, httpPath, authHeaderValue, streamBody)
 		if _, err := conn.Write([]byte(req)); err != nil {
