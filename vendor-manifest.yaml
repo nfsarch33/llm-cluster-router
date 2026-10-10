@@ -1,0 +1,17 @@
+# Vendored upstream trees excluded from the public-repo gate BY PATH
+# (authority ruling, r38 addendum: the vendored upstream tree is excluded by
+# path in the gate configuration with a vendor manifest row naming the
+# upstream and its sha; gitleaks keeps scanning these paths).
+# gitleaks still runs on every push and has its own config.
+- path: litellm
+  upstream: BerriAI/litellm
+  sha: 56523fece9a6
+- path: litellm-rust
+  upstream: BerriAI/litellm
+  sha: 56523fece9a6
+- path: tests/test_litellm
+  upstream: BerriAI/litellm
+  sha: 56523fece9a6
+- path: ui/litellm-dashboard
+  upstream: BerriAI/litellm
+  sha: 56523fece9a6
