@@ -53,6 +53,14 @@ regexes = [
     # not rewrite on a public repo. Anchored for the same reason as the entry
     # above -- it matches this exact string and cannot swallow a longer one.
     "^placeholder-is-stripped-not-forwarded$",
+
+    # 'private_key_b64' was a JSON OUTPUT FIELD NAME in the keygen-ephemeral
+    # subcommand's example envelope (cmd/helixchannel/main.go help text). It
+    # names a field the tool prints; no credential value ever sat behind it,
+    # and the noise handshake security round renamed the field (5f69b28), so
+    # the string survives only in commit 5342c52, which we do not rewrite on
+    # a public repo. Anchored: matches the exact field name only.
+    "^private_key_b64$",
 ]
 
 # Stop signals (entries that MUST NOT be allowlisted, even by accident).

@@ -71,6 +71,12 @@ type aesMTLSListenerFactory struct {
 	// different keys and lets future config-based wiring swap
 	// the source.
 	key [32]byte
+	// noiseKeys configure the Noise_IKpsk2 channel (server static +
+	// per-tenant PSKs); zero value = static-only listener.
+	noiseKeys crypto.NoiseKeys
+	// requireEphemeral refuses the legacy static channel (downgrade
+	// resistance after tenant cutover).
+	requireEphemeral bool
 }
 
 // NewAESMTLSListenerFactory returns a ListenerFactory for the
@@ -90,6 +96,16 @@ func NewAESMTLSListenerFactory() ListenerFactory {
 // production callers that load the key from a secret store.
 func NewAESMTLSListenerFactoryWithKey(key [32]byte) ListenerFactory {
 	return &aesMTLSListenerFactory{key: key}
+}
+
+// NewAESMTLSListenerFactoryEphemeral layers the ephemeral-key handshake
+// (spec v1) on top of the static-key factory: each accepted conn is
+// sniffed — HCX1 magic negotiates a per-session X25519 key, everything
+// else falls through to the legacy static wrap on the same port. keys
+// carries the current long-term key first and any previous key kept for
+// rotation; empty = static-only (no ephemeral support advertised).
+func NewAESMTLSListenerFactoryEphemeral(key [32]byte, keys crypto.NoiseKeys, requireEphemeral bool) ListenerFactory {
+	return &aesMTLSListenerFactory{key: key, noiseKeys: keys, requireEphemeral: requireEphemeral}
 }
 
 // defaultDemoAESKey returns a non-secret placeholder key for the
@@ -135,19 +151,20 @@ func (a *aesMTLSListenerFactory) Listen(ctx context.Context, addr string) (net.L
 			// metric. The wrapper's Close is sufficient to
 			// release the underlying conn; we do not need a
 			// separate defer.
-			//
-			// connCtx is THIS CONNECTION's lifetime, and it is
-			// what the tamper forwarder is given -- not the
-			// serve loop's ctx, which outlives every connection
-			// it accepts. The forwarder used to have no exit
-			// condition of any kind: one permanent goroutine and
-			// one 10ms ticker per accepted TCP connection, with
-			// nothing capping the total, each still holding its
-			// *crypto.WrapConn reachable long after the conn it
-			// polls had been closed on the very next line.
+			// Ephemeral-key spec v1: sniff HCX1 → ephemeral handshake;
+			// anything else stays on the legacy static wrap (one port,
+			// both generations of clients). keys come from the factory's
+			// configured long-term keys; nil = static-only.
+			wrapped, _ := crypto.Negotiate(conn, a.noiseKeys, key, a.requireEphemeral, 5*time.Second)
+			if wrapped == nil {
+				continue
+			}
+			// connCtx is THIS CONNECTION's lifetime: the tamper
+			// forwarder's exit condition, retired by closeConn below.
 			connCtx, closeConn := context.WithCancel(ctx)
-			wrapped := crypto.Wrap(conn, key)
-			startTamperForwarder(connCtx, wrapped)
+			if wc, ok := wrapped.(*crypto.WrapConn); ok {
+				startTamperForwarder(connCtx, wc)
+			}
 			// Production HTTP handling is delegated to the
 			// caller's http.Server. We close the wrapped conn
 			// here so the demo's ServeLoop does not leak

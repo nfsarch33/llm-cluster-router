@@ -47,11 +47,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/nfsarch33/llm-cluster-router/internal/crypto"
 	"net/http"
 	"os"
 	"runtime"
@@ -96,6 +100,38 @@ func main() {
 	case "factory-probe":
 		if err := runFactoryProbe(os.Args[2:]); err != nil {
 			fail("factory-probe", err)
+		}
+	case "keygen-ephemeral":
+		// F6: the PRIVATE half never reaches stdout or logs. It is
+		// written to a 0600 file given by -out (default
+		// ./helixchannel-server-key.<id>); stdout carries ONLY the
+		// public key and the key id. PSKs are NOT generated here —
+		// per-tenant PSKs come from the operator's secret store.
+		fs := flag.NewFlagSet("keygen-ephemeral", flag.ExitOnError)
+		outFile := fs.String("out", "", "0600 file for the private half (default ./helixchannel-server-key.<id>)")
+		_ = fs.Parse(os.Args[2:])
+		priv, err := crypto.NoiseStaticKeypair()
+		if err != nil {
+			fail("keygen-ephemeral", err)
+		}
+		id := "hc-" + hex.EncodeToString(crypto.SHA256Bytes(priv.PublicKey().Bytes()))[:8]
+		path := *outFile
+		if path == "" {
+			path = "helixchannel-server-key." + id
+		}
+		if err := os.WriteFile(path,
+			[]byte(base64.StdEncoding.EncodeToString(priv.Bytes())+"\n"), 0o600); err != nil {
+			fail("keygen-ephemeral", err)
+		}
+		env := map[string]string{
+			"subcommand":       "keygen-ephemeral",
+			"key_id":           id,
+			"public_key_b64":   base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()),
+			"private_key_file": path,
+			"note":             "private half written 0600 to " + path + " — never printed",
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(env); err != nil {
+			fail("keygen-ephemeral", err)
 		}
 	case "key-check":
 		if err := runKeyCheck(); err != nil {
