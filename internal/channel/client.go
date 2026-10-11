@@ -30,6 +30,10 @@ import (
 type ClientProxy struct {
 	// Listen is the loopback bind address for the agent to point at.
 	Listen string
+	// CallerID is the machine/tenant label stamped on every CONNECT as
+	// X-HLXN-Caller, so the gateway audit stream can tell many machines
+	// apart. Metadata only — never an authorisation input.
+	CallerID string
 	// Gateway is the channel edge, "host:port" (TLS).
 	Gateway string
 	// Token authorises the CONNECT at the gateway.
@@ -165,6 +169,7 @@ func (c *ClientProxy) dialGateway(target string) (net.Conn, error) {
 		Host:   target,
 		Header: http.Header{"Proxy-Authorization": {"Bearer " + c.Token}},
 	}
+	c.stampCaller(req)
 	if err := req.Write(conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write CONNECT: %w", err)

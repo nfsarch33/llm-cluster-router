@@ -54,7 +54,12 @@ type AuditEvent struct {
 	LatencyMS    int64  `json:"latency_ms"`
 	BytesOut     int64  `json:"bytes_out,omitempty"`
 	ClientAddr   string `json:"client_addr,omitempty"`
-	Error        string `json:"error,omitempty"`
+	// Caller is the caller-identity label (X-HLXN-Caller) the client
+	// volunteered — machine/tenant metadata so a multi-machine audit
+	// stream can be told apart. Audit-only: nothing authorises on it and
+	// a spoofed value buys a caller nothing but a misleading log line.
+	Caller string `json:"caller,omitempty"`
+	Error   string `json:"error,omitempty"`
 
 	// KeyIndex is the pool slot that served the request. It appears only on
 	// pooled routes, so legacy single-key and passthrough lines stay
@@ -1068,12 +1073,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		target = r.URL.Host
 	}
 
+	caller := SanitiseCaller(r.Header.Get(CallerHeader))
 	deny := func(status int, reason string) {
 		http.Error(w, http.StatusText(status), status)
 		s.audit.Log(AuditEvent{
 			Event: "connect_denied", RequestID: requestID, Target: target,
 			Status: status, LatencyMS: time.Since(start).Milliseconds(),
-			ClientAddr: s.auditClientAddr(r), Error: reason,
+			ClientAddr: s.auditClientAddr(r), Caller: caller, Error: reason,
 		})
 	}
 
@@ -1144,7 +1150,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit.Log(AuditEvent{
-		Event: "connect_established", RequestID: requestID, Target: target,
+		Event: "connect_established", RequestID: requestID, Target: target, Caller: caller,
 		Status: http.StatusOK, LatencyMS: time.Since(start).Milliseconds(),
 		ClientAddr: s.auditClientAddr(r),
 	})
