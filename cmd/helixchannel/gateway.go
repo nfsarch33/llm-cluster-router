@@ -235,6 +235,8 @@ func runProxy(args []string) error {
 	tokenEnv := fs.String("token-env", "HELIXCHANNEL_CONNECT_TOKEN",
 		"environment variable holding the CONNECT token")
 	tokenFile := fs.String("token-file", "", "file holding the CONNECT token")
+	callerID := fs.String("caller-id", envOrDefault("HC_CALLER_ID", ""),
+		"machine/tenant label sent as X-HLXN-Caller on every CONNECT; audit metadata only (edge logs), never an authorisation input")
 	insecure := fs.Bool("insecure", false,
 		"skip verification of the gateway certificate (pilot edges with self-signed certs only; the agent's own TLS to the provider is still verified end to end)")
 	printEnv := fs.Bool("print-env", false, "print the environment variables an agent needs, then exit")
@@ -267,6 +269,7 @@ func runProxy(args []string) error {
 		Listen:             *listen,
 		Gateway:            *gateway,
 		Token:              token,
+		CallerID:           *callerID,
 		InsecureSkipVerify: *insecure,
 		Audit:              channel.NewAuditor(os.Stdout),
 	}
