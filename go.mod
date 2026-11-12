@@ -2,7 +2,7 @@ module github.com/nfsarch33/llm-cluster-router
 
 go 1.27.0
 
-toolchain go1.27.2
+toolchain go1.27.4
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
