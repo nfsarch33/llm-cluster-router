@@ -131,7 +131,7 @@ Every component (binary, daemon, hook, scheduled task) MUST:
 5. Have at least one SLO alert in `observability/alerts/prometheus-helixon-alerts.yml`.
 6. Have a runbook entry in `observability/runbook.md`.
 7. Use OpenTelemetry tracing when calling external services.
-8. Coordinate fleet work through the sprint board contract (claim, note, merge-request, complete); no workflow engine is deployed (ADR-091).
+8. Coordinate fleet work through the sprint board contract (claim, note, merge-request, complete); no workflow engine is deployed.
 
 ## P0/P1 SLOs
 
