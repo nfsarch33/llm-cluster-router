@@ -71,6 +71,7 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.14.0
+          skip-save-cache: true
 
   security:
     runs-on: [self-hosted, linux]
