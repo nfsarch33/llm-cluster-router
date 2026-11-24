@@ -76,4 +76,4 @@ jobs:
         with:
           name: local-eval-${{ github.run_id }}
           path: eval-out/
-          retention-days: 90
+          retention-days: 3
