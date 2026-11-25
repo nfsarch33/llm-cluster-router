@@ -42,12 +42,10 @@ permissions:
 
 jobs:
   deny-pattern:
-    # Not `ubuntu-latest`: GitHub-hosted minutes on this account are exhausted,
-    # so a hosted job is rejected before it starts. `[self-hosted, linux]` is
-    # what the other repos in the estate use. Runner labels naming a specific
-    # host are deliberately avoided -- several of them are themselves deny
-    # patterns, so a workflow that named one would fail the gate it installs.
-    runs-on: [self-hosted, linux]
+    # A standard GitHub-hosted runner. This repository is public, where
+    # hosted runners are free, and a self-hosted runner would execute a fork's
+    # pull request on its own machine.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
